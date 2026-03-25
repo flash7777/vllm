@@ -1,102 +1,31 @@
 FROM localhost/vllm-ng17e-riy
 
-# ============================================================
-# vllm-ng17e-tq: TurboQuant KV-cache quantization
-# Base: vllm-ng17e-riy (vLLM 0.15.1 + SM12x + RIY)
-# Adds: TurboQuant transparent wrapper + CUDA fused kernel
-#
-# Build:
-#   cd ~/vllm-riy && podman build -f Dockerfile.tq -t vllm-ng17e-tq .
-#
-# Run:
-#   podman run ... vllm-ng17e-tq vllm serve <model> --kv-cache-dtype tq3
-# ============================================================
-
 ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
 
-# 1. Copy TurboQuant Python module
+# 1. TQ Python module + attention backend
 COPY vllm/turboquant/ ${VLLM_DST}/turboquant/
+COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
 
-# 2. Copy CUDA kernel sources for JIT build
-COPY csrc/quantization/turboquant/tq_round_trip.cu /opt/tq_build/tq_round_trip.cu
-COPY csrc/quantization/turboquant/tq_round_trip.cuh /opt/tq_build/tq_round_trip.cuh
-
-# 3. Copy JIT extension wrapper
+# 2. CUDA kernel sources
+COPY csrc/quantization/turboquant/ /opt/tq_build/
 COPY csrc/quantization/turboquant/tq_ext.cu /opt/tq_build/tq_ext.cu
 
-# 4. Apply patches to vLLM
-COPY tests/turboquant/patch_tq_transparent.py /opt/patch_tq.py
-RUN python3 /opt/patch_tq.py
+# 3. Patch script
+COPY tests/turboquant/patch_v4.py /opt/patch_v4.py
+RUN python3 /opt/patch_v4.py
 
-# 5. Install scipy for Lloyd-Max centroids
+# 4. Dependencies
 RUN pip install --no-cache-dir --break-system-packages scipy
 
-# 6. Patch quantizer.py for JIT extension dispatch
-RUN python3 -c "\
-F = '${VLLM_DST}/turboquant/quantizer.py'; \
-c = open(F).read(); \
-c = c.replace( \
-    'from vllm.turboquant.config import TurboQuantConfig', \
-    'from vllm.turboquant.config import TurboQuantConfig\n\n' \
-    '# CUDA fused kernel (JIT)\n' \
-    '_tq_cuda_ext = None\n' \
-    'try:\n' \
-    '    from torch.utils.cpp_extension import load as _jit_load\n' \
-    '    _tq_cuda_ext = _jit_load(\n' \
-    '        name=\"tq_serve\",\n' \
-    '        sources=[\"/opt/tq_build/tq_ext.cu\", \"/opt/tq_build/tq_round_trip.cu\"],\n' \
-    '        extra_cuda_cflags=[\"-O3\", \"-std=c++17\", \"--expt-relaxed-constexpr\", \"--use_fast_math\",\n' \
-    '                           \"-gencode=arch=compute_121,code=sm_121\",\n' \
-    '                           \"-diag-suppress=177,3288\"],\n' \
-    '        extra_include_paths=[\"/opt/tq_build\"],\n' \
-    '        verbose=False)\n' \
-    'except Exception:\n' \
-    '    pass\n'); \
-c = c.replace( \
-    '    # Try CUDA fused kernel (Phase 3)\n' \
-    '    try:\n' \
-    '        output = torch.empty_like(key)\n' \
-    '        from vllm._custom_ops import turboquant_round_trip\n' \
-    '        turboquant_round_trip(\n' \
-    '            key, Pi.float().contiguous(), S.float().contiguous(),\n' \
-    '            centroids.float().contiguous(),\n' \
-    '            output, key.shape[-1], centroids.shape[0],\n' \
-    '        )\n' \
-    '        return output\n' \
-    '    except (AttributeError, RuntimeError, ImportError):\n' \
-    '        pass  # Fall through to PyTorch implementation', \
-    '    # Try CUDA fused kernel (Phase 3)\n' \
-    '    if _tq_cuda_ext is not None:\n' \
-    '        try:\n' \
-    '            output = torch.empty_like(key)\n' \
-    '            _tq_cuda_ext.round_trip(\n' \
-    '                key, Pi.float().contiguous(), S.float().contiguous(),\n' \
-    '                centroids.float().contiguous(),\n' \
-    '                output, key.shape[-1], centroids.shape[0])\n' \
-    '            return output\n' \
-    '        except Exception:\n' \
-    '            pass'); \
-open(F, 'w').write(c); \
-print('Patched quantizer.py')"
-
-# 7. Pre-build JIT extension (cached for fast startup)
-RUN python3 -c "\
-from torch.utils.cpp_extension import load; \
+# 5. Pre-build JIT extension
+RUN python3 -c "from torch.utils.cpp_extension import load; \
 tq = load(name='tq_serve', \
     sources=['/opt/tq_build/tq_ext.cu', '/opt/tq_build/tq_round_trip.cu'], \
     extra_cuda_cflags=['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--use_fast_math', \
-                       '-gencode=arch=compute_121,code=sm_121', \
-                       '-diag-suppress=177,3288'], \
-    extra_include_paths=['/opt/tq_build'], \
-    verbose=True); \
-print('JIT kernel built:', tq)"
+                       '-gencode=arch=compute_121,code=sm_121', '-diag-suppress=177,3288'], \
+    extra_include_paths=['/opt/tq_build'], verbose=True); \
+print('Built:', tq)"
 
-# 8. Verify
-RUN python3 -c "\
-from vllm.config.cache import CacheDType; \
-print('tq3 in CacheDType:', 'tq3' in str(CacheDType)); \
-from vllm.turboquant.quantizer import _tq_cuda_ext; \
-print('CUDA ext:', _tq_cuda_ext)"
-
-# 9. Clear pycache
+# 6. Verify + cleanup
+RUN python3 -c "from vllm.config.cache import CacheDType; print('tq3:', 'tq3' in str(CacheDType))"
 RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
