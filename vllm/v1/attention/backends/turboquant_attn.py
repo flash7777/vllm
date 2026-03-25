@@ -145,9 +145,10 @@ class TurboQuantImpl(FlashInferImpl):
             return
 
         self._ensure_decomp_buffer(kv_cache)
-        Pi = self._get_cached_pi(layer)
-        S = self._get_cached_s(layer)
-        centroids = self._get_cached_centroids(layer)
+        device = key.device
+        Pi = self._get_cached_pi(layer, device)
+        S = self._get_cached_s(layer, device)
+        centroids = self._get_cached_centroids(layer, device)
         packed_size = self._tq_config.key_packed_size
         mse_bits = self._tq_config.mse_bits
         D = self.head_size
@@ -207,22 +208,22 @@ class TurboQuantImpl(FlashInferImpl):
 
     # ── Helper methods ────────────────────────────────────────────────
 
-    def _get_cached_pi(self, layer):
-        if not hasattr(layer, '_tq_Pi_f32'):
-            device = layer._tq_Pi.device
-            layer._tq_Pi_f32 = layer._tq_Pi.to(device).float().contiguous()
+    def _get_cached_pi(self, layer, device=None):
+        if not hasattr(layer, '_tq_Pi_f32') or (device and layer._tq_Pi_f32.device != device):
+            d = device or torch.device("cuda")
+            layer._tq_Pi_f32 = layer._tq_Pi.to(d).float().contiguous()
         return layer._tq_Pi_f32
 
-    def _get_cached_s(self, layer):
-        if not hasattr(layer, '_tq_S_f32'):
-            device = layer._tq_S.device
-            layer._tq_S_f32 = layer._tq_S.to(device).float().contiguous()
+    def _get_cached_s(self, layer, device=None):
+        if not hasattr(layer, '_tq_S_f32') or (device and layer._tq_S_f32.device != device):
+            d = device or torch.device("cuda")
+            layer._tq_S_f32 = layer._tq_S.to(d).float().contiguous()
         return layer._tq_S_f32
 
-    def _get_cached_centroids(self, layer):
-        if not hasattr(layer, '_tq_c_f32'):
-            device = layer._tq_centroids.device
-            layer._tq_c_f32 = layer._tq_centroids.to(device).float().contiguous()
+    def _get_cached_centroids(self, layer, device=None):
+        if not hasattr(layer, '_tq_c_f32') or (device and layer._tq_c_f32.device != device):
+            d = device or torch.device("cuda")
+            layer._tq_c_f32 = layer._tq_centroids.to(d).float().contiguous()
         return layer._tq_c_f32
 
     @staticmethod
