@@ -241,6 +241,14 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
+        # TurboQuant: init buffers, then masquerade as "auto" for the rest
+        # of the pipeline (backend selection, cache allocation, etc.)
+        self._tq_enabled = kv_cache_dtype.startswith("tq")
+        if self._tq_enabled:
+            self._tq_original_dtype = kv_cache_dtype
+            self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
+            kv_cache_dtype = "auto"
+
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
@@ -357,10 +365,6 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
-
-        # Initialize TurboQuant buffers (Pi, S, centroids) if tq cache dtype
-        if kv_cache_dtype.startswith("tq"):
-            self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
 
         # for attn backends supporting query quantization
         self.query_quant = None
@@ -686,6 +690,11 @@ def unified_kv_cache_update(
     """
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
+        # TurboQuant: apply lossy quantize→dequant round-trip on keys
+        if getattr(attn_layer, '_tq_enabled', False):
+            from vllm.turboquant.quantizer import tq_round_trip_keys
+            key = tq_round_trip_keys(key, attn_layer)
+
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )

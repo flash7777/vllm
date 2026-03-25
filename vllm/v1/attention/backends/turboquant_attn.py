@@ -13,9 +13,14 @@ from typing import ClassVar
 
 import torch
 
-from vllm.attention import AttentionType
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+
+try:
+    from vllm.attention import AttentionType
+except ImportError:
+    from vllm.v1.attention.backend import AttentionType  # type: ignore
+
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,

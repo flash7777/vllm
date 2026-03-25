@@ -21,7 +21,7 @@ def generate_rotation_matrix(
     """Generate Haar-distributed random orthogonal matrix via QR decomposition."""
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
-    G = torch.randn(d, d, generator=gen)
+    G = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
     Q, R = torch.linalg.qr(G)
     # Fix sign ambiguity for determinism
     diag_sign = torch.sign(torch.diag(R))
@@ -36,8 +36,59 @@ def generate_qjl_matrix(
     """Generate i.i.d. N(0,1) projection matrix for QJL."""
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
-    S = torch.randn(d, d, generator=gen)
+    S = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
     return S.to(device)
+
+
+@torch.no_grad()
+def tq_round_trip_keys(
+    key: torch.Tensor,
+    attn_layer: torch.nn.Module,
+) -> torch.Tensor:
+    """Apply TQ quantize→dequant round-trip on keys (lossy compression).
+
+    Called transparently in the KV cache update path.
+    key: (num_tokens, num_kv_heads, head_size)
+    attn_layer: Attention module with _tq_Pi, _tq_S, _tq_centroids buffers.
+    Returns: reconstructed key with TQ compression artifacts.
+    """
+    Pi = attn_layer._tq_Pi
+    S = attn_layer._tq_S
+    centroids = attn_layer._tq_centroids
+
+    orig_dtype = key.dtype
+    num_tokens, num_heads, head_size = key.shape
+    flat = key.reshape(-1, head_size).float()
+
+    # 1. Normalize
+    vec_norm = torch.norm(flat, dim=-1, keepdim=True)
+    x_hat = flat / (vec_norm + 1e-8)
+
+    # 2. Rotate
+    rotated = x_hat @ Pi.T
+
+    # 3. Scalar quantize to nearest centroid
+    diffs = rotated.unsqueeze(-1) - centroids
+    indices = diffs.abs().argmin(dim=-1)
+
+    # 4. Reconstruct MSE
+    y_hat = centroids[indices]
+    x_mse = y_hat @ Pi
+
+    # 5. Residual + QJL
+    residual = x_hat - x_mse
+    res_norm = torch.norm(residual, dim=-1, keepdim=True)
+    projected = residual @ S.T
+    signs = torch.sign(projected)
+    signs[signs == 0] = 1.0
+
+    # 6. QJL reconstruction
+    correction_scale = math.sqrt(math.pi / 2) / head_size
+    x_qjl = correction_scale * res_norm * (signs @ S)
+
+    # 7. Combine
+    x_recon = vec_norm * (x_mse + x_qjl)
+    return x_recon.reshape(num_tokens, num_heads, head_size).to(orig_dtype)
 
 
 class TurboQuantizer(nn.Module):
