@@ -127,6 +127,62 @@ def main():
     else:
         print(f"  [skip] attention.py — already patched")
 
+    # 7. Fix _layer_idx + _os + _riy NameErrors in FusedMoE (RIY bug)
+    moe_path = f"{VLLM}/model_executor/layers/fused_moe/layer.py"
+    with open(moe_path) as f:
+        content = f.read()
+    if "# TQ-fix: extract _layer_idx" not in content:
+        # Add missing imports at top
+        content = content.replace(
+            "import vllm.envs as envs",
+            "import os as _os\nimport vllm.envs as envs",
+        )
+        # Add _riy import (lazy, may not exist)
+        content = content.replace(
+            "from vllm.logger import init_logger",
+            "from vllm.logger import init_logger\n"
+            "try:\n"
+            "    from vllm.model_executor.layers.fused_moe import riy as _riy\n"
+            "except ImportError:\n"
+            "    _riy = None",
+        )
+        # Extract _layer_idx from prefix before it's used
+        content = content.replace(
+            "self._prune_logit_mask = None  # set below after _layer_idx is known",
+            "# TQ-fix: extract _layer_idx from prefix (e.g. 'model.layers.5.mlp')\n"
+            "        import re as _re_moe\n"
+            "        _m = _re_moe.search(r'layers\\.(\\d+)', prefix)\n"
+            "        _layer_idx = int(_m.group(1)) if _m else -1\n\n"
+            "        self._prune_logit_mask = None  # set below after _layer_idx is known",
+        )
+        # Guard _riy calls
+        content = content.replace(
+            "if _layer_idx >= 0 and _os.environ.get(\"VLLM_RIY_MONITOR\", \"0\") == \"1\":",
+            "if _layer_idx >= 0 and _riy is not None and _os.environ.get(\"VLLM_RIY_MONITOR\", \"0\") == \"1\":",
+        )
+        with open(moe_path, "w") as f:
+            f.write(content)
+        print(f"  [ok] layer.py (_layer_idx + _os + _riy fix)")
+    else:
+        print(f"  [skip] layer.py — already patched")
+
+    # 8. Fix kv_cache_dtype_str_to_dtype for TQ (maps to model dtype, not uint8)
+    tu_path = f"{VLLM}/utils/torch_utils.py"
+    with open(tu_path) as f:
+        content = f.read()
+    if "def kv_cache_dtype_str_to_dtype" in content and "tq3" not in content.split("kv_cache_dtype_str_to_dtype")[1][:200]:
+        content = content.replace(
+            '    if kv_cache_dtype == "auto":',
+            '    if kv_cache_dtype.startswith("tq"):\n'
+            '        return model_config.dtype if model_config else torch.half\n'
+            '    if kv_cache_dtype == "auto":',
+        )
+        with open(tu_path, "w") as f:
+            f.write(content)
+        print(f"  [ok] torch_utils.py (kv_cache_dtype_str_to_dtype TQ fix)")
+    else:
+        print(f"  [skip] torch_utils.py — already patched or not found")
+
     print("\nDone! TurboQuant patches applied.")
 
 
