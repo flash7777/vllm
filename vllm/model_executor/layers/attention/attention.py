@@ -358,6 +358,10 @@ class Attention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # Initialize TurboQuant buffers (Pi, S, centroids) if tq cache dtype
+        if kv_cache_dtype.startswith("tq"):
+            self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
+
         # for attn backends supporting query quantization
         self.query_quant = None
         if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
@@ -373,6 +377,39 @@ class Attention(nn.Module, AttentionLayerBase):
                 if is_per_head
                 else GroupShape.PER_TENSOR,
             )
+
+    def _init_turboquant_buffers(
+        self, cache_dtype: str, head_size: int, prefix: str
+    ) -> None:
+        """Initialize TurboQuant rotation/projection matrices and centroids."""
+        import re
+        from vllm.turboquant.config import TurboQuantConfig
+        from vllm.turboquant.quantizer import (
+            generate_rotation_matrix,
+            generate_qjl_matrix,
+        )
+        from vllm.turboquant.centroids import get_centroids
+
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+
+        # Extract layer index from prefix (e.g. "model.layers.5.self_attn")
+        match = re.search(r"layers\.(\d+)", prefix)
+        layer_idx = int(match.group(1)) if match else 0
+        seed = tq_config.seed + layer_idx * 1337
+
+        self.register_buffer(
+            "_tq_Pi",
+            generate_rotation_matrix(head_size, seed=seed),
+        )
+        self.register_buffer(
+            "_tq_S",
+            generate_qjl_matrix(head_size, seed=seed + 1),
+        )
+        self.register_buffer(
+            "_tq_centroids",
+            get_centroids(head_size, tq_config.mse_bits),
+        )
+        self._tq_config = tq_config
 
     def forward(
         self,
