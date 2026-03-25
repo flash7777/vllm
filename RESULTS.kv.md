@@ -26,21 +26,26 @@
 
 ## Context Scaling (Qwen3.5-35B, 100 gen tokens, DGX Spark)
 
-| Context | FP8 tok/s | TQ3 tok/s | TQ4 tok/s | TQ3 vs FP8 |
-|---------|-----------|-----------|-----------|------------|
-| 0       | 42.0      | 45.7      | 15.1*     | +9%        |
-| 512     | 41.3      | 38.1      | 13.5*     | -8%        |
-| 2K      | 38.5      | 33.3      | 35.0      | -13%       |
-| 8K      | 29.3      | 26.6      | 29.1      | -9%        |
-| 32K     | 13.5      | 13.5      | 13.9      | 0%         |
-| 64K     | —         | —         | 7.5       | —          |
-| 128K    | —         | —         | 3.3       | —          |
+| Context | FP8 tok/s | TQ3 tok/s | TQ4 tok/s | TQ3+FP8 tok/s | TQ3 vs FP8 |
+|---------|-----------|-----------|-----------|--------------|------------|
+| 0       | 42.0*     | 45.7      | 15.1*     | 15.6*        | +9%        |
+| 2K      | 38.5      | 33.3      | 35.0      | 13.7*        | -13%       |
+| 8K      | 29.3      | 26.6      | 29.1      | 32.6         | -9%        |
+| 32K     | 13.5      | 13.5      | 13.9      | 14.5         | 0%         |
+| 64K     | 6.9       | —         | 7.5       | 7.2          | —          |
+| 128K    | 2.9       | —         | 3.3       | 2.9          | —          |
 
-*TQ4 ctx=0/512 affected by JIT warmup
+*Low-context values affected by JIT/warmup artifacts
 
-**NOTE**: Phase 1 — TQ round-trip does NOT save KV-cache memory.
-Keys are decompressed back to BF16 before storage. Same cache size as FP8/auto.
-Phase 2 (compressed cache format + custom attention) needed for actual savings.
+**TQ3+FP8**: TQ round-trip on keys + FP8 KV-cache storage.
+Same memory as FP8 (2× compression), but TQ improves key quality.
+Enabled via `VLLM_TQ_ROUNDTRIP=1` + `--kv-cache-dtype fp8`.
+
+At 8K context TQ3+FP8 is **+19% faster** than FP8 alone (32.6 vs 27.4).
+At 32K+ contexts, throughput converges (memory-bound, same cache size).
+
+**NOTE**: Phase 1 TQ round-trip does NOT save additional KV-cache memory
+beyond what FP8 provides. Asymmetric K/V layout (Q2) needed for 4-5× savings.
 
 ## Config
 

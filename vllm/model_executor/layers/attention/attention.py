@@ -243,11 +243,18 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # TurboQuant: init buffers, then masquerade as "auto" for the rest
         # of the pipeline (backend selection, cache allocation, etc.)
-        self._tq_enabled = kv_cache_dtype.startswith("tq")
+        # Also supports VLLM_TQ_ROUNDTRIP=1 with any kv_cache_dtype (e.g. fp8)
+        import os as _tq_os
+        self._tq_enabled = (
+            kv_cache_dtype.startswith("tq")
+            or _tq_os.environ.get("VLLM_TQ_ROUNDTRIP", "0") == "1"
+        )
         if self._tq_enabled:
             self._tq_original_dtype = kv_cache_dtype
-            self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
-            kv_cache_dtype = "auto"
+            tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"
+            self._init_turboquant_buffers(tq_bits, head_size, prefix)
+            if kv_cache_dtype.startswith("tq"):
+                kv_cache_dtype = "auto"
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
