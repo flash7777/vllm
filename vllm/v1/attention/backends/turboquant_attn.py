@@ -81,13 +81,23 @@ class TurboQuantImpl(FlashInferImpl):
     """Compressed KV-cache with on-demand decompression for FlashInfer."""
 
     def __init__(self, *args, **kwargs):
-        kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+        # kv_cache_dtype is 7th positional arg (index 6) or kwarg
+        if len(args) > 6:
+            kv_cache_dtype = args[6]
+        else:
+            kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+
         self._tq_cache_dtype = kv_cache_dtype
-        self._tq_enabled = kv_cache_dtype.startswith("tq")
+        self._tq_enabled = isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("tq")
 
         # FlashInfer needs "auto" for internal setup
         if self._tq_enabled:
-            kwargs["kv_cache_dtype"] = "auto"
+            if len(args) > 6:
+                args = list(args)
+                args[6] = "auto"
+                args = tuple(args)
+            else:
+                kwargs["kv_cache_dtype"] = "auto"
 
         super().__init__(*args, **kwargs)
 
