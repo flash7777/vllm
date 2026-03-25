@@ -48,6 +48,8 @@ def tq_round_trip_keys(
     """Apply TQ quantize→dequant round-trip on keys (lossy compression).
 
     Called transparently in the KV cache update path.
+    Tries CUDA fused kernel first, falls back to PyTorch.
+
     key: (num_tokens, num_kv_heads, head_size)
     attn_layer: Attention module with _tq_Pi, _tq_S, _tq_centroids buffers.
     Returns: reconstructed key with TQ compression artifacts.
@@ -57,6 +59,29 @@ def tq_round_trip_keys(
     S = attn_layer._tq_S.to(device)
     centroids = attn_layer._tq_centroids.to(device)
 
+    # Try CUDA fused kernel (Phase 3)
+    try:
+        output = torch.empty_like(key)
+        from vllm._custom_ops import turboquant_round_trip
+        turboquant_round_trip(
+            key, Pi.float(), S.float(), centroids.float(),
+            output, key.shape[-1], centroids.shape[0],
+        )
+        return output
+    except (AttributeError, RuntimeError, ImportError):
+        pass  # Fall through to PyTorch implementation
+
+    return _tq_round_trip_pytorch(key, Pi, S, centroids)
+
+
+@torch.no_grad()
+def _tq_round_trip_pytorch(
+    key: torch.Tensor,
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+) -> torch.Tensor:
+    """PyTorch fallback for TQ round-trip."""
     orig_dtype = key.dtype
     num_tokens, num_heads, head_size = key.shape
     flat = key.reshape(-1, head_size).float()

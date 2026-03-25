@@ -2,6 +2,7 @@
 #include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
+#include "quantization/turboquant/tq_round_trip.cuh"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -772,6 +773,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor kv_cache_scale) -> ()");
   cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
                  &concat_and_cache_mla_rope_fused);
+
+  // TurboQuant fused round-trip: quantize→dequant keys in one kernel.
+  cache_ops.def(
+      "turboquant_round_trip(Tensor key, Tensor Pi, Tensor S,"
+      "                      Tensor centroids, Tensor! output,"
+      "                      int head_size, int n_centroids) -> ()");
+  cache_ops.impl("turboquant_round_trip", torch::kCUDA,
+                 &turboquant::turboquant_round_trip);
 
   // Convert the key and value cache to fp8 data type.
   cache_ops.def(
