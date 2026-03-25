@@ -111,8 +111,9 @@ class TurboQuantImpl(FlashInferImpl):
 
     def _ensure_decomp_buffer(self, kv_cache: torch.Tensor):
         """Allocate temp BF16 buffer matching the compressed cache's block count."""
+        if kv_cache.dim() < 5:
+            return  # Empty placeholder, skip
         if self._decomp_kv_cache is not None:
-            # Check if size still matches
             if self._decomp_kv_cache.shape[0] == kv_cache.shape[0]:
                 return
         num_blocks = kv_cache.shape[0]
