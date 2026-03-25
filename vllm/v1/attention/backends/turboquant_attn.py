@@ -183,7 +183,8 @@ class TurboQuantImpl(FlashInferImpl):
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward: use decompressed BF16 buffer for FlashInfer attention."""
-        if self._tq_enabled and self._decomp_kv_cache is not None:
+        if self._tq_enabled:
+            self._ensure_decomp_buffer(kv_cache)
             # FlashInfer reads from the full-size BF16 buffer
             return super().forward(
                 layer, query, key, value,
