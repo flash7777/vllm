@@ -41,11 +41,9 @@ class TurboQuantAttentionBackend(FlashInferBackend):
         head_size: int,
         cache_dtype_str: str = "tq3",
     ) -> tuple[int, ...]:
-        """Compressed cache: head_size replaced by tq_packed_size."""
-        from vllm.turboquant.config import TurboQuantConfig
-        if cache_dtype_str.startswith("tq"):
-            tq = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
-            return (num_blocks, 2, block_size, num_kv_heads, tq.cache_head_size)
+        """Cache shape — head_size is ALREADY the packed size from get_kv_cache_spec."""
+        # head_size comes from FullAttentionSpec which we set to cache_head_size
+        # in get_kv_cache_spec. Don't re-compress — use it directly.
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -57,6 +55,26 @@ class TurboQuantAttentionBackend(FlashInferBackend):
     @staticmethod
     def get_impl_cls() -> type["TurboQuantImpl"]:
         return TurboQuantImpl
+
+    @staticmethod
+    def get_builder_cls():
+        return TurboQuantMetadataBuilder
+
+
+class TurboQuantMetadataBuilder(FlashInferBackend.get_builder_cls()):
+    """FlashInfer metadata builder that accepts uint8 cache dtype."""
+
+    def __init__(self, *args, **kwargs):
+        # Temporarily patch kv_cache_spec dtype to model dtype for parent init
+        kv_cache_spec = args[0] if args else kwargs.get("kv_cache_spec")
+        if kv_cache_spec is not None and kv_cache_spec.dtype == torch.uint8:
+            from dataclasses import replace
+            patched_spec = replace(kv_cache_spec, dtype=torch.bfloat16)
+            if args:
+                args = (patched_spec,) + args[1:]
+            else:
+                kwargs["kv_cache_spec"] = patched_spec
+        super().__init__(*args, **kwargs)
 
 
 class TurboQuantImpl(FlashInferImpl):
