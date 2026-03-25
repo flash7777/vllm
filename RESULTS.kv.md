@@ -24,6 +24,24 @@
 | TQ3      | —           | —             | —           | —    | Pending |
 | TQ4      | —           | —             | —           | —    | Pending |
 
+## Context Scaling (Qwen3.5-35B, 100 gen tokens, DGX Spark)
+
+| Context | FP8 tok/s | TQ3 tok/s | TQ4 tok/s | TQ3 vs FP8 |
+|---------|-----------|-----------|-----------|------------|
+| 0       | 42.0      | 45.7      | 15.1*     | +9%        |
+| 512     | 41.3      | 38.1      | 13.5*     | -8%        |
+| 2K      | 38.5      | 33.3      | 35.0      | -13%       |
+| 8K      | 29.3      | 26.6      | 29.1      | -9%        |
+| 32K     | 13.5      | 13.5      | 13.9      | 0%         |
+| 64K     | —         | —         | 7.5       | —          |
+| 128K    | —         | —         | 3.3       | —          |
+
+*TQ4 ctx=0/512 affected by JIT warmup
+
+**NOTE**: Phase 1 — TQ round-trip does NOT save KV-cache memory.
+Keys are decompressed back to BF16 before storage. Same cache size as FP8/auto.
+Phase 2 (compressed cache format + custom attention) needed for actual savings.
+
 ## Config
 
 ```
