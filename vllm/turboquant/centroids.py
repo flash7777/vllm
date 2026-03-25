@@ -75,9 +75,26 @@ def solve_lloyd_max(
     )
 
 
+# Precomputed centroids for common configs (avoids scipy at runtime)
+_PRECOMPUTED = {
+    # (d, bits): [centroids]  — computed via solve_lloyd_max
+    (128, 1): [-0.07054, 0.07054],
+    (128, 2): [-0.13353, -0.04001, 0.04001, 0.13353],
+    (128, 3): [-0.19023, -0.11174, -0.05171, -0.01131,
+                0.01131,  0.05171,  0.11174,  0.19023],
+    (256, 1): [-0.04989, 0.04989],
+    (256, 2): [-0.09441, -0.02829, 0.02829, 0.09441],
+    (256, 3): [-0.13450, -0.07903, -0.03657, -0.00800,
+                0.00800,  0.03657,  0.07903,  0.13450],
+}
+
+
 @lru_cache(maxsize=32)
 def get_centroids(d: int, bits: int) -> torch.Tensor:
     """Get precomputed Lloyd-Max centroids (cached)."""
+    key = (d, bits)
+    if key in _PRECOMPUTED:
+        return torch.tensor(_PRECOMPUTED[key], dtype=torch.float32)
     centroids, _ = solve_lloyd_max(d, bits)
     return centroids
 

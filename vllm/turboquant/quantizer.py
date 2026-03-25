@@ -54,20 +54,24 @@ def tq_round_trip_keys(
     attn_layer: Attention module with _tq_Pi, _tq_S, _tq_centroids buffers.
     Returns: reconstructed key with TQ compression artifacts.
     """
-    device = key.device
-    Pi = attn_layer._tq_Pi.to(device)
-    S = attn_layer._tq_S.to(device)
-    centroids = attn_layer._tq_centroids.to(device)
+    # v3 optimization: cache contiguous float32 versions on first call
+    # to avoid .to(device).float().contiguous() on every token.
+    if not hasattr(attn_layer, '_tq_Pi_f32'):
+        device = key.device
+        attn_layer._tq_Pi_f32 = attn_layer._tq_Pi.to(device).float().contiguous()
+        attn_layer._tq_S_f32 = attn_layer._tq_S.to(device).float().contiguous()
+        attn_layer._tq_c_f32 = attn_layer._tq_centroids.to(device).float().contiguous()
+
+    Pi = attn_layer._tq_Pi_f32
+    S = attn_layer._tq_S_f32
+    centroids = attn_layer._tq_c_f32
 
     # Try CUDA fused kernel (Phase 3)
     try:
         output = torch.empty_like(key)
         from vllm._custom_ops import turboquant_round_trip
-        turboquant_round_trip(
-            key, Pi.float().contiguous(), S.float().contiguous(),
-            centroids.float().contiguous(),
-            output, key.shape[-1], centroids.shape[0],
-        )
+        turboquant_round_trip(key, Pi, S, centroids, output,
+                              key.shape[-1], centroids.shape[0])
         return output
     except (AttributeError, RuntimeError, ImportError):
         pass  # Fall through to PyTorch implementation
