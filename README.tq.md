@@ -6,6 +6,29 @@ enabling longer context lengths and higher throughput within the same GPU memory
 Based on: *"TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"*
 (ICLR 2026, Zandieh, Daliri, Hadian, Mirrokni — Google Research / NYU / DeepMind)
 
+## Quick Start
+
+```bash
+# Build the container image (one-time)
+cd ~/vllm-riy
+podman build -f Dockerfile.tq -t vllm-ng17e-tq .
+
+# Start serving with TQ3 (3-bit KV cache)
+podman run -d --name vllm-tq \
+  --device nvidia.com/gpu=all --security-opt=label=disable \
+  --hooks-dir=/usr/share/containers/oci/hooks.d \
+  -p 8011:8000 -v /data/tensordata:/data/tensordata \
+  -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  vllm-ng17e-tq \
+  vllm serve /data/tensordata/Qwen3.5-35B-A3B-int4-AutoRound \
+    --served-model-name qwen35-35b \
+    --kv-cache-dtype tq3 \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.05 --kv-cache-memory-bytes 10G \
+    --max-model-len 32768 --trust-remote-code --enforce-eager \
+    --limit-mm-per-prompt '{"image":0,"video":0}'
+```
+
 ## How It Works
 
 Two-stage compression per KV vector:
@@ -14,139 +37,95 @@ Two-stage compression per KV vector:
    Uses (b-1) bits per coordinate for near-optimal MSE distortion.
 
 2. **QJL (residual correction)**: 1-bit sign quantization of the residual via the
-   Quantized Johnson-Lindenstrauss transform. This corrects the inner-product bias
-   inherent in MSE quantizers, yielding **unbiased** attention scores.
+   Quantized Johnson-Lindenstrauss transform. Corrects inner-product bias,
+   yielding **unbiased** attention scores.
 
-```
-Storage per KV vector (tq3, head_dim=128):
-  MSE indices:  32 bytes  (128 × 2 bits / 8)
-  QJL signs:    16 bytes  (128 × 1 bit / 8)
-  Norms:         4 bytes  (vec_norm + residual_norm as float16)
-  Total:        52 bytes  vs 256 bytes FP16 → 4.9× key compression
-```
+TQ integrates as a **transparent wrapper** — the normal attention backend
+(FlashInfer/FlashAttention) handles all attention computation. TQ only modifies
+keys before they enter the KV cache via a fused CUDA kernel.
 
-## CLI Usage
+## CLI Parameters
 
 ```bash
 vllm serve <model> --kv-cache-dtype tq3    # 3-bit (2-bit MSE + 1-bit QJL)
 vllm serve <model> --kv-cache-dtype tq4    # 4-bit (3-bit MSE + 1-bit QJL)
 ```
 
-### Full Example (DGX Spark)
+All other vLLM parameters work unchanged.
 
-```bash
-vllm serve /data/tensordata/Qwen3.5-35B-A3B-int4-AutoRound \
-  --served-model-name qwen35-35b-tq3 \
-  --host 0.0.0.0 --port 8011 \
-  --kv-cache-dtype tq3 \
-  --gpu-memory-utilization 0.05 \
-  --kv-cache-memory-bytes 10G \
-  --max-model-len 131072 \
-  --trust-remote-code \
-  --enforce-eager
+## Benchmark Results
+
+**Qwen3.5-35B-A3B (INT4 AutoRound) on DGX Spark (GB10 SM121)**
+
+| KV-Cache | Short (20t) | Medium (150t) | Long (400t) | Math | Overhead |
+|----------|-------------|---------------|-------------|------|----------|
+| FP8      | 2.6 tok/s   | 47.8 tok/s    | 36.2 tok/s  | 100% | Baseline |
+| TQ3 v2   | 8.1 tok/s   | 35.5 tok/s    | 32.9 tok/s  | 100% | -9% long |
+
+**Zero quality loss** — 100% math accuracy across all configurations.
+
+## CUDA Kernel
+
+The fused kernel (`tq_round_trip.cu`) performs all 8 TQ stages in a single launch:
+
+```
+normalize → rotate(Pi) → quantize → reconstruct → residual → QJL(S) → correct → combine
 ```
 
-### Parameters
+Optimizations (v2):
+- Tiled GEMV with shared memory vector tiles (TILE_K=32)
+- float4 vectorized loads (128-bit coalesced reads)
+- Warp-shuffle reductions (no shared memory for block reduce)
+- `__launch_bounds__(256, 4)` for register pressure control
+- Precomputed centroids (no scipy at runtime)
+- Cached float32 contiguous buffers (no .to()/.float()/.contiguous() per call)
 
-| Parameter | Values | Description |
-|-----------|--------|-------------|
-| `--kv-cache-dtype tq3` | `tq3`, `tq4` | TurboQuant 3-bit or 4-bit KV-cache |
-| `--max-model-len` | int | Can be set higher than FP8/FP16 due to memory savings |
-| `--kv-cache-memory-bytes` | e.g. `10G` | Same as FP8; TQ fits more tokens in same memory |
-
-All other vLLM parameters work unchanged (`--tensor-parallel-size`, `--quantization`, etc).
-
-## Compression Comparison
-
-| KV-Cache Type | Bits/coord | Bytes/vector (d=128) | Compression vs FP16 |
-|---------------|-----------|---------------------|-------------------|
-| FP16          | 16        | 256                 | 1.0×              |
-| FP8           | 8         | 128                 | 2.0×              |
-| **TQ4**       | **4**     | **68**              | **3.8×**          |
-| **TQ3**       | **3**     | **52**              | **4.9×**          |
-
-*Phase 1: Only keys compressed. Values stored as FP16. Net K+V compression ~2× for tq3.*
-
-## Quality
-
-Tested on random vectors (d=128), comparing TurboQuant attention scores vs FP16 reference:
-
-| Metric | TQ3 | TQ4 |
-|--------|-----|-----|
-| Score correlation | 0.92 | 0.98 |
-| Attention output cosine similarity | 0.92 | 0.98 |
-| Inner product bias | < 0.005 | < 0.002 |
-| Needle-in-haystack top-1 | 100% | 100% |
+Micro-benchmark: **33µs** per call (256 threads, head_dim=256)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│ vllm serve --kv-cache-dtype tq3                 │
-│   │                                             │
-│   ├─ config/cache.py: CacheDType "tq3"/"tq4"   │
-│   ├─ platforms/cuda.py: TURBOQUANT priority     │
-│   ├─ attention backend selector                 │
-│   │                                             │
-│   └─ TurboQuantAttentionBackend                 │
-│       ├─ PREFILL: FlashAttention (FP16)         │
-│       │           → quantize → store in cache   │
-│       └─ DECODE:  Fused TQ score kernel         │
-│                   q_rot = Q @ Pi^T (once)       │
-│                   per token: gather + bit-unpack │
-└─────────────────────────────────────────────────┘
+vllm serve --kv-cache-dtype tq3
+  ↓
+Attention.__init__:
+  _tq_enabled = True
+  kv_cache_dtype = "auto"  ← masquerade for backend selector
+  Pi, S, centroids = register_buffer(...)
+  ↓
+Normal backend selected (FlashInfer on SM121)
+  ↓
+unified_kv_cache_update:
+  if _tq_enabled:
+    key = tq_round_trip_keys(key)  ← CUDA fused kernel
+  do_kv_cache_update(key, value, ...)  ← normal FlashInfer
 ```
 
-### Key Files
+## Container Image
+
+`vllm-ng17e-tq` = `vllm-ng17e-riy` + TurboQuant baked in:
+- Python module: `vllm/turboquant/`
+- CUDA kernel: pre-compiled JIT extension for SM121
+- All patches pre-applied (no runtime patching)
+
+Build: `podman build -f Dockerfile.tq -t vllm-ng17e-tq .`
+
+## Files
 
 | File | Purpose |
 |------|---------|
-| `vllm/turboquant/config.py` | TurboQuantConfig (bits, packed_size) |
-| `vllm/turboquant/centroids.py` | Lloyd-Max codebook computation |
-| `vllm/turboquant/quantizer.py` | Quantize, dequantize, pack/unpack, attention_scores |
-| `vllm/v1/attention/backends/turboquant_attn.py` | Attention backend (PyTorch + Triton) |
-| `vllm/v1/attention/ops/triton_tq_reshape_and_cache.py` | Triton: quantize-on-store |
-| `vllm/v1/attention/ops/triton_tq_attention_score.py` | Triton: fused decode score |
+| `Dockerfile.tq` | Container image build |
+| `vllm/turboquant/config.py` | TurboQuantConfig |
+| `vllm/turboquant/centroids.py` | Lloyd-Max codebook (precomputed) |
+| `vllm/turboquant/quantizer.py` | tq_round_trip_keys() + PyTorch fallback |
+| `csrc/quantization/turboquant/tq_round_trip.cu` | Fused CUDA kernel (v2) |
+| `csrc/quantization/turboquant/tq_ext.cu` | JIT extension wrapper |
 | `tests/turboquant/test_quantizer.py` | Standalone correctness tests |
-| `tests/turboquant/test_cache_pipeline.py` | End-to-end cache pipeline tests |
-| `tests/turboquant/patch_container.py` | Runtime patching for container images |
-
-## Container Usage
-
-For existing vLLM container images without TurboQuant built in:
-
-```bash
-# Mount TQ code + run patch script
-podman run -d --name vllm-tq \
-  -v /path/to/vllm-riy/vllm/turboquant:/usr/local/lib/.../vllm/turboquant:ro \
-  -v /path/to/vllm-riy/tests/turboquant/patch_container.py:/opt/patch.py:ro \
-  ... \
-  vllm-ng17e-riy bash -c "python3 /opt/patch.py && vllm serve ... --kv-cache-dtype tq3"
-```
-
-## Running Tests
-
-```bash
-# Standalone (no GPU needed)
-python3 tests/turboquant/test_quantizer.py
-python3 tests/turboquant/test_cache_pipeline.py
-
-# Inside container with GPU
-bash tests/turboquant/start_qwen35_tq.sh test
-```
+| `tests/turboquant/test_cuda_kernel.py` | CUDA kernel unit tests |
+| `tests/turboquant/patch_tq_transparent.py` | Runtime patching for other images |
 
 ## References
 
-- [TurboQuant paper](https://arxiv.org/abs/2504.19874) — Algorithms 1+2, Theorems 1-3
-- [QJL CUDA kernels](https://github.com/amirzandieh/QJL) — Sign-bit quantization (same first author)
-- [PolarQuant](https://github.com/ericshwu/PolarQuant) — Triton fused attention kernel reference
-- [turboquant-pytorch](https://github.com/tonbistudio/turboquant-pytorch) — PyTorch reference implementation
-
-## Status
-
-**Phase 1** (current): PyTorch reference + Triton kernel drafts. Keys compressed, values FP16.
-GPU quantization benchmark: 13M vecs/s on DGX Spark GB10.
-
-**Phase 2** (planned): Triton kernels validated on GPU, value compression, full MetadataBuilder.
-
-**Phase 3** (planned): CUDA fused kernels based on QJL CUDA code, production-ready.
+- [TurboQuant paper](https://arxiv.org/abs/2504.19874)
+- [QJL CUDA kernels](https://github.com/amirzandieh/QJL) (same first author)
+- [PolarQuant](https://github.com/ericshwu/PolarQuant)
+- [turboquant-pytorch](https://github.com/tonbistudio/turboquant-pytorch)
