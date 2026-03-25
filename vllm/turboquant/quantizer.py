@@ -27,7 +27,7 @@ def generate_rotation_matrix(
     diag_sign = torch.sign(torch.diag(R))
     diag_sign[diag_sign == 0] = 1.0
     Q = Q * diag_sign.unsqueeze(0)
-    return Q.to(device)
+    return Q.contiguous().to(device)
 
 
 def generate_qjl_matrix(
@@ -64,7 +64,8 @@ def tq_round_trip_keys(
         output = torch.empty_like(key)
         from vllm._custom_ops import turboquant_round_trip
         turboquant_round_trip(
-            key, Pi.float(), S.float(), centroids.float(),
+            key, Pi.float().contiguous(), S.float().contiguous(),
+            centroids.float().contiguous(),
             output, key.shape[-1], centroids.shape[0],
         )
         return output

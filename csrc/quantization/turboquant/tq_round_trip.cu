@@ -96,10 +96,9 @@ __global__ void turboquant_round_trip_kernel(
     // Base addresses
     const int key_offset = (token_idx * num_heads + head_idx) * D;
 
-    // Load centroids into shared memory (tiny, just N_CENTROIDS values)
-    if (tid < N_CENTROIDS) {
-        s_centroids[tid] = centroids[tid];
-    }
+    // Initialize shared memory
+    if (tid < 8) s_reduce[tid] = 0.0f;
+    if (tid < N_CENTROIDS) s_centroids[tid] = centroids[tid];
 
     // ====== Stage 1: Load key + compute L2 norm ======
     float local_val = 0.0f;
@@ -110,6 +109,8 @@ __global__ void turboquant_round_trip_kernel(
     }
 
     // Block-level reduce for L2 norm
+    if (tid < 8) s_reduce[tid] = 0.0f;
+    __syncthreads();
     float norm_sq = block_reduce_sum(local_sq, s_reduce, tid, BLOCK_SIZE);
     __shared__ float s_vec_norm;
     if (tid == 0) {
@@ -123,15 +124,14 @@ __global__ void turboquant_round_trip_kernel(
     }
     __syncthreads();
 
-    // ====== Stage 2: Rotate y = Pi^T @ x_hat (tiled GEMV) ======
-    // Pi^T[i, j] = Pi[j, i]. For row i of Pi^T, dot with x_hat.
-    // Each thread computes one element of y (if tid < D).
+    // ====== Stage 2: Rotate y = x_hat @ Pi^T ======
+    // y[i] = sum_j x_hat[j] * Pi^T[j, i] = sum_j x_hat[j] * Pi[i, j]
+    // Pi is row-major: Pi[i, j] = Pi[i * D + j]
+    // So y[tid] = sum_j x_hat[j] * Pi[tid, j] = sum_j Pi[tid * D + j] * x_hat[j]
     float y_val = 0.0f;
     if (tid < D) {
-        // y[tid] = sum_j Pi[j, tid] * x_hat[j] = sum_j Pi^T[tid, j] * x_hat[j]
-        // Pi is row-major: Pi[j, tid] = Pi[j * D + tid]
         for (int j = 0; j < D; j++) {
-            y_val += Pi[j * D + tid] * s_x_hat[j];
+            y_val += Pi[tid * D + j] * s_x_hat[j];
         }
     }
     // y_val now holds the rotated coordinate for this thread's dimension
@@ -159,13 +159,12 @@ __global__ void turboquant_round_trip_kernel(
     }
     __syncthreads();
 
-    // ====== Stage 4: Unrotate x_mse = Pi @ y_hat ======
-    // x_mse[tid] = sum_j Pi[tid, j] * y_hat[j]
-    // Pi is row-major: Pi[tid, j] = Pi[tid * D + j]
+    // ====== Stage 4: Unrotate x_mse = y_hat @ Pi ======
+    // x_mse[i] = sum_j y_hat[j] * Pi[j, i] = sum_j Pi[j * D + i] * y_hat[j]
     float x_mse_val = 0.0f;
     if (tid < D) {
         for (int j = 0; j < D; j++) {
-            x_mse_val += Pi[tid * D + j] * s_work[j];
+            x_mse_val += Pi[j * D + tid] * s_work[j];
         }
     }
     __syncthreads();
@@ -178,6 +177,8 @@ __global__ void turboquant_round_trip_kernel(
 
     // Compute residual L2 norm
     float r_sq = (tid < D) ? r_val * r_val : 0.0f;
+    if (tid < 8) s_reduce[tid] = 0.0f;
+    __syncthreads();
     float gamma_sq = block_reduce_sum(r_sq, s_reduce, tid, BLOCK_SIZE);
     __shared__ float s_gamma;
     if (tid == 0) {
@@ -191,12 +192,12 @@ __global__ void turboquant_round_trip_kernel(
     }
     __syncthreads();
 
-    // ====== Stage 6: QJL projection: proj = S^T @ r, signs = sign(proj) ======
-    // proj[tid] = sum_j S[j, tid] * r[j] = sum_j S^T[tid, j] * r[j]
+    // ====== Stage 6: QJL projection: proj = r @ S^T, signs = sign(proj) ======
+    // proj[i] = sum_j r[j] * S^T[j, i] = sum_j r[j] * S[i, j] = sum_j S[i*D+j] * r[j]
     float proj_val = 0.0f;
     if (tid < D) {
         for (int j = 0; j < D; j++) {
-            proj_val += S[j * D + tid] * s_work[j];
+            proj_val += S[tid * D + j] * s_work[j];
         }
     }
     float sign_val = (proj_val >= 0.0f) ? 1.0f : -1.0f;
@@ -207,12 +208,12 @@ __global__ void turboquant_round_trip_kernel(
     }
     __syncthreads();
 
-    // ====== Stage 7: QJL correction: x_qjl = S @ signs ======
-    // x_qjl[tid] = sum_j S[tid, j] * signs[j]
+    // ====== Stage 7: QJL correction: x_qjl = signs @ S ======
+    // x_qjl[i] = sum_j signs[j] * S[j, i] = sum_j S[j * D + i] * signs[j]
     float x_qjl_val = 0.0f;
     if (tid < D) {
         for (int j = 0; j < D; j++) {
-            x_qjl_val += S[tid * D + j] * s_work[j];
+            x_qjl_val += S[j * D + tid] * s_work[j];
         }
     }
 
@@ -249,55 +250,47 @@ void turboquant_round_trip(
     dim3 grid(num_tokens, num_heads);
     dim3 block(BLOCK_SIZE);
 
-    // Dispatch on input dtype and head_size
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        key.scalar_type(), "turboquant_round_trip", [&] {
-
-        // Dispatch on head_size (compile-time constant for loop unrolling)
+    // Helper lambda to launch kernel for a given scalar_t
+    auto launch = [&]<typename scalar_t>() {
         if (head_size == 128 && n_centroids == 4) {
             turboquant_round_trip_kernel<scalar_t, 128, 4>
                 <<<grid, block, smem_bytes>>>(
-                    key.data_ptr<scalar_t>(),
-                    output.data_ptr<scalar_t>(),
-                    Pi.data_ptr<float>(),
-                    S.data_ptr<float>(),
-                    centroids.data_ptr<float>(),
-                    num_heads);
+                    key.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
+                    Pi.data_ptr<float>(), S.data_ptr<float>(),
+                    centroids.data_ptr<float>(), num_heads);
         } else if (head_size == 128 && n_centroids == 8) {
             turboquant_round_trip_kernel<scalar_t, 128, 8>
                 <<<grid, block, smem_bytes>>>(
-                    key.data_ptr<scalar_t>(),
-                    output.data_ptr<scalar_t>(),
-                    Pi.data_ptr<float>(),
-                    S.data_ptr<float>(),
-                    centroids.data_ptr<float>(),
-                    num_heads);
+                    key.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
+                    Pi.data_ptr<float>(), S.data_ptr<float>(),
+                    centroids.data_ptr<float>(), num_heads);
         } else if (head_size == 256 && n_centroids == 4) {
             turboquant_round_trip_kernel<scalar_t, 256, 4>
                 <<<grid, block, smem_bytes>>>(
-                    key.data_ptr<scalar_t>(),
-                    output.data_ptr<scalar_t>(),
-                    Pi.data_ptr<float>(),
-                    S.data_ptr<float>(),
-                    centroids.data_ptr<float>(),
-                    num_heads);
+                    key.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
+                    Pi.data_ptr<float>(), S.data_ptr<float>(),
+                    centroids.data_ptr<float>(), num_heads);
         } else if (head_size == 256 && n_centroids == 8) {
             turboquant_round_trip_kernel<scalar_t, 256, 8>
                 <<<grid, block, smem_bytes>>>(
-                    key.data_ptr<scalar_t>(),
-                    output.data_ptr<scalar_t>(),
-                    Pi.data_ptr<float>(),
-                    S.data_ptr<float>(),
-                    centroids.data_ptr<float>(),
-                    num_heads);
+                    key.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
+                    Pi.data_ptr<float>(), S.data_ptr<float>(),
+                    centroids.data_ptr<float>(), num_heads);
         } else {
             TORCH_CHECK(false,
                 "TurboQuant: unsupported head_size=", head_size,
-                " n_centroids=", n_centroids,
-                ". Supported: head_size={128,256}, n_centroids={4,8}");
+                " n_centroids=", n_centroids);
         }
-    });
+    };
+
+    auto dtype = key.scalar_type();
+    if (dtype == at::ScalarType::Half) {
+        launch.template operator()<c10::Half>();
+    } else if (dtype == at::ScalarType::BFloat16) {
+        launch.template operator()<at::BFloat16>();
+    } else {
+        TORCH_CHECK(false, "TurboQuant: unsupported dtype. Expected Half or BFloat16.");
+    }
 }
 
 }  // namespace turboquant
