@@ -55,8 +55,9 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
-    # TurboQuant: tq3/tq4 use the normal backend (FlashInfer/FlashAttn).
-    # TQ round-trip is applied transparently in the attention layer.
+    # TurboQuant: compressed KV-cache with custom head_size
+    if kv_cache_dtype is not None and kv_cache_dtype.startswith("tq"):
+        return [AttentionBackendEnum.TURBOQUANT]
 
     if use_mla:
         if device_capability.major == 10:

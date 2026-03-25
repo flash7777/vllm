@@ -53,6 +53,20 @@ class TurboQuantConfig:
         """
         return self.head_dim * 2  # FP16 values need full space
 
+    @property
+    def cache_head_size(self) -> int:
+        """Effective head_size for KV-cache allocation (uint8 bytes).
+
+        Both K and V are TQ-compressed to the same packed size.
+        This replaces head_size in get_kv_cache_shape, making the
+        cache physically smaller. Symmetric layout — no arch change.
+
+        For D=256, TQ3: 100 bytes/slot → 5.1× smaller than BF16
+        For D=256, TQ4: 128 bytes/slot → 4.0× smaller than BF16
+        For D=128, TQ3:  52 bytes/slot → 4.9× smaller than BF16
+        """
+        return self.key_packed_size
+
     @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> "TurboQuantConfig":
         if cache_dtype == "tq3":
