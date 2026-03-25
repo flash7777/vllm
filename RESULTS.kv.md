@@ -10,7 +10,7 @@
 | KV-Cache | Short (20t) | Medium (150t) | Long (400t) | Math | Notes |
 |----------|-------------|---------------|-------------|------|-------|
 | FP8      | 2.6 tok/s   | 47.8 tok/s    | 36.2 tok/s  | 100% | Baseline |
-| TQ3      | —           | —             | —           | —    | Pending |
+| **TQ3**  | **2.7 tok/s** | **35.4 tok/s** | **28.7 tok/s** | **100%** | **-21-26% overhead (PyTorch round-trip)** |
 | TQ4      | —           | —             | —           | —    | Pending |
 
 ## Qwen3.5-122B-A10B (INT4 AutoRound, MoE 122B/A10B)

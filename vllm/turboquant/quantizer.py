@@ -52,9 +52,10 @@ def tq_round_trip_keys(
     attn_layer: Attention module with _tq_Pi, _tq_S, _tq_centroids buffers.
     Returns: reconstructed key with TQ compression artifacts.
     """
-    Pi = attn_layer._tq_Pi
-    S = attn_layer._tq_S
-    centroids = attn_layer._tq_centroids
+    device = key.device
+    Pi = attn_layer._tq_Pi.to(device)
+    S = attn_layer._tq_S.to(device)
+    centroids = attn_layer._tq_centroids.to(device)
 
     orig_dtype = key.dtype
     num_tokens, num_heads, head_size = key.shape
