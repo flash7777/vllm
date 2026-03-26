@@ -695,8 +695,10 @@ def unified_kv_cache_update(
     """
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
-        # TurboQuant v4: compress+store handled by TurboQuantImpl.do_kv_cache_update
-        # No separate round-trip needed — the Impl does compress+decompress internally.
+        # TurboQuant: apply TQ round-trip on keys before cache write
+        if getattr(attn_layer, '_tq_enabled', False):
+            from vllm.turboquant.quantizer import tq_round_trip_keys
+            key = tq_round_trip_keys(key, attn_layer)
 
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"

@@ -94,37 +94,8 @@ class TurboQuantImpl(FlashInferImpl):
                 self._tq_cache_dtype, self.head_size)
             self._tq_k_packed_cache = None  # Lazy init
 
-    @torch.no_grad()
-    def do_kv_cache_update(
-        self,
-        layer: torch.nn.Module,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Store K+V in standard BF16 cache (for FlashInfer prefill).
-        Additionally pack keys into TQ side-buffer (for compressed decode)."""
-
-        if not self._tq_enabled or not hasattr(layer, '_tq_Pi'):
-            # Standard FlashInfer path
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key, value, kv_cache[:, 0], kv_cache[:, 1],
-                slot_mapping, self.kv_cache_dtype,
-                layer._k_scale, layer._v_scale)
-            return
-
-        # TQ round-trip on keys for better quality
-        from vllm.turboquant.quantizer import tq_round_trip_keys
-        key_tq = tq_round_trip_keys(key, layer)
-
-        # Store in BF16 cache (FlashInfer needs this for prefill)
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key_tq, value, kv_cache[:, 0], kv_cache[:, 1],
-            slot_mapping, "auto", layer._k_scale, layer._v_scale)
-
-        # Also pack keys into compressed side-buffer
-        self._pack_keys_to_side_buffer(key, layer, kv_cache, slot_mapping)
+    # do_kv_cache_update: inherited from FlashInferImpl (standard path).
+    # TQ round-trip is applied in unified_kv_cache_update hook BEFORE this.
 
     def _pack_keys_to_side_buffer(self, key, layer, kv_cache, slot_mapping):
         """Pack keys into compressed TQ format in a side buffer."""
