@@ -130,3 +130,11 @@ GLM-4.7-Flash INT4 AutoRound (DGX Spark):
 
 Q3 is only 2-7% slower than FP8 with **2.3× less KV-cache memory**.
 Python decode loops — CUDA kernel will close the speed gap.
+
+### Q3 Vectorized Decode
+
+| Backend | Short | Med | Long | Math | KV-Cache |
+|---------|-------|-----|------|------|----------|
+| FP8 (FlashInfer) | 37.2 | 40.7 | 40.3 | 100% | 1× |
+| **TQ3 Q3 (vectorized)** | **45.2** | **47.2** | **42.8** | **100%** | **0.44× (2.3× smaller)** |
+| Delta vs FP8 | **+22%** | **+16%** | **+6%** | 0% | **-56% memory** |
