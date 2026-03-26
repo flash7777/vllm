@@ -61,6 +61,11 @@ class TurboQuantAttentionBackend(FlashInferBackend):
 
 
 class TurboQuantMetadataBuilder(FlashInferBackend.get_builder_cls()):
+    """Skips FlashInfer autotuner (TQ has its own decode kernel)."""
+
+    # Override reorder to skip FlashInfer-specific batch reordering
+    def reorder_batch(self, input_batch, scheduler_output):
+        return False  # No reordering needed for TQ
     """Patch spec to BF16 + real head_size for FlashInfer autotuner."""
     def __init__(self, *args, **kwargs):
         spec = args[0] if args else kwargs.get("kv_cache_spec")
