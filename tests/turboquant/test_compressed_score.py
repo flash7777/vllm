@@ -24,7 +24,7 @@ def build_kernels():
         name="tq_score",
         sources=[
             "/opt/tq_build/tq_compressed_score_ext.cu",
-            "/opt/vllm-riy/csrc/quantization/turboquant/tq_compressed_score.cu",
+            "/opt/tq_build/tq_compressed_score.cu",
         ],
         extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr",
                            "--use_fast_math",
@@ -141,8 +141,8 @@ def test_compressed_score():
     q_rot_full = q_rot.expand(1, num_q_heads, D).contiguous()
     q_proj_full = q_proj.expand(1, num_q_heads, D).contiguous()
 
-    # Expand k_cache for all kv heads
-    k_cache_full = k_cache.expand(num_blocks, block_size, num_kv_heads, packed_size).contiguous()
+    # Replicate k_cache for all kv heads (must be contiguous for CUDA kernel)
+    k_cache_full = k_cache.repeat(1, 1, num_kv_heads, 1).contiguous()
 
     # Block table and seq lens
     block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).unsqueeze(0)
@@ -150,26 +150,39 @@ def test_compressed_score():
 
     attn_scale = 1.0 / math.sqrt(D)
 
-    # === Reference: decompress keys and compute scores ===
+    # === Reference: compute scores from PACKED cache (same data as kernel) ===
     correction = math.sqrt(math.pi / 2) / D
+    mse_bytes = (D * mse_bits + 7) // 8
+    qjl_bytes = (D + 7) // 8
     ref_scores = torch.zeros(seq_len, device=device)
     for t in range(seq_len):
-        k = keys[t].float()
-        # TQ decompress
-        vn = k.norm()
-        xh = k / (vn + 1e-8)
-        rot = xh @ Pi.T
-        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1)
-        c_idx = centroids[idx]
-        xm = c_idx @ Pi
-        r = xh - xm
-        rn = r.norm()
-        proj = r @ S.T
-        signs = torch.where(proj >= 0, 1.0, -1.0)
+        bi, bo = t // block_size, t % block_size
+        packed = k_cache[bi, bo, 0]  # the PACKED data
 
-        # Score = vec_norm * (<q_rot, c[idx]> + corr * res_norm * <q_proj, signs>)
-        t1 = (q_rot[0, 0] * c_idx).sum()
-        t2 = (q_proj[0, 0] * signs).sum()
+        # Unpack MSE indices
+        idx = torch.zeros(D, dtype=torch.int32, device=device)
+        for j in range(D):
+            b_idx = j // 4; bit = (j % 4) * 2
+            idx[j] = (packed[b_idx].item() >> bit) & 0x3
+
+        # Unpack signs
+        sign_start = mse_bytes
+        signs = torch.zeros(D, dtype=torch.float32, device=device)
+        for j in range(D):
+            b_idx = j // 8; bit = j % 8
+            signs[j] = 1.0 if ((packed[sign_start + b_idx].item() >> bit) & 1) else -1.0
+
+        # Unpack norms
+        norm_start = mse_bytes + qjl_bytes
+        vn_u16 = packed[norm_start].item() | (packed[norm_start + 1].item() << 8)
+        rn_u16 = packed[norm_start + 2].item() | (packed[norm_start + 3].item() << 8)
+        import struct
+        vn = struct.unpack('e', struct.pack('H', vn_u16))[0]
+        rn = struct.unpack('e', struct.pack('H', rn_u16))[0]
+
+        c_idx = centroids[idx.long()]
+        t1 = (q_rot[0, 0] * c_idx).sum().item()
+        t2 = (q_proj[0, 0] * signs).sum().item()
         ref_scores[t] = vn * (t1 + correction * rn * t2) * attn_scale
 
     # === CUDA kernel scores ===

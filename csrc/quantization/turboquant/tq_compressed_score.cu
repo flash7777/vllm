@@ -84,23 +84,24 @@ __global__ void tq_compressed_score_kernel(
     // Get physical block index
     int phys_block = block_table[q_token * max_blocks_per_seq + cache_block_tile];
 
-    // Load query vectors into shared memory
+    // Load query vectors into shared memory (ALL threads participate)
     __shared__ float s_q_rot[D];
     __shared__ float s_q_proj[D];
     __shared__ float s_centroids[N_CENTROIDS];
 
     int q_base = (q_token * num_q_heads + q_head) * D;
-    if (tid < D) {
-        s_q_rot[tid] = q_rot[q_base + tid];
-        s_q_proj[tid] = q_proj[q_base + tid];
+    // Use multiple threads to cooperatively load D elements
+    for (int i = tid; i < D; i += blockDim.x) {
+        s_q_rot[i] = q_rot[q_base + i];
+        s_q_proj[i] = q_proj[q_base + i];
     }
     if (tid < N_CENTROIDS) {
         s_centroids[tid] = centroids[tid];
     }
     __syncthreads();
 
-    // Each thread processes one token in this block
-    int tok_in_block = tid;  // tid < block_size
+    // Only threads with tid < block_size process tokens
+    int tok_in_block = tid;
     if (tok_in_block >= block_size) return;
 
     int abs_pos = start_pos + tok_in_block;
@@ -191,7 +192,11 @@ void tq_compressed_attention_score(
 
     int num_cache_blocks = (max_seq_len + block_size - 1) / block_size;
     dim3 grid(num_q * num_q_heads, num_cache_blocks);
-    dim3 block(block_size);  // one thread per token in block
+    // Need at least head_dim threads to load q_rot/q_proj into shared memory
+    int threads = max(block_size, head_dim);
+    // Round up to multiple of 32 (warp size)
+    threads = ((threads + 31) / 32) * 32;
+    dim3 block(threads);
 
     // Dispatch on head_dim and mse_bits
     if (head_dim == 64 && mse_bits == 2 && n_centroids == 4) {
@@ -210,23 +215,8 @@ void tq_compressed_attention_score(
             scores.data_ptr<float>(),
             num_q_heads, num_kv_heads, block_size, packed_size,
             max_blocks_per_seq, max_seq_len, attn_scale, correction);
-    } else if (head_dim == 128 && mse_bits == 2 && n_centroids == 4) {
-        tq_compressed_score_kernel<128, 2, 4><<<grid, block>>>(
-            q_rot.data_ptr<float>(), q_proj.data_ptr<float>(),
-            k_cache.data_ptr<uint8_t>(), centroids.data_ptr<float>(),
-            block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
-            scores.data_ptr<float>(),
-            num_q_heads, num_kv_heads, block_size, packed_size,
-            max_blocks_per_seq, max_seq_len, attn_scale, correction);
-    } else if (head_dim == 256 && mse_bits == 2 && n_centroids == 4) {
-        tq_compressed_score_kernel<256, 2, 4><<<grid, block>>>(
-            q_rot.data_ptr<float>(), q_proj.data_ptr<float>(),
-            k_cache.data_ptr<uint8_t>(), centroids.data_ptr<float>(),
-            block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
-            scores.data_ptr<float>(),
-            num_q_heads, num_kv_heads, block_size, packed_size,
-            max_blocks_per_seq, max_seq_len, attn_scale, correction);
     } else {
+        // TODO: add D=128, D=256 instantiations when needed
         TORCH_CHECK(false, "TQ score: unsupported head_dim=", head_dim,
             " mse_bits=", mse_bits, " n_centroids=", n_centroids);
     }
