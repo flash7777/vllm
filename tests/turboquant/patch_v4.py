@@ -92,7 +92,12 @@ if "_tq_enabled" not in c:
         '            _tq_os.environ.get("VLLM_TQ_ROUNDTRIP", "0") == "1")\n'
         '        if self._tq_enabled:\n'
         '            tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"\n'
-        '            self._init_turboquant_buffers(tq_bits, head_size, prefix)\n\n'
+        '            self._init_turboquant_buffers(tq_bits, head_size, prefix)\n'
+        '            self._kv_storage_dtype = kv_cache_dtype\n'
+        '            if kv_cache_dtype.startswith("tq"):\n'
+        '                kv_cache_dtype = "fp8"\n'
+        '                if cache_config is not None:\n'
+        '                    cache_config.cache_dtype = "fp8"\n\n'
         "        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(")
 
     # _init_turboquant_buffers method
@@ -119,35 +124,8 @@ if "_tq_enabled" not in c:
         "    def forward(\n        self,\n        query: torch.Tensor,",
         method + "    def forward(\n        self,\n        query: torch.Tensor,")
 
-    # get_kv_cache_spec: compressed head_size for TQ
-    old_spec = (
-        "        else:\n"
-        "            return FullAttentionSpec(\n"
-        "                block_size=block_size,\n"
-        "                num_kv_heads=self.num_kv_heads,\n"
-        "                head_size=self.head_size,\n"
-        "                head_size_v=self.head_size_v,\n"
-        "                dtype=self.kv_cache_torch_dtype,\n"
-        "            )")
-    new_spec = (
-        "        else:\n"
-        '            if getattr(self, "_tq_enabled", False):\n'
-        "                tq_head = self._tq_config.cache_head_size\n"
-        "                return FullAttentionSpec(\n"
-        "                    block_size=block_size,\n"
-        "                    num_kv_heads=self.num_kv_heads,\n"
-        "                    head_size=tq_head,\n"
-        "                    head_size_v=tq_head,\n"
-        "                    dtype=torch.uint8,\n"
-        "                )\n"
-        "            return FullAttentionSpec(\n"
-        "                block_size=block_size,\n"
-        "                num_kv_heads=self.num_kv_heads,\n"
-        "                head_size=self.head_size,\n"
-        "                head_size_v=self.head_size_v,\n"
-        "                dtype=self.kv_cache_torch_dtype,\n"
-        "            )")
-    c = c.replace(old_spec, new_spec)
+    # No get_kv_cache_spec override — uses standard FP8 spec
+    # (tq3 maps to fp8 in __init__, so get_kv_cache_spec returns fp8 spec)
 
     with open(F, "w") as f: f.write(c)
     print("  [ok] attention.py")
