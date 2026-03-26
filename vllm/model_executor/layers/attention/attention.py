@@ -250,9 +250,7 @@ class Attention(nn.Module, AttentionLayerBase):
         if self._tq_enabled:
             tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"
             self._init_turboquant_buffers(tq_bits, head_size, prefix)
-            # Masquerade as "auto" so FlashInfer allocates BF16 cache
-            if kv_cache_dtype.startswith("tq"):
-                kv_cache_dtype = "auto"
+            # kv_cache_dtype stays "tq3" — TURBOQUANT backend handles it
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
@@ -576,6 +574,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            if getattr(self, '_tq_enabled', False) and hasattr(self, '_tq_config'):
+                tq_head = self._tq_config.cache_head_size
+                return FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=tq_head,
+                    head_size_v=tq_head,
+                    dtype=torch.uint8,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -695,11 +702,7 @@ def unified_kv_cache_update(
     """
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
-        # TurboQuant: apply TQ round-trip on keys before cache write
-        if getattr(attn_layer, '_tq_enabled', False):
-            from vllm.turboquant.quantizer import tq_round_trip_keys
-            key = tq_round_trip_keys(key, attn_layer)
-
+        # TQ: TurboQuantImpl.do_kv_cache_update handles packing internally
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
