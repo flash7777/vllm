@@ -138,3 +138,11 @@ Python decode loops — CUDA kernel will close the speed gap.
 | FP8 (FlashInfer) | 37.2 | 40.7 | 40.3 | 100% | 1× |
 | **TQ3 Q3 (vectorized)** | **45.2** | **47.2** | **42.8** | **100%** | **0.44× (2.3× smaller)** |
 | Delta vs FP8 | **+22%** | **+16%** | **+6%** | 0% | **-56% memory** |
+
+### GLM-4.7 Full Comparison (Q3 vectorized decode)
+
+| Backend | Short | Med | Long | Math | Page Size | vs FP8 |
+|---------|-------|-----|------|------|-----------|--------|
+| FP8     | 37.2  | 40.7| 40.3 | 100% | 40,960 B  | 1×     |
+| **TQ3** | **45.2** | **47.2** | **42.8** | **100%** | **17,920 B** | **2.3× smaller** |
+| **TQ4** | **40.6** | **42.5** | **45.9** | **100%** | **23,040 B** | **1.8× smaller** |
