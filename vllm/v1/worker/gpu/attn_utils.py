@@ -163,8 +163,10 @@ def init_kv_cache(
     kv_caches = _reshape_kv_cache(
         kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
     )
-    # For TQ: create decompressed BF16 shadow caches and swap them in.
-    # FlashInfer sees BF16, the Impl stores compressed data separately.
+    # For TQ: swap compressed cache with a BF16 shadow that FlashInfer can read.
+    # The shadow has the SAME num_blocks as the compressed cache, but full head_size.
+    # This means the shadow is larger — but we only need it for ONE sequence at a time.
+    # The compressed cache stores the actual data (saves memory for the backing store).
     if cache_dtype.startswith("tq"):
         for layer_name, kv_cache in kv_caches.items():
             attn_layer = forward_context.get(layer_name)
@@ -175,20 +177,18 @@ def init_kv_cache(
                 continue
             # Store compressed cache as separate attribute
             attn_layer._tq_compressed_cache = kv_cache
-            # Create BF16 shadow cache with real head_size.
-            # Must match FlashInfer's expected layout:
-            # (num_blocks, 2, block_size, num_kv_heads, head_size)
-            # allocated as contiguous so [:, 0] and [:, 1] are contiguous.
-            num_blocks = kv_cache.shape[0]
-            block_size = kv_cache.shape[2]
-            num_kv_heads = kv_cache.shape[3]
+            # Create a SMALL BF16 shadow: only enough for max_model_len tokens.
+            # This is the buffer FlashInfer reads from during attention.
             head_size = attn_layer.head_size
+            num_kv_heads = kv_cache.shape[3]
+            block_size = kv_cache.shape[2]
+            # Shadow needs same num_blocks as compressed (for block_table compat)
+            num_blocks = kv_cache.shape[0]
             decomp = torch.zeros(
                 num_blocks, 2, block_size, num_kv_heads, head_size,
                 dtype=torch.bfloat16, device=kv_cache.device,
-            ).contiguous()
+            )
             attn_layer._tq_decomp_cache = decomp
-            # Replace the cache that FlashInfer will see
             kv_caches[layer_name] = decomp
 
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
