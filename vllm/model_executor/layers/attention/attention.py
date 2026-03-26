@@ -251,11 +251,7 @@ class Attention(nn.Module, AttentionLayerBase):
             tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"
             self._init_turboquant_buffers(tq_bits, head_size, prefix)
             self._kv_storage_dtype = kv_cache_dtype
-            # Map tq3/tq4 → fp8 for cache allocation + FlashInfer
-            if kv_cache_dtype.startswith("tq"):
-                kv_cache_dtype = "fp8"
-                if cache_config is not None:
-                    cache_config.cache_dtype = "fp8"
+            # kv_cache_dtype stays "tq3" — TURBOQUANT backend handles everything
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
@@ -579,6 +575,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            if getattr(self, '_tq_enabled', False) and hasattr(self, '_tq_config'):
+                ps = self._tq_config.cache_head_size
+                return FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=ps,
+                    head_size_v=ps,
+                    dtype=torch.uint8,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
