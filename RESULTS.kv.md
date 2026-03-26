@@ -68,3 +68,31 @@ beyond what FP8 provides. Asymmetric K/V layout (Q2) needed for 4-5× savings.
 | Needle-in-haystack top-1 | 100% | 100% |
 | Key compression vs FP16 | 4.9x | 3.8x |
 | GPU quantize throughput (GB10) | 13M vecs/s | 9M vecs/s |
+
+## Q2: Compressed Attention Kernel (Standalone)
+
+**Reads directly from packed TQ cache — no shadow buffer, no extra memory.**
+
+| Metric | Value |
+|--------|-------|
+| K-Score correlation vs BF16 | 1.000 (bitgenau) |
+| Full output cosine vs BF16 | 0.944 |
+| Memory: TQ3 K + FP8 V | 23 KB / 64 KB BF16 = **2.8× compression** |
+| Score kernel latency | 4.3 µs (256 tokens × 20 heads) |
+| Model tested | GLM-4.7-Flash (D=64, 20 KV-heads) |
+
+### Architecture
+```
+K: TQ3 packed (28 bytes/vector, D=64)
+   → CUDA kernel reads indices + signs directly
+   → term1 = centroid gather, term2 = QJL sign multiply
+   → No GEMV, no decompression
+
+V: FP8 or BF16 (64-128 bytes/vector)
+   → Standard dequant per element
+
+Full decode:
+  scores = compressed_score_kernel(q_rot, q_proj, k_cache_packed)
+  weights = softmax(scores)
+  output = weights @ dequant(v_cache)
+```
