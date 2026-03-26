@@ -163,6 +163,34 @@ def init_kv_cache(
     kv_caches = _reshape_kv_cache(
         kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
     )
+    # For TQ: create decompressed BF16 shadow caches and swap them in.
+    # FlashInfer sees BF16, the Impl stores compressed data separately.
+    if cache_dtype.startswith("tq"):
+        from vllm.v1.attention.backends.turboquant_attn import TurboQuantImpl
+        for layer_name, kv_cache in kv_caches.items():
+            attn_layer = forward_context.get(layer_name)
+            if attn_layer is None:
+                continue
+            tq_config = getattr(attn_layer, '_tq_config', None)
+            if tq_config is None:
+                continue
+            # Store compressed cache as separate attribute
+            attn_layer._tq_compressed_cache = kv_cache
+            # Create BF16 shadow cache with real head_size
+            head_size = attn_layer.head_size
+            decomp = torch.zeros(
+                kv_cache.shape[0],  # num_blocks
+                2,
+                kv_cache.shape[2],  # block_size
+                kv_cache.shape[3],  # num_kv_heads
+                head_size,
+                dtype=torch.bfloat16,
+                device=kv_cache.device,
+            )
+            attn_layer._tq_decomp_cache = decomp
+            # Replace the cache that FlashInfer will see
+            kv_caches[layer_name] = decomp
+
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
 

@@ -134,17 +134,26 @@ class TurboQuantImpl(FlashInferImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Compress K and V, then pack into uint8 cache slots."""
+        """Store K/V. kv_cache is the BF16 shadow (from init_kv_cache swap)."""
         if not self._tq_enabled or not hasattr(layer, '_tq_Pi'):
-            # Fallback: write to decompressed buffer directly
-            self._ensure_decomp_buffer(kv_cache)
+            # Standard path: write BF16 directly
             torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key, value,
-                self._decomp_kv_cache[:, 0], self._decomp_kv_cache[:, 1],
+                key, value, kv_cache[:, 0], kv_cache[:, 1],
                 slot_mapping, "auto", layer._k_scale, layer._v_scale)
             return
 
-        self._ensure_decomp_buffer(kv_cache)
+        # TQ path: TQ round-trip on keys, then write to BF16 shadow cache.
+        # Also write compressed data to _tq_compressed_cache for memory savings.
+        from vllm.turboquant.quantizer import tq_round_trip_keys
+        key_tq = tq_round_trip_keys(key, layer)
+
+        # Write decompressed K + original V to the BF16 shadow cache
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key_tq, value, kv_cache[:, 0], kv_cache[:, 1],
+            slot_mapping, "auto", layer._k_scale, layer._v_scale)
+
+        # TODO: Also write compressed data to layer._tq_compressed_cache
+        # for future on-demand decompression (Phase 3 optimization)
         device = key.device
         Pi = self._get_cached_pi(layer, device)
         S = self._get_cached_s(layer, device)
@@ -194,13 +203,12 @@ class TurboQuantImpl(FlashInferImpl):
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward: use decompressed BF16 buffer for FlashInfer attention."""
-        if self._tq_enabled:
-            self._ensure_decomp_buffer(kv_cache)
-            # FlashInfer reads from the full-size BF16 buffer
+        """Forward: FlashInfer gets the BF16 shadow cache from bind_kv_cache."""
+        if self._tq_enabled and hasattr(layer, '_tq_decomp_cache'):
+            # kv_cache is ALREADY the BF16 shadow cache (swapped in bind_kv_cache)
             return super().forward(
                 layer, query, key, value,
-                self._decomp_kv_cache,  # ← decompressed, not the packed cache
+                kv_cache,  # ← already BF16 shadow cache from init_kv_cache
                 attn_metadata, output, output_scale, output_block_scale)
         return super().forward(
             layer, query, key, value, kv_cache,
