@@ -61,14 +61,33 @@ class TurboQuantAttentionBackend(FlashInferBackend):
 
 
 class TurboQuantMetadataBuilder(FlashInferBackend.get_builder_cls()):
-    """Accept uint8 cache dtype by patching to bfloat16 for FlashInfer internals."""
+    """Patch spec to BF16 + real head_size for FlashInfer autotuner."""
     def __init__(self, *args, **kwargs):
         spec = args[0] if args else kwargs.get("kv_cache_spec")
         if spec is not None and spec.dtype == torch.uint8:
             from dataclasses import replace
-            patched = replace(spec, dtype=torch.bfloat16)
-            args = (patched,) + args[1:] if args else args
-            if not args:
+            from vllm.turboquant.config import TurboQuantConfig
+            # Recover real head_size from the packed head_size
+            # The packed head_size was set in get_kv_cache_spec.
+            # We need the ORIGINAL head_size for FlashInfer.
+            # TQ3/D=64: packed=28, TQ3/D=128: packed=52, TQ3/D=256: packed=100
+            # Reverse: find head_dim where TurboQuantConfig.key_packed_size == spec.head_size
+            real_head = None
+            for d in [64, 96, 128, 192, 256]:
+                for bits_name in ["tq3", "tq4"]:
+                    tc = TurboQuantConfig.from_cache_dtype(bits_name, d)
+                    if tc.key_packed_size == spec.head_size:
+                        real_head = d
+                        break
+                if real_head:
+                    break
+            if real_head is None:
+                real_head = spec.head_size  # fallback
+            patched = replace(spec, dtype=torch.bfloat16,
+                              head_size=real_head, head_size_v=real_head)
+            if args:
+                args = (patched,) + args[1:]
+            else:
                 kwargs["kv_cache_spec"] = patched
         super().__init__(*args, **kwargs)
 
