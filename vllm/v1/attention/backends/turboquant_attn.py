@@ -277,8 +277,8 @@ class TurboQuantImpl(FlashInferImpl):
         parts.append(packed_s)
 
         # Norms
-        parts.append(vn.half().view(torch.uint8))
-        parts.append(rn.half().view(torch.uint8))
+        parts.append(vn.half().reshape(1).view(torch.uint8))
+        parts.append(rn.half().reshape(1).view(torch.uint8))
 
         return torch.cat(parts)
 
