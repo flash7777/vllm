@@ -96,3 +96,13 @@ Full decode:
   weights = softmax(scores)
   output = weights @ dequant(v_cache)
 ```
+
+## GLM-4.7-Flash INT4 AutoRound (DGX Spark)
+
+| KV-Cache | Short (20t) | Medium (150t) | Long (400t) | Math |
+|----------|-------------|---------------|-------------|------|
+| FP8      | 37.2 tok/s  | 40.7 tok/s    | 40.3 tok/s  | 100% |
+| **TQ3**  | **45.0 tok/s** | **47.4 tok/s** | **45.7 tok/s** | **100%** |
+| Delta    | **+21%**    | **+16%**      | **+13%**    | 0%   |
+
+TQ3 is **13-21% faster** than FP8 on GLM-4.7-Flash with identical accuracy.
