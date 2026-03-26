@@ -106,3 +106,14 @@ Full decode:
 | Delta    | **+21%**    | **+16%**      | **+13%**    | 0%   |
 
 TQ3 is **13-21% faster** than FP8 on GLM-4.7-Flash with identical accuracy.
+
+## Qwen3.5-35B TQ3 Q2 (kv_storage_dtype, DGX Spark)
+
+| KV-Cache | Short (20t) | Medium (150t) | Long (400t) | Math |
+|----------|-------------|---------------|-------------|------|
+| FP8      | 2.6*        | 47.8          | 36.2        | 100% |
+| TQ3 Q1   | 2.7*        | 45.5          | 32.8        | 100% |
+| **TQ3 Q2** | **9.6**   | **40.8**      | **38.1**    | **100%** |
+
+*Short values affected by warmup.
+TQ3 Q2 long is +5% vs FP8. Medium is -15% (TQ round-trip overhead).
