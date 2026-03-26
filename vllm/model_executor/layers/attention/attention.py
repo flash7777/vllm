@@ -254,6 +254,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Map tq3/tq4 → fp8 for cache allocation + FlashInfer
             if kv_cache_dtype.startswith("tq"):
                 kv_cache_dtype = "fp8"
+                if cache_config is not None:
+                    cache_config.cache_dtype = "fp8"
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config

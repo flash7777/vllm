@@ -39,7 +39,7 @@ class TurboQuantAttentionBackend(FlashInferBackend):
     def get_impl_cls():
         return TurboQuantImpl
 
-    # Inherit everything else from FlashInfer:
+    # Inherit get_builder_cls from FlashInfer (cache_config is now fp8):
     # get_kv_cache_shape, get_builder_cls, get_supported_kernel_block_sizes, etc.
 
 
