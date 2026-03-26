@@ -147,49 +147,10 @@ class TurboQuantImpl(FlashInferImpl):
         from vllm.turboquant.quantizer import tq_round_trip_keys
         key_tq = tq_round_trip_keys(key, layer)
 
-        # Write decompressed K + original V to the BF16 shadow cache
+        # Write TQ-compressed K + original V to the BF16 shadow cache
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key_tq, value, kv_cache[:, 0], kv_cache[:, 1],
             slot_mapping, "auto", layer._k_scale, layer._v_scale)
-
-        # TODO: Also write compressed data to layer._tq_compressed_cache
-        # for future on-demand decompression (Phase 3 optimization)
-        device = key.device
-        Pi = self._get_cached_pi(layer, device)
-        S = self._get_cached_s(layer, device)
-        centroids = self._get_cached_centroids(layer, device)
-        packed_size = self._tq_config.key_packed_size
-        mse_bits = self._tq_config.mse_bits
-        D = self.head_size
-        num_tokens = key.shape[0]
-        num_heads = key.shape[1]
-        block_size = kv_cache.shape[2]
-
-        for i in range(num_tokens):
-            slot = slot_mapping[i].item()
-            if slot < 0:
-                continue
-            bi = slot // block_size
-            bo = slot % block_size
-
-            for h in range(num_heads):
-                # Compress key
-                k_packed = self._compress_vector(
-                    key[i, h], Pi, S, centroids, D, mse_bits)
-                kv_cache[bi, 0, bo, h, :len(k_packed)] = k_packed
-
-                # Compress value (same TQ pipeline)
-                v_packed = self._compress_vector(
-                    value[i, h], Pi, S, centroids, D, mse_bits)
-                kv_cache[bi, 1, bo, h, :len(v_packed)] = v_packed
-
-                # Also write decompressed versions for FlashInfer
-                k_decomp = self._decompress_vector(k_packed, Pi, S, centroids,
-                                                    D, mse_bits)
-                v_decomp = self._decompress_vector(v_packed, Pi, S, centroids,
-                                                    D, mse_bits)
-                self._decomp_kv_cache[bi, 0, bo, h] = k_decomp.to(torch.bfloat16)
-                self._decomp_kv_cache[bi, 1, bo, h] = v_decomp.to(torch.bfloat16)
 
     def forward(
         self,
