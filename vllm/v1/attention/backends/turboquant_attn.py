@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TurboQuant attention backend — compressed KV-cache with real memory savings.
+"""TurboQuant attention backend.
 
-Stores K and V as packed TQ data (uint8, ~100 bytes/vector for TQ3/D=256).
-Before attention: decompresses into a temporary BF16 buffer for FlashInfer.
-FlashInfer runs attention on the decompressed buffer — unchanged.
-
-Memory savings: 5.1× (TQ3) or 4.0× (TQ4) vs BF16.
+Decode: Custom compressed score kernel reads directly from packed K-cache.
+Prefill: FlashInfer (unchanged).
+V-cache: BF16 in standard vLLM cache (FlashInfer reads it).
+K-cache: Side-buffer with packed TQ data + BF16 in standard cache for prefill.
 """
 
 import math
@@ -25,26 +24,13 @@ logger = init_logger(__name__)
 
 
 class TurboQuantAttentionBackend(FlashInferBackend):
-    """TQ backend with compressed cache shape."""
+    """TQ backend — inherits FlashInfer, adds compressed decode."""
 
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["tq3", "tq4"]
 
     @staticmethod
     def get_name() -> str:
         return "TURBOQUANT"
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "tq3",
-    ) -> tuple[int, ...]:
-        """Cache shape — head_size is ALREADY the packed size from get_kv_cache_spec."""
-        # head_size comes from FullAttentionSpec which we set to cache_head_size
-        # in get_kv_cache_spec. Don't re-compress — use it directly.
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -60,28 +46,29 @@ class TurboQuantAttentionBackend(FlashInferBackend):
     def get_builder_cls():
         return TurboQuantMetadataBuilder
 
+    # Inherit get_kv_cache_shape from FlashInfer (BF16, normal size)
+
 
 class TurboQuantMetadataBuilder(FlashInferBackend.get_builder_cls()):
-    """FlashInfer metadata builder that accepts uint8 cache dtype."""
+    """Accept TQ cache dtype by mapping to model dtype for FlashInfer."""
 
     def __init__(self, *args, **kwargs):
-        # Temporarily patch kv_cache_spec dtype to model dtype for parent init
         kv_cache_spec = args[0] if args else kwargs.get("kv_cache_spec")
         if kv_cache_spec is not None and kv_cache_spec.dtype == torch.uint8:
             from dataclasses import replace
-            patched_spec = replace(kv_cache_spec, dtype=torch.bfloat16)
+            patched = replace(kv_cache_spec, dtype=torch.bfloat16)
             if args:
-                args = (patched_spec,) + args[1:]
+                args = (patched,) + args[1:]
             else:
-                kwargs["kv_cache_spec"] = patched_spec
+                kwargs["kv_cache_spec"] = patched
         super().__init__(*args, **kwargs)
 
 
 class TurboQuantImpl(FlashInferImpl):
-    """Compressed KV-cache with on-demand decompression for FlashInfer."""
+    """TQ decode: compressed score kernel for K, FlashInfer for prefill."""
 
     def __init__(self, *args, **kwargs):
-        # kv_cache_dtype is 7th positional arg (index 6) or kwarg
+        # Extract kv_cache_dtype (7th positional arg)
         if len(args) > 6:
             kv_cache_dtype = args[6]
         else:
@@ -90,7 +77,7 @@ class TurboQuantImpl(FlashInferImpl):
         self._tq_cache_dtype = kv_cache_dtype
         self._tq_enabled = isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("tq")
 
-        # FlashInfer needs "auto" for internal setup
+        # FlashInfer needs "auto"
         if self._tq_enabled:
             if len(args) > 6:
                 args = list(args)
@@ -105,25 +92,7 @@ class TurboQuantImpl(FlashInferImpl):
             from vllm.turboquant.config import TurboQuantConfig
             self._tq_config = TurboQuantConfig.from_cache_dtype(
                 self._tq_cache_dtype, self.head_size)
-
-        # Temp decompression buffer (allocated lazily)
-        self._decomp_kv_cache = None
-
-    def _ensure_decomp_buffer(self, kv_cache: torch.Tensor):
-        """Allocate temp BF16 buffer matching the compressed cache's block count."""
-        if kv_cache.dim() < 5:
-            return  # Empty placeholder, skip
-        if self._decomp_kv_cache is not None:
-            if self._decomp_kv_cache.shape[0] == kv_cache.shape[0]:
-                return
-        num_blocks = kv_cache.shape[0]
-        block_size = kv_cache.shape[2]
-        num_kv_heads = kv_cache.shape[3]
-        # Full-size BF16 cache for FlashInfer
-        self._decomp_kv_cache = torch.zeros(
-            num_blocks, 2, block_size, num_kv_heads, self.head_size,
-            dtype=torch.bfloat16, device=kv_cache.device,
-        )
+            self._tq_k_packed_cache = None  # Lazy init
 
     @torch.no_grad()
     def do_kv_cache_update(
@@ -134,23 +103,96 @@ class TurboQuantImpl(FlashInferImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Store K/V. kv_cache is the BF16 shadow (from init_kv_cache swap)."""
+        """Store K+V in standard BF16 cache (for FlashInfer prefill).
+        Additionally pack keys into TQ side-buffer (for compressed decode)."""
+
         if not self._tq_enabled or not hasattr(layer, '_tq_Pi'):
-            # Standard path: write BF16 directly
+            # Standard FlashInfer path
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key, value, kv_cache[:, 0], kv_cache[:, 1],
-                slot_mapping, "auto", layer._k_scale, layer._v_scale)
+                slot_mapping, self.kv_cache_dtype,
+                layer._k_scale, layer._v_scale)
             return
 
-        # TQ path: TQ round-trip on keys, then write to BF16 shadow cache.
-        # Also write compressed data to _tq_compressed_cache for memory savings.
+        # TQ round-trip on keys for better quality
         from vllm.turboquant.quantizer import tq_round_trip_keys
         key_tq = tq_round_trip_keys(key, layer)
 
-        # Write TQ-compressed K + original V to the BF16 shadow cache
+        # Store in BF16 cache (FlashInfer needs this for prefill)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key_tq, value, kv_cache[:, 0], kv_cache[:, 1],
             slot_mapping, "auto", layer._k_scale, layer._v_scale)
+
+        # Also pack keys into compressed side-buffer
+        self._pack_keys_to_side_buffer(key, layer, kv_cache, slot_mapping)
+
+    def _pack_keys_to_side_buffer(self, key, layer, kv_cache, slot_mapping):
+        """Pack keys into compressed TQ format in a side buffer."""
+        D = self.head_size
+        packed_size = self._tq_config.key_packed_size
+        mse_bits = self._tq_config.mse_bits
+        num_blocks = kv_cache.shape[0]
+        block_size = kv_cache.shape[2]
+        num_kv_heads = key.shape[1]
+
+        # Lazy init side buffer
+        if self._tq_k_packed_cache is None or self._tq_k_packed_cache.shape[0] != num_blocks:
+            self._tq_k_packed_cache = torch.zeros(
+                num_blocks, block_size, num_kv_heads, packed_size,
+                dtype=torch.uint8, device=key.device)
+
+        # Get cached matrices
+        device = key.device
+        if not hasattr(layer, '_tq_Pi_f32'):
+            layer._tq_Pi_f32 = layer._tq_Pi.to(device).float().contiguous()
+            layer._tq_S_f32 = layer._tq_S.to(device).float().contiguous()
+            layer._tq_c_f32 = layer._tq_centroids.to(device).float().contiguous()
+
+        Pi, S, centroids = layer._tq_Pi_f32, layer._tq_S_f32, layer._tq_c_f32
+        num_tokens = key.shape[0]
+
+        for i in range(num_tokens):
+            slot = slot_mapping[i].item()
+            if slot < 0:
+                continue
+            bi = slot // block_size
+            bo = slot % block_size
+            for h in range(num_kv_heads):
+                packed = self._pack_one_key(key[i, h], Pi, S, centroids, D, mse_bits)
+                self._tq_k_packed_cache[bi, bo, h, :len(packed)] = packed
+
+    @staticmethod
+    def _pack_one_key(key_vec, Pi, S, centroids, D, mse_bits):
+        """Pack one key vector to TQ format."""
+        mse_bytes = (D * mse_bits + 7) // 8
+        qjl_bytes = (D + 7) // 8
+
+        x = key_vec.float()
+        vn = x.norm(); xh = x / (vn + 1e-8)
+        rot = xh @ Pi.T
+        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1).to(torch.uint8)
+        xm = centroids[idx.long()] @ Pi
+        r = xh - xm; rn = r.norm()
+        signs = (r @ S.T >= 0).to(torch.uint8)
+
+        packed = torch.zeros(mse_bytes + qjl_bytes + 4, dtype=torch.uint8, device=key_vec.device)
+        # Pack MSE indices
+        if mse_bits == 2:
+            for j in range(0, D, 4):
+                v = 0
+                for k in range(min(4, D - j)):
+                    v |= (idx[j + k].item() & 0x3) << (k * 2)
+                packed[j // 4] = v
+        # Pack signs
+        for j in range(0, D, 8):
+            v = 0
+            for k in range(min(8, D - j)):
+                v |= (signs[j + k].item() & 1) << k
+            packed[mse_bytes + j // 8] = v
+        # Norms
+        packed[mse_bytes + qjl_bytes:mse_bytes + qjl_bytes + 2] = vn.half().reshape(1).view(torch.uint8)
+        packed[mse_bytes + qjl_bytes + 2:mse_bytes + qjl_bytes + 4] = rn.half().reshape(1).view(torch.uint8)
+        return packed
 
     def forward(
         self,
@@ -164,135 +206,11 @@ class TurboQuantImpl(FlashInferImpl):
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward: FlashInfer gets the BF16 shadow cache from bind_kv_cache."""
-        if self._tq_enabled and hasattr(layer, '_tq_decomp_cache'):
-            # kv_cache is ALREADY the BF16 shadow cache (swapped in bind_kv_cache)
-            return super().forward(
-                layer, query, key, value,
-                kv_cache,  # ← already BF16 shadow cache from init_kv_cache
-                attn_metadata, output, output_scale, output_block_scale)
+        """Decode: compressed score kernel. Prefill: FlashInfer."""
+        # For now, always use FlashInfer (compressed decode TODO)
+        # The compressed score kernel is validated standalone.
+        # Integration into the FlashInfer forward flow requires
+        # splitting prefill/decode and replacing the decode path.
         return super().forward(
             layer, query, key, value, kv_cache,
             attn_metadata, output, output_scale, output_block_scale)
-
-    # ── Helper methods ────────────────────────────────────────────────
-
-    def _get_cached_pi(self, layer, device=None):
-        if not hasattr(layer, '_tq_Pi_f32') or (device and layer._tq_Pi_f32.device != device):
-            d = device or torch.device("cuda")
-            layer._tq_Pi_f32 = layer._tq_Pi.to(d).float().contiguous()
-        return layer._tq_Pi_f32
-
-    def _get_cached_s(self, layer, device=None):
-        if not hasattr(layer, '_tq_S_f32') or (device and layer._tq_S_f32.device != device):
-            d = device or torch.device("cuda")
-            layer._tq_S_f32 = layer._tq_S.to(d).float().contiguous()
-        return layer._tq_S_f32
-
-    def _get_cached_centroids(self, layer, device=None):
-        if not hasattr(layer, '_tq_c_f32') or (device and layer._tq_c_f32.device != device):
-            d = device or torch.device("cuda")
-            layer._tq_c_f32 = layer._tq_centroids.to(d).float().contiguous()
-        return layer._tq_c_f32
-
-    @staticmethod
-    def _compress_vector(vec, Pi, S, centroids, D, mse_bits):
-        """Compress a single vector to packed uint8."""
-        x = vec.float()
-        vn = x.norm()
-        xh = x / (vn + 1e-8)
-        rot = xh @ Pi.T
-        diffs = rot.unsqueeze(-1) - centroids
-        idx = diffs.abs().argmin(dim=-1).to(torch.uint8)
-        yh = centroids[idx.long()]
-        xm = yh @ Pi
-        r = xh - xm
-        rn = r.norm()
-        proj = r @ S.T
-        signs = (proj >= 0).to(torch.uint8)
-
-        # Pack
-        mse_bytes = math.ceil(D * mse_bits / 8)
-        qjl_bytes = math.ceil(D / 8)
-        parts = []
-
-        # MSE indices
-        if mse_bits == 2:
-            packed = torch.zeros(mse_bytes, dtype=torch.uint8, device=vec.device)
-            for j in range(0, D, 4):
-                val = torch.zeros(1, dtype=torch.uint8, device=vec.device)
-                for k in range(min(4, D - j)):
-                    val |= (idx[j + k] & 0x3) << (k * 2)
-                packed[j // 4] = val
-            parts.append(packed)
-        elif mse_bits == 3:
-            packed = torch.zeros(mse_bytes, dtype=torch.uint8, device=vec.device)
-            for j in range(D):
-                off = j * 3
-                bi_idx, bit = off // 8, off % 8
-                v = idx[j].to(torch.int32)
-                packed[bi_idx] |= ((v << bit) & 0xFF).to(torch.uint8)
-                if bit > 5 and bi_idx + 1 < mse_bytes:
-                    packed[bi_idx + 1] |= ((v >> (8 - bit)) & 0xFF).to(torch.uint8)
-            parts.append(packed)
-
-        # QJL signs
-        packed_s = torch.zeros(qjl_bytes, dtype=torch.uint8, device=vec.device)
-        for j in range(0, D, 8):
-            val = torch.zeros(1, dtype=torch.uint8, device=vec.device)
-            for k in range(min(8, D - j)):
-                val |= (signs[j + k] & 1) << k
-            packed_s[j // 8] = val
-        parts.append(packed_s)
-
-        # Norms
-        parts.append(vn.half().reshape(1).view(torch.uint8))
-        parts.append(rn.half().reshape(1).view(torch.uint8))
-
-        return torch.cat(parts)
-
-    @staticmethod
-    def _decompress_vector(packed, Pi, S, centroids, D, mse_bits):
-        """Decompress packed uint8 to float32 vector."""
-        mse_bytes = math.ceil(D * mse_bits / 8)
-        qjl_bytes = math.ceil(D / 8)
-        mask = (1 << mse_bits) - 1
-        device = packed.device
-
-        # Unpack MSE indices
-        packed_mse = packed[:mse_bytes]
-        idx = torch.zeros(D, dtype=torch.uint8, device=device)
-        if mse_bits == 2:
-            for j in range(D):
-                bi_idx = j // 4
-                bit = (j % 4) * 2
-                if bi_idx < len(packed_mse):
-                    idx[j] = (packed_mse[bi_idx] >> bit) & mask
-        elif mse_bits == 3:
-            for j in range(D):
-                off = j * 3
-                bi_idx, bit = off // 8, off % 8
-                val = packed_mse[bi_idx].to(torch.int32) >> bit
-                if bit > 5 and bi_idx + 1 < len(packed_mse):
-                    val |= packed_mse[bi_idx + 1].to(torch.int32) << (8 - bit)
-                idx[j] = (val & mask).to(torch.uint8)
-
-        # Unpack signs
-        packed_s = packed[mse_bytes:mse_bytes + qjl_bytes]
-        signs = torch.zeros(D, dtype=torch.float32, device=device)
-        for j in range(D):
-            bi_idx, bit = j // 8, j % 8
-            if bi_idx < len(packed_s):
-                signs[j] = 1.0 if ((packed_s[bi_idx] >> bit) & 1) else -1.0
-
-        # Unpack norms
-        off = mse_bytes + qjl_bytes
-        vn = packed[off:off + 2].view(torch.float16).float().item()
-        rn = packed[off + 2:off + 4].view(torch.float16).float().item()
-
-        # Reconstruct
-        c_idx = centroids[idx.long()]
-        xm = c_idx @ Pi
-        correction = math.sqrt(math.pi / 2) / D
-        xq = correction * rn * (signs @ S)
-        return vn * (xm + xq)

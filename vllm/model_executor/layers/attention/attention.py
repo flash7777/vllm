@@ -250,6 +250,9 @@ class Attention(nn.Module, AttentionLayerBase):
         if self._tq_enabled:
             tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"
             self._init_turboquant_buffers(tq_bits, head_size, prefix)
+            # Masquerade as "auto" so FlashInfer allocates BF16 cache
+            if kv_cache_dtype.startswith("tq"):
+                kv_cache_dtype = "auto"
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
@@ -573,16 +576,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
-            # TurboQuant: use compressed head_size + uint8 dtype
-            if getattr(self, '_tq_enabled', False):
-                tq_head = self._tq_config.cache_head_size
-                return FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_size=tq_head,
-                    head_size_v=tq_head,
-                    dtype=torch.uint8,
-                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
