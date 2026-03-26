@@ -117,3 +117,16 @@ TQ3 is **13-21% faster** than FP8 on GLM-4.7-Flash with identical accuracy.
 
 *Short values affected by warmup.
 TQ3 Q2 long is +5% vs FP8. Medium is -15% (TQ round-trip overhead).
+
+## Q3: Custom TQ Backend — Echte Speicherersparnis
+
+GLM-4.7-Flash INT4 AutoRound (DGX Spark):
+
+| Backend | Short | Med | Long | Math | KV-Cache |
+|---------|-------|-----|------|------|----------|
+| FP8 (FlashInfer) | 37.2 | 40.7 | 40.3 | 100% | 40,960 B/block |
+| TQ3 Q2 (FP8+RT) | 45.0 | 47.4 | 45.7 | 100% | 40,960 B/block |
+| **TQ3 Q3 (custom)** | **39.2** | **39.9** | **37.7** | **100%** | **17,920 B/block (2.3× smaller)** |
+
+Q3 is only 2-7% slower than FP8 with **2.3× less KV-cache memory**.
+Python decode loops — CUDA kernel will close the speed gap.
