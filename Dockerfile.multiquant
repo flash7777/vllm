@@ -1,30 +1,26 @@
 # ============================================================
-# MultiQuant Full Build — vllm-mq
+# vllm-multiquant — Full build from our fork
 #
-# Single-stage build from NVIDIA base, includes:
-#   - vLLM 0.17 from source (SM120a/SM121a)
-#   - RIY Expert Pruning
-#   - MultiQuant (TurboQuant, RotorQuant, Archer, AutoRound RTN)
-#   - TQ/Archer CUDA Kernels
-#   - MLA Backend (MULTIQUANT_MLA)
-#   - Mixed Page-Size Block Manager
-#   - FlashInfer 0.6.6, Marlin SM12x, MTP/EAGLE3
+# Source: flash7777/vllm branch multiquant
+# Contains: vLLM 0.17 + RIY + MultiQuant + Marlin SM12x + all fixes
 #
-# Build:
-#   podman build -f Dockerfile.full -t vllm-mq \
-#     --build-arg BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3 .
+# No patches, no sed, no build/deps — everything is in the source tree.
+# Only external deps: CUTLASS, FlashInfer wheels, MoE configs.
 #
-# Requires build context from BOTH repos:
-#   - vllm-riy/ (this repo: MultiQuant, RIY, TQ kernels)
-#   - vllm-marlin-sm12x/build/ (patches, wheels, moe-configs)
+# Build (DGX Spark):
+#   podman build -f Dockerfile.multiquant -t vllm-multiquant .
 #
-# For now: copy needed files from vllm-marlin-sm12x into build/deps/
+# Build (RTX PRO 6000 / Spiegel 2):
+#   podman build -f Dockerfile.multiquant -t vllm-multiquant \
+#     --build-arg CUDA_ARCHS="12.0a"
 # ============================================================
 
 ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3
 FROM ${BASE_IMAGE}
 
-ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
+ARG CUDA_ARCHS="12.0a;12.1a"
+ARG VLLM_BRANCH=multiquant
+ARG MAX_JOBS=16
 
 # ─── System deps ─────────────────────────────────────────────
 RUN apt-get update -qq && \
@@ -41,11 +37,11 @@ RUN apt-get update -qq && \
 
 RUN pip install --no-cache-dir cmake ninja setuptools-scm scipy pytest
 
-# Sichern NVIDIA CUDA torch
+# Save NVIDIA's CUDA-aware PyTorch before anything overwrites it
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     tar cf /opt/nvidia-torch.tar torch/ $(ls -d torch*.dist-info 2>/dev/null)
 
-# ─── CUTLASS 4.4.0 ──────────────────────────────────────────
+# ─── CUTLASS 4.4.0 (SM120a/SM121a) ──────────────────────────
 RUN git clone --depth 1 --branch v4.4.0 \
       https://github.com/NVIDIA/cutlass.git /opt/cutlass
 ENV VLLM_CUTLASS_SRC_DIR=/opt/cutlass
@@ -53,42 +49,47 @@ RUN sed -i '/nvidia-cutlass-dsl/d' /etc/pip/constraint.txt && \
     echo "4.4.0" > /opt/cutlass/python/CuTeDSL/VERSION.EDITABLE && \
     pip install --no-cache-dir --force-reinstall --no-deps /opt/cutlass/python/CuTeDSL
 
-# ─── vLLM from source ───────────────────────────────────────
-RUN git clone --filter=blob:none \
-      https://github.com/vllm-project/vllm.git /tmp/vllm-build && \
-    cd /tmp/vllm-build && git checkout 600a039f5
+# ─── vLLM from OUR FORK (everything included) ───────────────
+RUN git clone --filter=blob:none --branch ${VLLM_BRANCH} \
+      https://github.com/flash7777/vllm.git /tmp/vllm-build
 WORKDIR /tmp/vllm-build
 
-# PR Reverts (Hopper-Code bricht SM121)
-COPY build/deps/patches/34758.diff /tmp/
-COPY build/deps/patches/34302.diff /tmp/
-RUN patch -p1 -R < /tmp/34758.diff || true
-RUN patch -p1 -R < /tmp/34302.diff || true
-
-# Marlin SM12x
-COPY build/deps/marlin_sm12x.patch /tmp/
-RUN git apply /tmp/marlin_sm12x.patch || true
-
+# Use existing PyTorch, remove flashinfer pin
 RUN python use_existing_torch.py
 RUN sed -i '/flashinfer-python/d' requirements/cuda.txt 2>/dev/null || true && \
     sed -i '/flashinfer-python/d' pyproject.toml 2>/dev/null || true
 RUN pip install --no-cache-dir -r requirements/build.txt
+
+# Remove container's pre-installed vLLM
 RUN pip uninstall -y vllm
 
-ENV TORCH_CUDA_ARCH_LIST="12.0a;12.1a"
+# Build vLLM from our fork
+ENV TORCH_CUDA_ARCH_LIST=${CUDA_ARCHS}
 ENV VLLM_TARGET_DEVICE=cuda
-ENV MAX_JOBS=16
+ENV MAX_JOBS=${MAX_JOBS}
 RUN pip install --no-build-isolation --no-cache-dir .
+
+# Save our source files that aren't part of pip install
+# (multiquant, turboquant, csrc kernels, tests)
+RUN cp -r vllm/multiquant /usr/local/lib/python3.12/dist-packages/vllm/multiquant && \
+    cp -r vllm/turboquant /usr/local/lib/python3.12/dist-packages/vllm/turboquant && \
+    cp -r csrc/quantization/turboquant /opt/tq_build && \
+    cp -r csrc/quantization/archer /opt/archer_build && \
+    cp -r tests/multiquant /opt/tests/multiquant && \
+    cp -r tests/turboquant /opt/tests/turboquant
 
 WORKDIR /
 RUN rm -rf /tmp/vllm-build
 
-# ─── FlashInfer 0.6.6 ───────────────────────────────────────
-COPY build/deps/wheels/flashinfer*.whl /tmp/wheels/
-RUN pip install --no-cache-dir --force-reinstall /tmp/wheels/flashinfer*.whl && rm -rf /tmp/wheels
+# ─── FlashInfer 0.6.6 (prebuilt wheel) ──────────────────────
+# Copy wheels into build context: build/wheels/flashinfer*.whl
+COPY build/wheels/flashinfer*.whl /tmp/wheels/
+RUN pip install --no-cache-dir --force-reinstall /tmp/wheels/flashinfer*.whl && \
+    rm -rf /tmp/wheels
 
 # ─── fastsafetensors + Ray ───────────────────────────────────
 RUN pip install --no-cache-dir fastsafetensors ray[default] nvidia-nvshmem-cu13
+# Restore NVIDIA CUDA torch (pip may have downgraded it)
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
     tar xf /opt/nvidia-torch.tar -C /usr/local/lib/python3.12/dist-packages/
 
@@ -97,42 +98,7 @@ RUN pip install --no-cache-dir --no-deps "transformers>=5.2" && \
     pip install --no-cache-dir --upgrade "huggingface_hub>=0.32" && \
     pip install --no-cache-dir --no-deps "compressed-tensors>=0.13"
 
-# ─── Base patches (from vllm-marlin-sm12x) ───────────────────
-COPY build/deps/patches/*.py /tmp/patches/
-RUN for f in /tmp/patches/*.py; do python3 "$f" || echo "WARN: $(basename $f)"; done
-
-# ─── RIY Expert Pruning ─────────────────────────────────────
-COPY riy.patch /tmp/riy.patch
-RUN cd /usr/local/lib/python3.12/dist-packages && \
-    patch -p1 < /tmp/riy.patch || echo "RIY: may need update"
-
-# ─── MultiQuant Framework ───────────────────────────────────
-COPY vllm/multiquant/ ${VLLM_DST}/multiquant/
-COPY vllm/turboquant/__init__.py ${VLLM_DST}/turboquant/__init__.py
-
-# ─── Updated vLLM files ─────────────────────────────────────
-COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
-COPY vllm/model_executor/layers/attention/mla_attention.py ${VLLM_DST}/model_executor/layers/attention/mla_attention.py
-COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
-COPY vllm/v1/attention/backends/multiquant_attn.py ${VLLM_DST}/v1/attention/backends/multiquant_attn.py
-COPY vllm/v1/attention/backends/mla/multiquant_mla.py ${VLLM_DST}/v1/attention/backends/mla/multiquant_mla.py
-COPY vllm/v1/attention/backends/registry.py ${VLLM_DST}/v1/attention/backends/registry.py
-COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
-
-# ─── Inline patches (files that can't be fully copied) ──────
-RUN sed -i 's/"tq4",/"tq4",\n    "rq2",\n    "rq3",\n    "rq4",/' ${VLLM_DST}/config/cache.py
-RUN sed -i 's/"tq4": torch.uint8,/"tq4": torch.uint8,\n    "rq2": torch.uint8,\n    "rq3": torch.uint8,\n    "rq4": torch.uint8,/' ${VLLM_DST}/utils/torch_utils.py
-RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/v1/attention/backend.py
-RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/platforms/cuda.py \
- && sed -i 's/return \[AttentionBackendEnum.TURBOQUANT\]/if use_mla:\n            return [AttentionBackendEnum.MULTIQUANT_MLA]\n        return [AttentionBackendEnum.MULTIQUANT, AttentionBackendEnum.TURBOQUANT]/' ${VLLM_DST}/platforms/cuda.py
-RUN sed -i 's/"cpu_awq",/"cpu_awq",\n    "multiquant",\n    "marlin_mq",\n    "autoround_rtn",/' ${VLLM_DST}/model_executor/layers/quantization/__init__.py
-RUN python3 -c "p='${VLLM_DST}/model_executor/layers/quantization/__init__.py'; open(p,'a').write(\"\"\"\ntry:\n    from vllm.multiquant.weight_quant.config import ArcherConfig as _AC\n    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['multiquant'] = _AC\nexcept ImportError: pass\ntry:\n    from vllm.multiquant.autoround.config import AutoRoundRTNConfig as _ARC\n    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['autoround_rtn'] = _ARC\nexcept ImportError: pass\ntry:\n    from vllm.multiquant.marlin.config import MarlinMultiQuantConfig as _MMC\n    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['marlin_mq'] = _MMC\nexcept ImportError: pass\n\"\"\")"
-
-# ─── CUDA Kernels (TQ + Archer) ─────────────────────────────
-COPY csrc/quantization/turboquant/ /opt/tq_build/
-COPY csrc/quantization/archer/ /opt/archer_build/
-
-# Pre-build TQ round-trip kernel
+# ─── Pre-build TQ CUDA kernel ───────────────────────────────
 RUN python3 -c "from torch.utils.cpp_extension import load; \
 tq = load(name='tq_serve', \
     sources=['/opt/tq_build/tq_ext.cu', '/opt/tq_build/tq_round_trip.cu'], \
@@ -141,17 +107,16 @@ tq = load(name='tq_serve', \
     extra_include_paths=['/opt/tq_build'], verbose=True); \
 print('TQ kernel:', tq)"
 
-# ─── Tests ───────────────────────────────────────────────────
-COPY tests/multiquant/ /opt/tests/multiquant/
-COPY tests/turboquant/ /opt/tests/turboquant/
-
-# ─── MoE Configs ─────────────────────────────────────────────
-COPY build/deps/moe-configs/*.json ${VLLM_DST}/model_executor/layers/fused_moe/configs/ 2>/dev/null || true
+# ─── MoE Configs (optional, from build context) ─────────────
+COPY build/moe-configs/*.json /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/ 2>/dev/null || true
 
 # ─── Runtime defaults ────────────────────────────────────────
 ENV FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a"
 ENV RAY_memory_monitor_refresh_ms=0
 ENV RAY_object_store_memory=1073741824
+
+# cv2/typing shadow fix
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2/typing 2>/dev/null || true
 
 # ─── Cleanup ─────────────────────────────────────────────────
 RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
@@ -161,7 +126,7 @@ RUN python3 -c "\
 import vllm; print('vLLM:', vllm.__version__); \
 from vllm.multiquant import is_multiquant_dtype; \
 assert is_multiquant_dtype('tq3'); assert is_multiquant_dtype('rq3'); \
-print('MultiQuant: OK (tq3, rq3, rq2, tq4, rq4)'); \
+print('MultiQuant: tq3 rq3 rq2 tq4 rq4'); \
 from vllm.multiquant.weight_quant.config import ArcherConfig; \
 print('Archer:', ArcherConfig.get_name()); \
 print('All OK')"
