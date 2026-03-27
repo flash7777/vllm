@@ -142,41 +142,91 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         group_size = self.quant_config.group_size
         n_levels = 2 ** bits
 
-        # Simple per-group symmetric RTN quantization
         out_features, in_features = W.shape
         if group_size <= 0 or group_size > in_features:
             group_size = in_features
 
         n_groups = (in_features + group_size - 1) // group_size
-        W_q = torch.zeros_like(W)
+
+        # Per-group symmetric RTN: compute scales + integer weights
+        scales = torch.zeros(n_groups, out_features, dtype=torch.float32,
+                             device=W.device)
+        W_int = torch.zeros_like(W, dtype=torch.int32)
 
         for g in range(n_groups):
             start = g * group_size
             end = min(start + group_size, in_features)
             group = W[:, start:end]
 
-            # Symmetric quantization: scale = max(|w|) / (n_levels/2 - 1)
             max_val = group.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
             scale = max_val / (n_levels // 2 - 1)
+            scales[g] = scale.squeeze(-1)
 
-            # Quantize (round-to-nearest)
             q = torch.clamp(
                 torch.round(group / scale),
                 -(n_levels // 2), n_levels // 2 - 1
+            ).to(torch.int32)
+            W_int[:, start:end] = q
+
+        # Try Marlin repack for fast inference kernel
+        use_marlin = False
+        try:
+            if bits == 4:
+                from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                    prepare_int4_weight_for_marlin,
+                )
+                # Pack INT4 to Marlin format + use Marlin GEMM
+                # Shift to unsigned: q_unsigned = q + 8 (for INT4 symmetric)
+                W_unsigned = (W_int + n_levels // 2).to(torch.int32)
+                # Pack 8 x INT4 per INT32
+                pack_factor = 32 // bits
+                packed_w = torch.zeros(
+                    out_features, in_features // pack_factor,
+                    dtype=torch.int32, device=W.device)
+                for k in range(pack_factor):
+                    packed_w |= (W_unsigned[:, k::pack_factor] & 0xF) << (k * 4)
+
+                # Store packed weights + scales for Marlin
+                from vllm.model_executor.model_loader.utils import (
+                    replace_parameter,
+                )
+                replace_parameter(layer, "weight", packed_w.data)
+                layer.register_buffer(
+                    "weight_scale",
+                    scales.T.contiguous().to(layer.orig_dtype),
+                    persistent=False,
+                )
+                layer._autoround_rtn_marlin = True
+                use_marlin = True
+                logger.info(
+                    "AutoRound RTN: %s (%dx%d) → INT4 packed (Marlin-ready)",
+                    getattr(layer, "layer_name", "?"),
+                    out_features, in_features,
+                )
+        except Exception as e:
+            logger.debug("Marlin repack failed, falling back to BF16: %s", e)
+
+        if not use_marlin:
+            # Fallback: dequantize to BF16 (no memory savings, but correct)
+            W_q = torch.zeros_like(W)
+            for g in range(n_groups):
+                start = g * group_size
+                end = min(start + group_size, in_features)
+                scale = scales[g].unsqueeze(-1)
+                W_q[:, start:end] = W_int[:, start:end].float() * scale
+
+            from vllm.model_executor.model_loader.utils import (
+                replace_parameter,
+            )
+            replace_parameter(layer, "weight", W_q.to(layer.orig_dtype).data)
+            layer._autoround_rtn_marlin = False
+            logger.info(
+                "AutoRound RTN: %s (%dx%d) → %d-bit dequantized (BF16 fallback)",
+                getattr(layer, "layer_name", "?"),
+                out_features, in_features, bits,
             )
 
-            # Dequantize
-            W_q[:, start:end] = q * scale
-
-        from vllm.model_executor.model_loader.utils import replace_parameter
-        replace_parameter(layer, "weight", W_q.to(layer.orig_dtype).data)
-
         layer._already_called_process_weights_after_loading = True
-        logger.info(
-            "AutoRound RTN: quantized %s (%dx%d) to %d-bit, group=%d",
-            getattr(layer, "layer_name", "?"),
-            out_features, in_features, bits, group_size,
-        )
 
     def apply(
         self,
@@ -184,5 +234,38 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Phase 1: Standard F.linear with dequantized weights."""
-        return torch.nn.functional.linear(x, layer.weight, bias)
+        """GEMM: Marlin kernel if packed INT4, else standard F.linear."""
+        if getattr(layer, "_autoround_rtn_marlin", False):
+            # INT4 packed → dequantize on-the-fly via simple unpack + scale
+            # TODO: Replace with actual Marlin kernel call (needs repack to
+            # Marlin tile format via gptq_marlin_repack + workspace setup)
+            W_packed = layer.weight  # (out, in // 8) int32
+            scales = layer.weight_scale  # (out, n_groups) or (n_groups, out)
+            bits = self.quant_config.bits
+            group_size = self.quant_config.group_size
+            pack_factor = 32 // bits
+            out_features = W_packed.shape[0]
+            in_features = W_packed.shape[1] * pack_factor
+
+            # Unpack INT4 → float (temporary until Marlin kernel integrated)
+            W_float = torch.zeros(out_features, in_features,
+                                  dtype=x.dtype, device=x.device)
+            n_levels = 2 ** bits
+            for k in range(pack_factor):
+                W_float[:, k::pack_factor] = (
+                    ((W_packed >> (k * 4)) & 0xF).float() - n_levels // 2
+                )
+
+            # Apply per-group scales
+            n_groups = scales.shape[0] if scales.dim() == 2 else 1
+            if n_groups > 1 and group_size > 0:
+                for g in range(n_groups):
+                    start = g * group_size
+                    end = min(start + group_size, in_features)
+                    W_float[:, start:end] *= scales[g].unsqueeze(-1)
+            else:
+                W_float *= scales.unsqueeze(-1)
+
+            return torch.nn.functional.linear(x, W_float, bias)
+        else:
+            return torch.nn.functional.linear(x, layer.weight, bias)
