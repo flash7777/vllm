@@ -207,23 +207,38 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             logger.debug("Marlin repack failed, falling back to BF16: %s", e)
 
         if not use_marlin:
-            # Fallback: dequantize to BF16 (no memory savings, but correct)
-            W_q = torch.zeros_like(W)
-            for g in range(n_groups):
-                start = g * group_size
-                end = min(start + group_size, in_features)
-                scale = scales[g].unsqueeze(-1)
-                W_q[:, start:end] = W_int[:, start:end].float() * scale
+            # Pack INT into uint8/int32 — real VRAM savings
+            pack_factor = 32 // bits
+            W_unsigned = (W_int + n_levels // 2).to(torch.int32)
+            packed_w = torch.zeros(
+                out_features, (in_features + pack_factor - 1) // pack_factor,
+                dtype=torch.int32, device=W.device)
+            for k in range(pack_factor):
+                col_idx = k
+                while col_idx < in_features:
+                    packed_w[:, col_idx // pack_factor] |= (
+                        (W_unsigned[:, col_idx] & ((1 << bits) - 1))
+                        << ((col_idx % pack_factor) * bits)
+                    )
+                    col_idx += pack_factor
 
             from vllm.model_executor.model_loader.utils import (
                 replace_parameter,
             )
-            replace_parameter(layer, "weight", W_q.to(layer.orig_dtype).data)
-            layer._autoround_rtn_marlin = False
+            replace_parameter(layer, "weight",
+                              torch.nn.Parameter(packed_w, requires_grad=False))
+            layer.register_buffer(
+                "weight_scale",
+                scales.T.contiguous().to(layer.orig_dtype),
+                persistent=False,
+            )
+            layer._autoround_rtn_marlin = True  # Same packed format
+            layer._autoround_rtn_in_features = in_features
             logger.info(
-                "AutoRound RTN: %s (%dx%d) → %d-bit dequantized (BF16 fallback)",
+                "AutoRound RTN: %s (%dx%d) → %d-bit packed INT%d, %.1f%% of BF16",
                 getattr(layer, "layer_name", "?"),
-                out_features, in_features, bits,
+                out_features, in_features, bits, bits,
+                100.0 * packed_w.numel() * 4 / (out_features * in_features * 2),
             )
 
         layer._already_called_process_weights_after_loading = True
