@@ -41,13 +41,12 @@ RUN pip install --no-cache-dir cmake ninja setuptools-scm scipy pytest
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     tar cf /opt/nvidia-torch.tar torch/ $(ls -d torch*.dist-info 2>/dev/null)
 
-# ─── CUTLASS 4.4.0 (SM120a/SM121a) ──────────────────────────
-RUN git clone --depth 1 --branch v4.4.0 \
+# ─── CUTLASS 4.4.1 (SM120a/SM121a) ──────────────────────────
+RUN git clone --depth 1 --branch v4.4.1 \
       https://github.com/NVIDIA/cutlass.git /opt/cutlass
 ENV VLLM_CUTLASS_SRC_DIR=/opt/cutlass
 RUN sed -i '/nvidia-cutlass-dsl/d' /etc/pip/constraint.txt && \
-    echo "4.4.0" > /opt/cutlass/python/CuTeDSL/VERSION.EDITABLE && \
-    pip install --no-cache-dir --force-reinstall --no-deps /opt/cutlass/python/CuTeDSL
+    pip install --no-cache-dir --force-reinstall nvidia-cutlass-dsl==4.4.1
 
 # ─── vLLM from OUR FORK (everything included) ───────────────
 RUN git clone --filter=blob:none --branch ${VLLM_BRANCH} \
