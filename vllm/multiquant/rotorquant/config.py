@@ -23,7 +23,9 @@ class RotorQuantConfig(KVQuantizerConfig):
 
     @classmethod
     def from_cache_dtype(cls, cache_dtype: str, head_dim: int) -> RotorQuantConfig:
-        if cache_dtype == "rq3":
+        if cache_dtype == "rq2":
+            return cls(head_dim=head_dim, total_bits=2)
+        elif cache_dtype == "rq3":
             return cls(head_dim=head_dim, total_bits=3)
         elif cache_dtype == "rq4":
             return cls(head_dim=head_dim, total_bits=4)

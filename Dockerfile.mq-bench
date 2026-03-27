@@ -1,0 +1,34 @@
+FROM localhost/vllm-riy-tq
+
+ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
+
+# MultiQuant framework
+COPY vllm/multiquant/ ${VLLM_DST}/multiquant/
+
+# Updated vLLM files (Q5 mixed page-size + Q6 3D fix + M1-M2 multiquant)
+COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
+COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
+COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
+COPY vllm/v1/attention/backends/multiquant_attn.py ${VLLM_DST}/v1/attention/backends/multiquant_attn.py
+COPY vllm/v1/attention/backends/registry.py ${VLLM_DST}/v1/attention/backends/registry.py
+COPY vllm/v1/attention/backend.py ${VLLM_DST}/v1/attention/backend.py
+COPY vllm/platforms/cuda.py ${VLLM_DST}/platforms/cuda.py
+COPY vllm/config/cache.py ${VLLM_DST}/config/cache.py
+COPY vllm/turboquant/__init__.py ${VLLM_DST}/turboquant/__init__.py
+
+# Patch torch_utils.py inline (can't copy whole file — torch._opaque_base issue)
+RUN sed -i 's/"tq4": torch.uint8,/"tq4": torch.uint8,\n    "rq2": torch.uint8,\n    "rq3": torch.uint8,\n    "rq4": torch.uint8,/' ${VLLM_DST}/utils/torch_utils.py
+
+# Tests
+COPY tests/multiquant/ /opt/tests/multiquant/
+COPY tests/turboquant/ /opt/tests/turboquant/
+COPY tests/v1/core/test_kv_cache_utils.py /opt/tests/test_kv_cache_utils.py
+
+# pytest
+RUN pip install --no-cache-dir --break-system-packages pytest
+
+# Cleanup bytecode
+RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+
+# Verify
+RUN python3 -c "from vllm.multiquant import is_multiquant_dtype; assert is_multiquant_dtype('rq3'); print('MultiQuant: OK')"

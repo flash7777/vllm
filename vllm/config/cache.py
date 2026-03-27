@@ -22,6 +22,7 @@ CacheDType = Literal[
     "fp8_ds_mla",
     "tq3",
     "tq4",
+    "rq2",
     "rq3",
     "rq4",
 ]
