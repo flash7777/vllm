@@ -2,9 +2,10 @@ FROM localhost/vllm-ng17e-riy
 
 ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
 
-# 1. TQ Python module + attention backend
+# 1. TQ Python module + attention backend + attention layer
 COPY vllm/turboquant/ ${VLLM_DST}/turboquant/
 COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
+COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
 
 # 2. CUDA kernel sources
 COPY csrc/quantization/turboquant/ /opt/tq_build/

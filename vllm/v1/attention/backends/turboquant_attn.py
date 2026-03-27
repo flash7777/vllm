@@ -142,6 +142,9 @@ class TurboQuantImpl:
     supports_quant_query_input: bool = False
     can_return_lse_for_decode: bool = False
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        pass
+
     def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
                  alibi_slopes=None, sliding_window=None, kv_cache_dtype="tq3",
                  logits_soft_cap=None, attn_type=AttentionType.DECODER,
@@ -163,6 +166,7 @@ class TurboQuantImpl:
         self._mask = (1 << self._mse_bits) - 1
         self._correction = math.sqrt(math.pi / 2) / head_size
 
+    @torch.compiler.disable
     @torch.no_grad()
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
         """Pack K+V into compressed uint8 cache."""
@@ -187,16 +191,37 @@ class TurboQuantImpl:
                 kv_cache[bi, 1, bo, h, :self._packed_size] = self._pack(
                     value[i, h], Pi, S, centroids, D)
 
+    @torch.compiler.disable
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
         """Decode: compressed attention. Prefill: naive causal."""
-        if output is None:
-            output = torch.empty(query.shape[0], self.num_heads * self.head_size,
+        D = self.head_size
+        N = query.shape[0]
+
+        # vLLM passes 3D tensors [N, heads, D] — flatten to 2D for our logic
+        if query.dim() == 3:
+            query = query.reshape(N, -1)
+        if key is not None and key.dim() == 3:
+            key = key.reshape(key.shape[0], -1)
+        if value is not None and value.dim() == 3:
+            value = value.reshape(value.shape[0], -1)
+
+        output_3d = False
+        if output is not None and output.dim() == 3:
+            output_3d = True
+            out_shape = output.shape
+            # Use view (not reshape) to keep same storage — in-place writes
+            # propagate back to the caller's tensor.
+            output = output.view(N, -1)
+        elif output is None:
+            output = torch.empty(N, self.num_heads * D,
                                  device=query.device, dtype=query.dtype)
+
         if attn_metadata is None:
+            if output_3d:
+                return output.fill_(0).view(out_shape)
             return output.fill_(0)
 
-        D = self.head_size
         device = query.device
         Pi, S, centroids = self._get_matrices(layer, device)
         block_size = kv_cache.shape[2]
@@ -330,6 +355,8 @@ class TurboQuantImpl:
                         out_h = (weights.unsqueeze(-1) * v_recon).sum(0)  # (D,)
                         output[qi, h * D:(h + 1) * D] = out_h.to(output.dtype)
 
+        if output_3d:
+            return output.view(out_shape)
         return output
 
     # --- Helpers ---
