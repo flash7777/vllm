@@ -26,16 +26,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class _CopyCounter(torch.overrides.TorchFunctionMode):
-    """Count elements copied via Tensor.copy_ (tracks shard loading)."""
-    def __init__(self):
-        self.copied = 0
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        result = func(*args, **(kwargs or {}))
-        if func is torch.Tensor.copy_:
-            self.copied += args[0].numel()
-        return result
-
 
 class ArcherOnlineLinearMethod(QuantizeMethodBase):
     """BF16/FP8 → MultiQuant packed, quantized per-layer on arrival.
@@ -85,13 +75,12 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
 
             # Load this shard via original loader
             param = layer.weight
-            counter = _CopyCounter()
-            with counter:
-                if orig_loader is not None:
-                    orig_loader(param, loaded_weight, *args, **kwargs)
-                else:
-                    param.data.copy_(loaded_weight)
-            layer._archer_loaded += counter.copied
+            if orig_loader is not None:
+                orig_loader(param, loaded_weight, *args, **kwargs)
+            else:
+                param.data.copy_(loaded_weight)
+            # Track by loaded_weight size (not copy_ ops — those vary)
+            layer._archer_loaded += loaded_weight.numel()
 
             # All shards for this layer arrived? → quantize + free BF16
             if layer._archer_loaded >= param.data.numel():
