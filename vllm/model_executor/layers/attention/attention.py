@@ -241,17 +241,19 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
-        # TurboQuant: init buffers for compressed KV-cache
-        import os as _tq_os
-        self._tq_enabled = (
-            kv_cache_dtype.startswith("tq")
-            or _tq_os.environ.get("VLLM_TQ_ROUNDTRIP", "0") == "1"
+        # MultiQuant: init buffers for compressed KV-cache (TQ, RQ, etc.)
+        from vllm.multiquant.registry import is_multiquant_dtype
+        import os as _mq_os
+        self._mq_enabled = (
+            is_multiquant_dtype(kv_cache_dtype)
+            or _mq_os.environ.get("VLLM_TQ_ROUNDTRIP", "0") == "1"
         )
-        if self._tq_enabled:
-            tq_bits = kv_cache_dtype if kv_cache_dtype.startswith("tq") else "tq3"
-            self._init_turboquant_buffers(tq_bits, head_size, prefix)
+        # Keep _tq_enabled as alias for backward compat
+        self._tq_enabled = self._mq_enabled
+        if self._mq_enabled:
+            mq_dtype = kv_cache_dtype if is_multiquant_dtype(kv_cache_dtype) else "tq3"
+            self._init_multiquant_buffers(mq_dtype, head_size, prefix)
             self._kv_storage_dtype = kv_cache_dtype
-            # kv_cache_dtype stays "tq3" — TURBOQUANT backend handles everything
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
@@ -386,24 +388,28 @@ class Attention(nn.Module, AttentionLayerBase):
                 else GroupShape.PER_TENSOR,
             )
 
-    def _init_turboquant_buffers(
+    def _init_multiquant_buffers(
         self, cache_dtype: str, head_size: int, prefix: str
     ) -> None:
-        """Initialize TurboQuant rotation/projection matrices and centroids."""
+        """Initialize MultiQuant buffers via registry (TQ, RQ, etc.)."""
         import re
-        from vllm.turboquant.config import TurboQuantConfig
-        from vllm.turboquant.quantizer import (
-            generate_rotation_matrix,
-            generate_qjl_matrix,
-        )
-        from vllm.turboquant.centroids import get_centroids
+        from vllm.multiquant.registry import get_kv_quantizer_config
 
-        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+        mq_config = get_kv_quantizer_config(cache_dtype, head_size)
 
         # Extract layer index from prefix (e.g. "model.layers.5.self_attn")
         match = re.search(r"layers\.(\d+)", prefix)
         layer_idx = int(match.group(1)) if match else 0
-        seed = tq_config.seed + layer_idx * 1337
+        seed = mq_config.seed + layer_idx * 1337
+
+        # For now, all quantizers use the same buffer pattern (Pi, S, centroids).
+        # When RotorQuant is added, this will dispatch via the quantizer's
+        # init_buffers() method instead.
+        from vllm.multiquant.turboquant.quantizer import (
+            generate_rotation_matrix,
+            generate_qjl_matrix,
+        )
+        from vllm.multiquant.turboquant.centroids import get_centroids
 
         self.register_buffer(
             "_tq_Pi",
@@ -415,9 +421,9 @@ class Attention(nn.Module, AttentionLayerBase):
         )
         self.register_buffer(
             "_tq_centroids",
-            get_centroids(head_size, tq_config.mse_bits),
+            get_centroids(head_size, mq_config.mse_bits),
         )
-        self._tq_config = tq_config
+        self._tq_config = mq_config
 
     def forward(
         self,
