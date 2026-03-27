@@ -34,6 +34,7 @@ QuantizationMethods = Literal[
     "petit_nvfp4",
     "cpu_awq",
     "multiquant",
+    "marlin_mq",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -160,10 +161,15 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "cpu_awq": CPUAWQConfig,
     }
 
-    # Archer (MultiQuant online weight quantization) — lazy import
+    # MultiQuant: Archer (online) + Marlin adapter (pre-quantized)
     try:
         from vllm.multiquant.weight_quant.config import ArcherConfig
         method_to_config["multiquant"] = ArcherConfig
+    except ImportError:
+        pass
+    try:
+        from vllm.multiquant.marlin.config import MarlinMultiQuantConfig
+        method_to_config["marlin_mq"] = MarlinMultiQuantConfig
     except ImportError:
         pass
     # Update the `method_to_config` with customized quantization methods.
