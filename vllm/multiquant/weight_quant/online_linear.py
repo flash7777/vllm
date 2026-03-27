@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Archer online linear method — BF16/FP8 → MultiQuant packed weights.
 
-Quantizes per-layer as soon as all shards for that layer are loaded.
-Peak memory = 1 BF16 layer + 1 packed layer (not full model).
+Per-layer quantization: each layer is quantized as soon as all its shards
+arrive, then BF16 is replaced by packed uint8. Peak memory = 1 layer BF16.
 """
 
 from __future__ import annotations
@@ -26,12 +26,23 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class ArcherOnlineLinearMethod(QuantizeMethodBase):
-    """BF16/FP8 → MultiQuant packed weights, quantized per-layer on load.
+class _CopyCounter(torch.overrides.TorchFunctionMode):
+    """Count elements copied via Tensor.copy_ (tracks shard loading)."""
+    def __init__(self):
+        self.copied = 0
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        result = func(*args, **(kwargs or {}))
+        if func is torch.Tensor.copy_:
+            self.copied += args[0].numel()
+        return result
 
-    uses_meta_device=True: weights start on meta (no memory).
-    patched_weight_loader: materializes on first shard, quantizes when complete.
-    apply(): decompresses on-the-fly per forward pass.
+
+class ArcherOnlineLinearMethod(QuantizeMethodBase):
+    """BF16/FP8 → MultiQuant packed, quantized per-layer on arrival.
+
+    uses_meta_device=True: weight starts on meta (0 bytes).
+    patched_weight_loader: materializes on first shard, quantizes when done.
+    Peak memory = 1 BF16 layer + accumulated packed layers.
     """
 
     uses_meta_device: bool = True
@@ -51,62 +62,57 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        output_size_per_partition = sum(output_partition_sizes)
-        orig_weight_loader = extra_weight_attrs.get("weight_loader")
-        layer._archer_orig_dtype = params_dtype
-        layer._archer_quant_method = self
+        out_size = sum(output_partition_sizes)
+        orig_loader = extra_weight_attrs.get("weight_loader")
+        archer_method = self  # closure reference
 
         def patched_weight_loader(param, loaded_weight, *args, **kwargs):
-            """Materialize on first shard, quantize when all shards loaded."""
-            if not hasattr(layer, "_archer_loaded_numel"):
-                layer._archer_loaded_numel = 0
-                # Materialize from meta → real device
-                real_weight = ModelWeightParameter(
+            # First shard: materialize from meta → real device
+            if not hasattr(layer, "_archer_loaded"):
+                layer._archer_loaded = 0
+                real = ModelWeightParameter(
                     data=torch.empty(
-                        output_size_per_partition,
-                        input_size_per_partition,
+                        out_size, input_size_per_partition,
                         dtype=params_dtype,
-                        device=layer._archer_load_device,
+                        device=layer._archer_device,
                     ),
                     input_dim=1,
                     output_dim=0,
                     weight_loader=patched_weight_loader,
                 )
-                layer.register_parameter("weight", real_weight)
-                del layer._archer_load_device
+                layer.register_parameter("weight", real)
+                del layer._archer_device
 
-            # Load this shard
+            # Load this shard via original loader
             param = layer.weight
-            old_numel = param.data.numel()
-            if orig_weight_loader is not None:
-                orig_weight_loader(param, loaded_weight, *args, **kwargs)
+            counter = _CopyCounter()
+            with counter:
+                if orig_loader is not None:
+                    orig_loader(param, loaded_weight, *args, **kwargs)
+                else:
+                    param.data.copy_(loaded_weight)
+            layer._archer_loaded += counter.copied
 
-            # Track progress (approximate — count loaded_weight elements)
-            layer._archer_loaded_numel += loaded_weight.numel()
-
-            # When all shards loaded → quantize immediately
-            target = layer.weight.data.numel()
-            if layer._archer_loaded_numel >= target:
-                self._quantize_layer(layer)
+            # All shards for this layer arrived? → quantize + free BF16
+            if layer._archer_loaded >= param.data.numel():
+                archer_method._quantize_layer(layer)
                 layer._already_called_process_weights_after_loading = True
 
-        # Create on meta device (zero memory)
+        # Create on meta device — zero memory
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                device="meta",
-                dtype=params_dtype,
+                out_size, input_size_per_partition,
+                device="meta", dtype=params_dtype,
             ),
             input_dim=1,
             output_dim=0,
             weight_loader=patched_weight_loader,
         )
-        layer._archer_load_device = torch.get_default_device()
+        layer._archer_device = torch.get_default_device()
         layer.register_parameter("weight", weight)
 
     def _quantize_layer(self, layer: nn.Module) -> None:
-        """Compress one layer BF16 → packed uint8. Called per-layer."""
+        """Compress one layer: BF16 → packed uint8."""
         W = layer.weight.data.float()
         out_features, in_features = W.shape
         device = W.device
@@ -135,7 +141,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         from vllm.multiquant.shared.qjl import generate_qjl_matrix
         S = generate_qjl_matrix(in_features, seed=seed + 1).to(device)
 
-        # Quantize
+        # Per-row quantization
         row_norms = W.norm(dim=-1)
         W_unit = W / (row_norms.unsqueeze(-1) + 1e-8)
 
@@ -158,9 +164,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             # Re-compute indices for packing
             mv2 = embed_vectors_as_multivectors(W_unit)
             mv2_rot = rotor_sandwich(rotation, mv2)
-            coords = []
-            for gi in [1, 2, 3, 7]:
-                coords.append(mv2_rot[..., gi])
+            coords = [mv2_rot[..., gi] for gi in [1, 2, 3, 7]]
             flat_coords = torch.cat(
                 [c.reshape(out_features, -1) for c in coords], dim=-1)
             diffs = flat_coords.unsqueeze(-1) - centroids
@@ -184,7 +188,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             in_features, mse_bits,
         )
 
-        # Replace BF16 weight with packed uint8 — frees BF16 memory
+        # Replace BF16 with packed uint8 — frees BF16 memory immediately
         layer.weight = nn.Parameter(packed_W, requires_grad=False)
 
         # Decompression metadata
@@ -204,12 +208,11 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Fallback for layers that didn't go through patched_weight_loader."""
+        """Fallback — normally patched_weight_loader already quantized."""
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
         if getattr(layer, "_archer_packed", False):
             return
-        # Layer loaded normally (no meta device) — quantize now
         if layer.weight.device != torch.device("meta"):
             self._quantize_layer(layer)
         layer._already_called_process_weights_after_loading = True
@@ -241,7 +244,6 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         mask = (1 << mse_bits) - 1
         cpb = 8 // mse_bits
 
-        # Unpack MSE indices
         idx = torch.zeros(out_features, in_features,
                           dtype=torch.long, device=device)
         for b in range(mse_bytes):
@@ -252,7 +254,6 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                     break
                 idx[:, j] = (bv >> (k * mse_bits)) & mask
 
-        # Unpack signs
         signs = torch.zeros(out_features, in_features,
                             dtype=torch.float32, device=device)
         for b in range(qjl_bytes):
@@ -267,7 +268,6 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                     -torch.ones(out_features, device=device),
                 )
 
-        # Unpack norms
         no = mse_bytes + qjl_bytes
         row_norms = packed[:, no:no + 2].contiguous().view(
             torch.float16).float().squeeze(-1)
