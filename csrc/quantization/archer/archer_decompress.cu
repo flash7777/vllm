@@ -37,6 +37,8 @@ __device__ __forceinline__ T from_float(float val);
 template <> __device__ __forceinline__ c10::Half from_float<c10::Half>(float v) { return __float2half(v); }
 template <> __device__ __forceinline__ at::BFloat16 from_float<at::BFloat16>(float v) { return static_cast<at::BFloat16>(v); }
 template <> __device__ __forceinline__ float from_float<float>(float v) { return v; }
+template <> __device__ __forceinline__ float to_float<double>(double v) { return static_cast<float>(v); }
+template <> __device__ __forceinline__ double from_float<double>(float v) { return static_cast<double>(v); }
 
 // ── Tiled column-access GEMV: out[tid] = Σ_j M[j*D + tid] * vec[j] ────
 // This computes Pi^T @ x = (transpose of Pi) @ x
@@ -208,7 +210,7 @@ void archer_decompress(
 ) {
     int num_rows = packed_W.size(0);
     int packed_size = packed_W.size(1);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = 0;  // default stream
 
     // Dispatch on dtype + head_size + n_centroids
     #define DISPATCH(DTYPE, D, NC, BITS) \
@@ -220,9 +222,16 @@ void archer_decompress(
             centroids.data_ptr<float>(), \
             num_rows, packed_size, stream)
 
+    // Only BF16/FP16/FP32 — no double (avoids template instantiation issue)
+    auto dtype = W_out.scalar_type();
+    TORCH_CHECK(dtype == at::ScalarType::BFloat16 ||
+                dtype == at::ScalarType::Half ||
+                dtype == at::ScalarType::Float,
+                "archer_decompress: only BF16/FP16/FP32 supported, got ", dtype);
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
-        W_out.scalar_type(), "archer_decompress", [&] {
+        dtype, "archer_decompress", [&] {
             // TQ3: MSE_BITS=2, N_CENTROIDS=4
             if (n_centroids == 4) {
                 if (head_size == 128)       DISPATCH(scalar_t, 128, 4, 2);
