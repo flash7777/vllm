@@ -67,6 +67,11 @@ RUN pip uninstall -y vllm
 ENV TORCH_CUDA_ARCH_LIST=${CUDA_ARCHS}
 ENV VLLM_TARGET_DEVICE=cuda
 ENV MAX_JOBS=${MAX_JOBS}
+# Pin cutlass-dsl to already-installed version (avoids 74MB download on flaky SSL)
+RUN pip install --no-cache-dir --retries 10 --timeout 120 \
+    numba llvmlite xgrammar nvidia-cutlass-dsl==4.4.0 nvidia-cutlass-dsl-libs-base==4.4.0 || \
+    pip install --no-cache-dir --retries 10 --timeout 120 \
+    numba llvmlite xgrammar nvidia-cutlass-dsl==4.4.0 nvidia-cutlass-dsl-libs-base==4.4.0
 RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 pip install --no-build-isolation --no-cache-dir .
 
 # Save our source files that aren't part of pip install
