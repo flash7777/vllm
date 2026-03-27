@@ -277,6 +277,21 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         S = layer._archer_S
         centroids = layer._archer_centroids
 
+        # Try CUDA kernel first (100× faster)
+        try:
+            from vllm.multiquant.weight_quant.archer_ops import cuda_decompress
+            result = cuda_decompress(
+                packed, rotation, S, centroids, in_features,
+                out_dtype=torch.bfloat16,
+            )
+            if result is not None:
+                return result
+        except Exception:
+            pass
+
+        # Python fallback
+        centroids = layer._archer_centroids
+
         mse_bytes = math.ceil(in_features * mse_bits / 8)
         qjl_bytes = math.ceil(in_features / 8)
         mask = (1 << mse_bits) - 1
