@@ -290,46 +290,55 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             except Exception:
                 pass
 
-        # Hybrid: vectorized unpack (GPU) + torch.mm for rotation (cuBLAS)
+        # Try CUDA unpack kernel (eliminates Python bit-loops)
         centroids = layer._archer_centroids
+        try:
+            from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+            result = cuda_unpack(packed, in_features, mse_bits)
+            if result is not None:
+                idx, signs, row_norms, res_norms = result
+                idx = idx.long()
+            else:
+                result = None
+        except Exception:
+            result = None
 
-        mse_bytes = math.ceil(in_features * mse_bits / 8)
-        qjl_bytes = math.ceil(in_features / 8)
-        mask = (1 << mse_bits) - 1
-        cpb = 8 // mse_bits
+        if result is None:
+            # Python fallback
+            mse_bytes = math.ceil(in_features * mse_bits / 8)
+            qjl_bytes = math.ceil(in_features / 8)
+            mask = (1 << mse_bits) - 1
+            cpb = 8 // mse_bits
 
-        # Unpack MSE indices — vectorized over bytes
-        idx = torch.zeros(out_features, in_features,
-                          dtype=torch.long, device=device)
-        for b in range(mse_bytes):
-            bv = packed[:, b].long()
-            for k in range(cpb):
-                j = b * cpb + k
-                if j >= in_features:
-                    break
-                idx[:, j] = (bv >> (k * mse_bits)) & mask
+            idx = torch.zeros(out_features, in_features,
+                              dtype=torch.long, device=device)
+            for b in range(mse_bytes):
+                bv = packed[:, b].long()
+                for k in range(cpb):
+                    j = b * cpb + k
+                    if j >= in_features:
+                        break
+                    idx[:, j] = (bv >> (k * mse_bits)) & mask
 
-        # Unpack signs — vectorized over bytes
-        signs = torch.zeros(out_features, in_features,
-                            dtype=torch.float32, device=device)
-        for b in range(qjl_bytes):
-            bv = packed[:, mse_bytes + b].long()
-            for k in range(8):
-                j = b * 8 + k
-                if j >= in_features:
-                    break
-                signs[:, j] = torch.where(
-                    ((bv >> k) & 1).bool(),
-                    torch.ones(out_features, device=device),
-                    -torch.ones(out_features, device=device),
-                )
+            signs = torch.zeros(out_features, in_features,
+                                dtype=torch.float32, device=device)
+            for b in range(qjl_bytes):
+                bv = packed[:, mse_bytes + b].long()
+                for k in range(8):
+                    j = b * 8 + k
+                    if j >= in_features:
+                        break
+                    signs[:, j] = torch.where(
+                        ((bv >> k) & 1).bool(),
+                        torch.ones(out_features, device=device),
+                        -torch.ones(out_features, device=device),
+                    )
 
-        # Unpack norms
-        no = mse_bytes + qjl_bytes
-        row_norms = packed[:, no:no + 2].contiguous().view(
-            torch.float16).float().squeeze(-1)
-        res_norms = packed[:, no + 2:no + 4].contiguous().view(
-            torch.float16).float().squeeze(-1)
+            no = mse_bytes + qjl_bytes
+            row_norms = packed[:, no:no + 2].contiguous().view(
+                torch.float16).float().squeeze(-1)
+            res_norms = packed[:, no + 2:no + 4].contiguous().view(
+                torch.float16).float().squeeze(-1)
 
         # Centroid lookup (GPU gather) + inverse rotation (cuBLAS GEMM)
         c_vals = centroids[idx]  # (out, in) — fast GPU gather
