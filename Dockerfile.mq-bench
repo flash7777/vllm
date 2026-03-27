@@ -11,12 +11,19 @@ COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executo
 COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
 COPY vllm/v1/attention/backends/multiquant_attn.py ${VLLM_DST}/v1/attention/backends/multiquant_attn.py
 COPY vllm/v1/attention/backends/registry.py ${VLLM_DST}/v1/attention/backends/registry.py
-COPY vllm/v1/attention/backend.py ${VLLM_DST}/v1/attention/backend.py
-COPY vllm/platforms/cuda.py ${VLLM_DST}/platforms/cuda.py
-COPY vllm/config/cache.py ${VLLM_DST}/config/cache.py
+# Patch backend.py inline
+RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/v1/attention/backend.py
+# Patch cuda.py inline (can't copy — _C_stable_libtorch import chain)
+# Remove TQ-only backend priority — let normal selection handle it.
+# MLA models (GLM-4.7) need their MLA backend; TQ/RQ compression runs
+# in attention.py _init_multiquant_buffers regardless of backend.
+# Non-MLA + TQ/RQ (Qwen3.5) will pick MULTIQUANT via registry match.
+RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/platforms/cuda.py \
+ && sed -i '/startswith("tq")/{n;s/return \[AttentionBackendEnum.TURBOQUANT\]/pass  # removed: let normal backend selection handle MLA vs non-MLA/}' ${VLLM_DST}/platforms/cuda.py
 COPY vllm/turboquant/__init__.py ${VLLM_DST}/turboquant/__init__.py
 
-# Patch torch_utils.py inline (can't copy whole file — torch._opaque_base issue)
+# Patch config/cache.py + utils/torch_utils.py inline (can't copy — import chain breaks)
+RUN sed -i 's/"tq4",/"tq4",\n    "rq2",\n    "rq3",\n    "rq4",/' ${VLLM_DST}/config/cache.py
 RUN sed -i 's/"tq4": torch.uint8,/"tq4": torch.uint8,\n    "rq2": torch.uint8,\n    "rq3": torch.uint8,\n    "rq4": torch.uint8,/' ${VLLM_DST}/utils/torch_utils.py
 
 # Tests

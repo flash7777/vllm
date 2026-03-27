@@ -329,6 +329,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             calculate_kv_scales = False
         self.quant_config = quant_config
 
+        # MultiQuant MLA: compress latent vectors, remap dtype for MLA backend
+        from vllm.multiquant.registry import is_multiquant_dtype
+        self._mq_enabled = is_multiquant_dtype(kv_cache_dtype)
+        self._mq_cache_dtype = kv_cache_dtype if self._mq_enabled else None
+        if self._mq_enabled:
+            self._init_multiquant_buffers(
+                kv_cache_dtype, self.head_size, prefix)
+            # Remap to fp8 so MLA backend sees a supported dtype
+            kv_cache_dtype = "fp8"
+            if cache_config is not None:
+                cache_config.cache_dtype = "fp8"
+            logger.info_once(
+                "MultiQuant MLA: %s compression enabled, "
+                "handing off as fp8 to MLA backend",
+                self._mq_cache_dtype,
+            )
+
         dtype = torch.get_default_dtype()
         self.attn_backend = get_attn_backend(
             self.head_size,
@@ -464,6 +481,39 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             )
         return self._chunked_prefill_workspace_size
+
+    def _init_multiquant_buffers(
+        self, cache_dtype: str, head_size: int, prefix: str
+    ) -> None:
+        """Initialize MultiQuant buffers for MLA latent vector compression."""
+        import re
+        from vllm.multiquant.registry import get_kv_quantizer_config
+
+        mq_config = get_kv_quantizer_config(cache_dtype, head_size)
+        match = re.search(r"layers\.(\d+)", prefix)
+        layer_idx = int(match.group(1)) if match else 0
+        seed = mq_config.seed + layer_idx * 1337
+
+        from vllm.multiquant.shared.qjl import generate_qjl_matrix
+        from vllm.multiquant.shared.centroids import get_centroids
+
+        if cache_dtype.startswith("rq"):
+            from vllm.multiquant.rotorquant.quantizer import generate_rotors
+            self.register_buffer(
+                "_tq_Pi", generate_rotors(head_size, seed=seed))
+        else:
+            from vllm.multiquant.turboquant.quantizer import (
+                generate_rotation_matrix,
+            )
+            self.register_buffer(
+                "_tq_Pi", generate_rotation_matrix(head_size, seed=seed))
+
+        self.register_buffer(
+            "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
+        self.register_buffer(
+            "_tq_centroids",
+            get_centroids(head_size, mq_config.mse_bits))
+        self._tq_config = mq_config
 
     def forward(
         self,
