@@ -402,35 +402,27 @@ class Attention(nn.Module, AttentionLayerBase):
         layer_idx = int(match.group(1)) if match else 0
         seed = mq_config.seed + layer_idx * 1337
 
-        # Dispatch buffer init based on quantizer type
+        # Shared: QJL + Centroids
+        from vllm.multiquant.shared.qjl import generate_qjl_matrix
+        from vllm.multiquant.shared.centroids import get_centroids
+
+        # Dispatch rotation based on quantizer type
         if cache_dtype.startswith("rq"):
-            from vllm.multiquant.rotorquant.quantizer import (
-                generate_rotors,
-                generate_qjl_matrix,
-            )
-            from vllm.multiquant.turboquant.centroids import get_centroids
-            # _tq_Pi stores rotors (n_groups, 8) for RQ
+            from vllm.multiquant.rotorquant.quantizer import generate_rotors
             self.register_buffer(
                 "_tq_Pi", generate_rotors(head_size, seed=seed))
-            self.register_buffer(
-                "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
-            self.register_buffer(
-                "_tq_centroids",
-                get_centroids(head_size, mq_config.mse_bits))
         else:
             from vllm.multiquant.turboquant.quantizer import (
                 generate_rotation_matrix,
-                generate_qjl_matrix,
             )
-            from vllm.multiquant.turboquant.centroids import get_centroids
-            # _tq_Pi stores dense D×D matrix for TQ
             self.register_buffer(
                 "_tq_Pi", generate_rotation_matrix(head_size, seed=seed))
-            self.register_buffer(
-                "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
-            self.register_buffer(
-                "_tq_centroids",
-                get_centroids(head_size, mq_config.mse_bits))
+
+        self.register_buffer(
+            "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
+        self.register_buffer(
+            "_tq_centroids",
+            get_centroids(head_size, mq_config.mse_bits))
         self._tq_config = mq_config
         self._mq_cache_dtype = cache_dtype
 

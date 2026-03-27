@@ -159,7 +159,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         mq_config = get_kv_quantizer_config(cache_dtype, in_features)
         mse_bits = mq_config.mse_bits
 
-        from vllm.multiquant.turboquant.centroids import get_centroids
+        from vllm.multiquant.shared.centroids import get_centroids
         centroids = get_centroids(in_features, mse_bits).to(W.device)
 
         # 3. Generate rotation (per-layer seed)
@@ -181,15 +181,8 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             out_features, packed_size, dtype=torch.uint8, device=W.device
         )
 
-        # Generate QJL matrix
-        if self.method == "rq":
-            from vllm.multiquant.rotorquant.quantizer import (
-                generate_qjl_matrix,
-            )
-        else:
-            from vllm.multiquant.turboquant.quantizer import (
-                generate_qjl_matrix,
-            )
+        # Generate QJL matrix (shared between TQ and RQ)
+        from vllm.multiquant.shared.qjl import generate_qjl_matrix
         S = generate_qjl_matrix(in_features, seed=seed + 1).to(W.device)
 
         # Vectorized quantization for all rows at once

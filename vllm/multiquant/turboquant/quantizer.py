@@ -30,14 +30,7 @@ def generate_rotation_matrix(
     return Q.contiguous().to(device)
 
 
-def generate_qjl_matrix(
-    d: int, seed: int, device: torch.device = torch.device("cpu")
-) -> torch.Tensor:
-    """Generate i.i.d. N(0,1) projection matrix for QJL."""
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    S = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
-    return S.to(device)
+from vllm.multiquant.shared.qjl import generate_qjl_matrix  # noqa: F401
 
 
 @torch.no_grad()
