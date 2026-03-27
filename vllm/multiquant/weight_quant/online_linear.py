@@ -291,17 +291,18 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                 pass
 
         # Try CUDA unpack kernel (eliminates Python bit-loops)
+        # Only for dimensions that have been tested (128-2048)
         centroids = layer._archer_centroids
-        try:
-            from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
-            result = cuda_unpack(packed, in_features, mse_bits)
-            if result is not None:
-                idx, signs, row_norms, res_norms = result
-                idx = idx.long()
-            else:
+        result = None
+        if in_features <= 2048:
+            try:
+                from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+                result = cuda_unpack(packed, in_features, mse_bits)
+                if result is not None:
+                    idx, signs, row_norms, res_norms = result
+                    idx = idx.long()
+            except Exception:
                 result = None
-        except Exception:
-            result = None
 
         if result is None:
             # Python fallback

@@ -2,7 +2,7 @@
 #include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
-#include "quantization/turboquant/tq_round_trip.cuh"
+// TQ/Archer kernels built via JIT, not cmake — include removed
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -774,13 +774,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
                  &concat_and_cache_mla_rope_fused);
 
-  // TurboQuant fused round-trip: quantize→dequant keys in one kernel.
-  cache_ops.def(
-      "turboquant_round_trip(Tensor key, Tensor Pi, Tensor S,"
-      "                      Tensor centroids, Tensor! output,"
-      "                      int head_size, int n_centroids) -> ()");
-  cache_ops.impl("turboquant_round_trip", torch::kCUDA,
-                 &turboquant::turboquant_round_trip);
+  // TurboQuant: built via JIT (kernels/turboquant/), not cmake.
+  // Use torch.utils.cpp_extension.load() at runtime.
 
   // Convert the key and value cache to fp8 data type.
   cache_ops.def(
