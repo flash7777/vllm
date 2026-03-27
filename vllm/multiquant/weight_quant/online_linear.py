@@ -261,7 +261,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_archer_packed", False):
-            W = self._decompress(layer).to(x.dtype)
+            W = self._decompress(layer).to(x.dtype).contiguous()
             return F.linear(x, W, bias)
         return F.linear(x, layer.weight, bias)
 
