@@ -293,16 +293,9 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         # Try CUDA unpack kernel (eliminates Python bit-loops)
         # Only for dimensions that have been tested (128-2048)
         centroids = layer._archer_centroids
+        # CUDA unpack kernel disabled for now — async assert in serving.
+        # TODO: debug with CUDA_LAUNCH_BLOCKING=1 in full serving context.
         result = None
-        if in_features <= 2048:
-            try:
-                from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
-                result = cuda_unpack(packed, in_features, mse_bits)
-                if result is not None:
-                    idx, signs, row_norms, res_norms = result
-                    idx = idx.long()
-            except Exception:
-                result = None
 
         if result is None:
             # Python fallback
