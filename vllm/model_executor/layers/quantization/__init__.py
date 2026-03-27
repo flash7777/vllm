@@ -35,6 +35,7 @@ QuantizationMethods = Literal[
     "cpu_awq",
     "multiquant",
     "marlin_mq",
+    "autoround_rtn",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -170,6 +171,11 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     try:
         from vllm.multiquant.marlin.config import MarlinMultiQuantConfig
         method_to_config["marlin_mq"] = MarlinMultiQuantConfig
+    except ImportError:
+        pass
+    try:
+        from vllm.multiquant.autoround.config import AutoRoundRTNConfig
+        method_to_config["autoround_rtn"] = AutoRoundRTNConfig
     except ImportError:
         pass
     # Update the `method_to_config` with customized quantization methods.
