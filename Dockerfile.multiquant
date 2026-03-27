@@ -82,10 +82,15 @@ WORKDIR /
 RUN rm -rf /tmp/vllm-build
 
 # ─── FlashInfer 0.6.6 (prebuilt wheel) ──────────────────────
-# Copy wheels into build context: build/wheels/flashinfer*.whl
-COPY build/wheels/flashinfer*.whl /tmp/wheels/
-RUN pip install --no-cache-dir --force-reinstall /tmp/wheels/flashinfer*.whl && \
-    rm -rf /tmp/wheels
+# Try build context first, then PyPI fallback
+COPY build/wheels/flashinfer*.whl /tmp/wheels/ 2>/dev/null || true
+RUN if ls /tmp/wheels/flashinfer*.whl 1>/dev/null 2>&1; then \
+      echo "Installing FlashInfer from local wheels"; \
+      pip install --no-cache-dir --force-reinstall /tmp/wheels/flashinfer*.whl; \
+    else \
+      echo "No local wheels — installing FlashInfer from PyPI"; \
+      pip install --no-cache-dir flashinfer-python==0.6.6; \
+    fi && rm -rf /tmp/wheels
 
 # ─── fastsafetensors + Ray ───────────────────────────────────
 RUN pip install --no-cache-dir fastsafetensors ray[default] nvidia-nvshmem-cu13
