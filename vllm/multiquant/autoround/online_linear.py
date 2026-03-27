@@ -42,18 +42,18 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight = nn.Parameter(
-            torch.empty(
+        from vllm.model_executor.parameter import ModelWeightParameter
+        weight = ModelWeightParameter(
+            data=torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
             ),
-            requires_grad=False,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
         )
         layer.register_parameter("weight", weight)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        if weight_loader is not None:
-            weight.weight_loader = weight_loader
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """BF16 → packed INT4 int32."""
