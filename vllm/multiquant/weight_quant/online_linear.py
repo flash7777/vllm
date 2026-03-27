@@ -177,8 +177,20 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             in_features, mse_bits,
         )
 
-        # Replace BF16 with packed uint8 — frees BF16 memory immediately
+        # Zero the BF16 data first — releases actual GPU memory even if
+        # params_dict in model.load_weights() still holds a reference.
+        # Then resize to 0 to minimize the dangling allocation.
+        old_weight = layer.weight
+        old_weight.data = torch.empty(0, device=device, dtype=old_weight.dtype)
+
+        # Set new packed weight
         layer.weight = nn.Parameter(packed_W, requires_grad=False)
+
+        # Force GC to release the old allocation
+        del old_weight
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Decompression metadata
         layer.register_buffer("_archer_rotation", rotation, persistent=False)
