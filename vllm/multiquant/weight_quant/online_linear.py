@@ -214,37 +214,136 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             quantized = centroids[indices]
             W_mse = quantized @ rotation
 
-        # QJL residual correction
+        # 5. Compute MSE indices for packing (re-use rotation result)
+        if self.method == "rq":
+            # For RQ, re-compute indices from rotated multivector
+            mv2 = embed_vectors_as_multivectors(W_unit)
+            mv2_rot = rotor_sandwich(rotation, mv2)
+            # Collect quantized coords for all non-zero grades
+            all_coords = []
+            for gi in [1, 2, 3, 7]:
+                all_coords.append(mv2_rot[..., gi])
+            flat_coords = torch.cat(
+                [c.reshape(out_features, -1) for c in all_coords], dim=-1
+            )
+            diffs = flat_coords.unsqueeze(-1) - centroids
+            mse_indices = diffs.abs().argmin(dim=-1)
+        else:
+            rotated = W_unit @ rotation.T
+            diffs = rotated.unsqueeze(-1) - centroids
+            mse_indices = diffs.abs().argmin(dim=-1)
+
+        # QJL residual
         residual = W_unit - W_mse
-        res_norms = residual.norm(dim=-1)  # (out_features,)
+        res_norms = residual.norm(dim=-1)
         projected = residual @ S.T
         signs = torch.sign(projected)
         signs[signs == 0] = 1.0
 
-        correction_scale = math.sqrt(math.pi / 2) / in_features
-        W_qjl = correction_scale * res_norms.unsqueeze(-1) * (signs @ S)
-        W_recon = row_norms.unsqueeze(-1) * (W_mse + W_qjl)
-
-        # 5. Pack into uint8 (same format as KV-cache pack)
-        # For now, store decompressed BF16 — full packing in Phase 2
-        # This gives correct results but no memory savings yet
-        W_compressed = W_recon.to(layer.orig_dtype)
+        # 6. Pack into uint8 — REAL compression, stays packed in VRAM
+        from vllm.multiquant.shared.bitpack import pack_vectors_batched
+        packed_W = pack_vectors_batched(
+            mse_indices, signs, row_norms, res_norms,
+            in_features, mse_bits,
+        )
 
         from vllm.model_executor.model_loader.utils import replace_parameter
-        replace_parameter(layer, "weight", W_compressed.data)
+        # Store packed uint8 weights (REAL memory savings!)
+        replace_parameter(layer, "weight",
+                          torch.nn.Parameter(packed_W, requires_grad=False))
 
-        # Store metadata for potential future Archer kernel
+        # Store decompression metadata
         layer.register_buffer(
-            "_archer_row_norms", row_norms.half(), persistent=False
-        )
+            "_archer_rotation", rotation, persistent=False)
+        layer.register_buffer(
+            "_archer_S", S, persistent=False)
+        layer.register_buffer(
+            "_archer_centroids", centroids, persistent=False)
+        layer._archer_in_features = in_features
+        layer._archer_mse_bits = mse_bits
+        layer._archer_method = self.method
+        layer._archer_packed = True
 
         layer._already_called_process_weights_after_loading = True
         logger.info(
-            "Archer: quantized %s (%dx%d) with %s%d",
+            "Archer: packed %s (%dx%d) → (%dx%d) uint8, %.1f%% of BF16",
             getattr(layer, "layer_name", "?"),
             out_features, in_features,
-            self.method, self.bits,
+            out_features, packed_size,
+            100.0 * packed_size / (in_features * 2),
         )
+
+    def _decompress_weights(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Decompress packed uint8 → BF16 weight matrix on-the-fly."""
+        packed = layer.weight.data  # (out, packed_size) uint8
+        out_features = packed.shape[0]
+        in_features = layer._archer_in_features
+        mse_bits = layer._archer_mse_bits
+        device = packed.device
+
+        rotation = layer._archer_rotation
+        S = layer._archer_S
+        centroids = layer._archer_centroids
+
+        mse_bytes = math.ceil(in_features * mse_bits / 8)
+        qjl_bytes = math.ceil(in_features / 8)
+        mask = (1 << mse_bits) - 1
+        coords_per_byte = 8 // mse_bits
+
+        # Unpack MSE indices
+        idx_all = torch.zeros(out_features, in_features,
+                              dtype=torch.long, device=device)
+        for b in range(mse_bytes):
+            bv = packed[:, b].long()
+            for k in range(coords_per_byte):
+                j = b * coords_per_byte + k
+                if j >= in_features:
+                    break
+                idx_all[:, j] = (bv >> (k * mse_bits)) & mask
+
+        # Unpack signs
+        signs_all = torch.zeros(out_features, in_features,
+                                dtype=torch.float32, device=device)
+        for b in range(qjl_bytes):
+            bv = packed[:, mse_bytes + b].long()
+            for k in range(8):
+                j = b * 8 + k
+                if j >= in_features:
+                    break
+                signs_all[:, j] = torch.where(
+                    ((bv >> k) & 1).bool(),
+                    torch.ones(out_features, device=device),
+                    -torch.ones(out_features, device=device),
+                )
+
+        # Unpack norms
+        no = mse_bytes + qjl_bytes
+        row_norms = packed[:, no:no + 2].contiguous().view(
+            torch.float16).float().squeeze(-1)
+        res_norms = packed[:, no + 2:no + 4].contiguous().view(
+            torch.float16).float().squeeze(-1)
+
+        # Reconstruct
+        c_vals = centroids[idx_all]
+
+        if layer._archer_method == "rq":
+            from vllm.multiquant.rotorquant.clifford import (
+                embed_vectors_as_multivectors,
+                extract_vectors_from_multivectors,
+                reverse, rotor_sandwich,
+            )
+            mv_q = embed_vectors_as_multivectors(c_vals)
+            rotor_rev = reverse(rotation)
+            mv_recon = rotor_sandwich(rotor_rev, mv_q)
+            W_mse = extract_vectors_from_multivectors(mv_recon, in_features)
+        else:
+            W_mse = c_vals @ rotation
+
+        correction = math.sqrt(math.pi / 2) / in_features
+        W_qjl = correction * res_norms.unsqueeze(-1) * (signs_all @ S)
+        W_recon = row_norms.unsqueeze(-1) * (W_mse + W_qjl)
+
+        return W_recon
 
     def apply(
         self,
@@ -252,9 +351,13 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass: standard F.linear with decompressed weights.
+        """Decompress packed weights on-the-fly → GEMM.
 
-        Phase 1: Weights already decompressed in process_weights_after_loading.
-        Phase 2: Archer kernel will decompress on-the-fly.
+        Weights stored as packed uint8 (real compression).
+        Decompressed to BF16/FP16 per forward pass.
+        TODO: Archer CUDA kernel for fused decompress+GEMM.
         """
+        if getattr(layer, '_archer_packed', False):
+            W = self._decompress_weights(layer).to(x.dtype)
+            return F.linear(x, W, bias)
         return F.linear(x, layer.weight, bias)
