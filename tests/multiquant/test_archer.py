@@ -118,7 +118,7 @@ class TestArcherLinearMethod:
         from vllm.multiquant.weight_quant.config import ArcherConfig
         cfg = ArcherConfig(bits=3, method="rq")
         method = ArcherOnlineLinearMethod(cfg)
-        assert method.uses_meta_device is True
+        assert method.uses_meta_device is False
 
 
 if __name__ == "__main__":

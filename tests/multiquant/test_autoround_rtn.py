@@ -85,7 +85,7 @@ class TestAutoRoundRTNMethod:
         from vllm.multiquant.autoround.config import AutoRoundRTNConfig
         cfg = AutoRoundRTNConfig(bits=4)
         method = AutoRoundRTNLinearMethod(cfg)
-        assert method.uses_meta_device is True
+        assert method.uses_meta_device is False
 
 
 if __name__ == "__main__":

@@ -26,6 +26,25 @@ COPY vllm/turboquant/__init__.py ${VLLM_DST}/turboquant/__init__.py
 RUN sed -i 's/"tq4",/"tq4",\n    "rq2",\n    "rq3",\n    "rq4",/' ${VLLM_DST}/config/cache.py
 RUN sed -i 's/"tq4": torch.uint8,/"tq4": torch.uint8,\n    "rq2": torch.uint8,\n    "rq3": torch.uint8,\n    "rq4": torch.uint8,/' ${VLLM_DST}/utils/torch_utils.py
 
+# Register "multiquant" + "autoround_rtn" + "marlin_mq" as valid quantization methods
+RUN sed -i 's/"cpu_awq",/"cpu_awq",\n    "multiquant",\n    "marlin_mq",\n    "autoround_rtn",/' ${VLLM_DST}/model_executor/layers/quantization/__init__.py
+RUN python3 -c "\
+p='${VLLM_DST}/model_executor/layers/quantization/__init__.py';\
+open(p,'a').write(\"\"\"\n\
+try:\n\
+    from vllm.multiquant.weight_quant.config import ArcherConfig as _AC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['multiquant'] = _AC\n\
+except ImportError: pass\n\
+try:\n\
+    from vllm.multiquant.autoround.config import AutoRoundRTNConfig as _ARC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['autoround_rtn'] = _ARC\n\
+except ImportError: pass\n\
+try:\n\
+    from vllm.multiquant.marlin.config import MarlinMultiQuantConfig as _MMC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['marlin_mq'] = _MMC\n\
+except ImportError: pass\n\
+\"\"\")"
+
 # Tests
 COPY tests/multiquant/ /opt/tests/multiquant/
 COPY tests/turboquant/ /opt/tests/turboquant/
