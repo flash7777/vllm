@@ -265,6 +265,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             return F.linear(x, W, bias)
         return F.linear(x, layer.weight, bias)
 
+    @torch.compiler.disable
     def _decompress(self, layer: nn.Module) -> torch.Tensor:
         packed = layer.weight.data
         out_features = packed.shape[0]
