@@ -8,6 +8,7 @@ COPY vllm/multiquant/ ${VLLM_DST}/multiquant/
 # Updated vLLM files (Q5 mixed page-size + Q6 3D fix + M1-M2 multiquant)
 COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
 COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
+COPY vllm/model_executor/layers/attention/mla_attention.py ${VLLM_DST}/model_executor/layers/attention/mla_attention.py
 COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
 COPY vllm/v1/attention/backends/multiquant_attn.py ${VLLM_DST}/v1/attention/backends/multiquant_attn.py
 COPY vllm/v1/attention/backends/registry.py ${VLLM_DST}/v1/attention/backends/registry.py

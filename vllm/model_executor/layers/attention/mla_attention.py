@@ -889,6 +889,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # MultiQuant MLA: compressed cache with packed_size as head_size.
+        # The MLA impl still sees the full latent dimension — we compress
+        # in the KV-cache write hook and decompress in the read hook.
+        # TODO(m8): When we have a dedicated MQ-MLA backend, this can
+        # allocate with packed_size directly. For now, we keep FP8
+        # allocation so existing MLA backends work unchanged.
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )

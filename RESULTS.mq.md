@@ -10,12 +10,14 @@ Model: `unsloth/GLM-4.7-Flash-FP8-Dynamic` (FP8) / `GLM-4.7-Flash-int4-AutoRound
 
 | KV-Dtype | Bits | Packed B/Key | tok/s | Math% | KV B/Block | Notes |
 |----------|------|-------------|-------|-------|------------|-------|
-| fp8      | 8    | 128         |       |       |            | Baseline |
-| tq3      | 3    | 52          |       |       |            | TurboQuant |
-| tq4      | 4    | 68          |       |       |            | TurboQuant |
-| rq2      | 2    | 36          |       |       |            | RotorQuant |
-| rq3      | 3    | 52          |       |       |            | RotorQuant |
-| rq4      | 4    | 68          |       |       |            | RotorQuant |
+| fp8      | 8    | 576         | 45.6/51.0/51.7 | 0%* | — | Baseline, TRITON_MLA |
+| tq3      | 3    | ~220        | 30.9/50.2/49.9 | 0%* | — | MLA+MQ, 30064 MiB |
+| tq4      | 4    | ~292        |       |       |            | TurboQuant |
+| rq2      | 2    | ~148        |       |       |            | RotorQuant |
+| rq3      | 3    | ~220        |       |       |            | RotorQuant |
+| rq4      | 4    | ~292        |       |       |            | RotorQuant |
+
+*Math 0%: GLM-4.7 Prompt-Issue (antwortet "1"), nicht KV-bezogen
 
 ### +MTP NST=1
 
