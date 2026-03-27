@@ -253,6 +253,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             self._quantize_layer(layer)
         layer._already_called_process_weights_after_loading = True
 
+    @torch.compiler.disable
     def apply(
         self,
         layer: nn.Module,
