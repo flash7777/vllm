@@ -20,6 +20,14 @@ _REGISTRY: dict[
         "vllm.multiquant.turboquant.config", "TurboQuantConfig",
         "vllm.multiquant.turboquant.quantizer", "TurboQuantizer",
     ),
+    "rq3": (
+        "vllm.multiquant.rotorquant.config", "RotorQuantConfig",
+        "vllm.multiquant.rotorquant.quantizer", "RotorQuantizer",
+    ),
+    "rq4": (
+        "vllm.multiquant.rotorquant.config", "RotorQuantConfig",
+        "vllm.multiquant.rotorquant.quantizer", "RotorQuantizer",
+    ),
 }
 
 
