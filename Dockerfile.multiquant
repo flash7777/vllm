@@ -73,8 +73,8 @@ RUN pip install --no-build-isolation --no-cache-dir .
 # (multiquant, turboquant, csrc kernels, tests)
 RUN cp -r vllm/multiquant /usr/local/lib/python3.12/dist-packages/vllm/multiquant && \
     cp -r vllm/turboquant /usr/local/lib/python3.12/dist-packages/vllm/turboquant && \
-    cp -r csrc/quantization/turboquant /opt/tq_build && \
-    cp -r csrc/quantization/archer /opt/archer_build && \
+    cp -r kernels/turboquant /opt/tq_build && \
+    cp -r kernels/archer /opt/archer_build && \
     cp -r tests/multiquant /opt/tests/multiquant && \
     cp -r tests/turboquant /opt/tests/turboquant
 

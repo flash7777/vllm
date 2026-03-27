@@ -22,11 +22,16 @@ def _load_kernel():
 
     src_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "..",
-        "csrc", "quantization", "archer"
+        "kernels", "archer"
     )
-    # Also check container path
+    # Also check container path or old csrc path
     if not os.path.exists(src_dir):
         src_dir = "/opt/archer_build"
+    if not os.path.exists(src_dir):
+        src_dir = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..",
+            "csrc", "quantization", "archer"
+        )
 
     src_file = os.path.join(src_dir, "archer_decompress.cu")
     if not os.path.exists(src_file):

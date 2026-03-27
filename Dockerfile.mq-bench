@@ -6,7 +6,7 @@ ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
 COPY vllm/multiquant/ ${VLLM_DST}/multiquant/
 
 # Archer CUDA kernel sources
-COPY csrc/quantization/archer/ /opt/archer_build/
+COPY kernels/archer/ /opt/archer_build/
 
 # Updated vLLM files (Q5 mixed page-size + Q6 3D fix + M1-M2 multiquant)
 COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
