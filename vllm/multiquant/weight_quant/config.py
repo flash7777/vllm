@@ -22,7 +22,14 @@ class ArcherConfig(QuantizationConfig):
     Loads BF16/FP8 checkpoints and quantizes weights at load time using
     RotorQuant or TurboQuant compression. Decompresses on-the-fly during
     inference.
+
+    IMPORTANT: Only accepts BF16, FP16, or FP8 source weights.
+    Pre-quantized models (GPTQ, AWQ, INT4, INT8) are NOT supported —
+    double quantization would introduce unacceptable error.
     """
+
+    # Source dtypes that Archer can quantize from
+    SUPPORTED_SOURCE_DTYPES = {"bfloat16", "float16", "float32", "fp8"}
 
     def __init__(
         self,
@@ -64,6 +71,20 @@ class ArcherConfig(QuantizationConfig):
         method = config.get("method", "rq")
         act_dtype = config.get("act_dtype", "bf16")
         return cls(bits=bits, method=method, act_dtype=act_dtype)
+
+    @classmethod
+    def verify_source_dtype(cls, model_config) -> None:
+        """Reject pre-quantized models — Archer only accepts BF16/FP16/FP8."""
+        if model_config is None:
+            return
+        existing_quant = getattr(model_config, 'quantization', None)
+        if existing_quant and existing_quant not in ('multiquant', 'fp8'):
+            raise ValueError(
+                f"Archer (multiquant) cannot quantize a pre-quantized model "
+                f"(existing quantization: {existing_quant}). "
+                f"Only BF16, FP16, or FP8 source weights are supported. "
+                f"Double quantization would introduce unacceptable error."
+            )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
