@@ -130,46 +130,81 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         from vllm.multiquant.shared.qjl import generate_qjl_matrix
         S = generate_qjl_matrix(in_features, seed=seed + 1).to(device)
 
-        # Per-row quantization
+        # Per-row quantization — try CUDA kernel, fallback to PyTorch
         row_norms = W.norm(dim=-1)
         W_unit = W / (row_norms.unsqueeze(-1) + 1e-8)
 
-        if self.method == "rq":
-            from vllm.multiquant.rotorquant.clifford import (
-                embed_vectors_as_multivectors,
-                extract_vectors_from_multivectors,
-                reverse, rotor_sandwich,
-            )
-            mv = embed_vectors_as_multivectors(W_unit)
-            mv_rot = rotor_sandwich(rotation, mv)
-            for gi in [1, 2, 3, 7]:
-                comp = mv_rot[..., gi]
-                diffs = comp.unsqueeze(-1) - centroids
-                idx = diffs.abs().argmin(dim=-1)
-                mv_rot[..., gi] = centroids[idx]
-            rotor_rev = reverse(rotation)
-            mv_recon = rotor_sandwich(rotor_rev, mv_rot)
-            W_mse = extract_vectors_from_multivectors(mv_recon, in_features)
-            # Re-compute indices for packing
-            mv2 = embed_vectors_as_multivectors(W_unit)
-            mv2_rot = rotor_sandwich(rotation, mv2)
-            coords = [mv2_rot[..., gi] for gi in [1, 2, 3, 7]]
-            flat_coords = torch.cat(
-                [c.reshape(out_features, -1) for c in coords], dim=-1)
-            diffs = flat_coords.unsqueeze(-1) - centroids
-            mse_indices = diffs.abs().argmin(dim=-1)
-        else:
-            rotated = W_unit @ rotation.T
-            diffs = rotated.unsqueeze(-1) - centroids
-            mse_indices = diffs.abs().argmin(dim=-1)
-            quantized = centroids[mse_indices]
-            W_mse = quantized @ rotation
+        # Use existing TQ CUDA kernel for fast round-trip (rotation+quantize+QJL)
+        cuda_ok = False
+        if self.method == "tq":
+            try:
+                from vllm.multiquant.turboquant.quantizer import tq_round_trip_keys
+                # Reshape (out, in) → (out, 1, in) for the kernel
+                W_3d = W_unit.unsqueeze(1)
 
-        residual = W_unit - W_mse
-        res_norms = residual.norm(dim=-1)
-        projected = residual @ S.T
-        signs = torch.sign(projected)
-        signs[signs == 0] = 1.0
+                # Build a fake layer with the buffers the kernel expects
+                class _FakeLayer:
+                    pass
+                fake = _FakeLayer()
+                fake._tq_Pi = rotation
+                fake._tq_S = S
+                fake._tq_centroids = centroids
+
+                W_recon_3d = tq_round_trip_keys(W_3d, fake)
+                W_recon_unit = W_recon_3d.squeeze(1)  # (out, in)
+
+                # Extract indices from rotated space for packing
+                rotated = W_unit.float() @ rotation.float().T
+                diffs = rotated.unsqueeze(-1) - centroids.float()
+                mse_indices = diffs.abs().argmin(dim=-1)
+
+                # QJL signs from residual
+                residual = W_unit.float() - W_recon_unit.float()
+                res_norms = residual.norm(dim=-1)
+                projected = residual @ S.float().T
+                signs = torch.sign(projected)
+                signs[signs == 0] = 1.0
+                cuda_ok = True
+            except Exception as e:
+                logger.debug("CUDA kernel failed, using PyTorch: %s", e)
+
+        if not cuda_ok:
+            # PyTorch fallback
+            if self.method == "rq":
+                from vllm.multiquant.rotorquant.clifford import (
+                    embed_vectors_as_multivectors,
+                    extract_vectors_from_multivectors,
+                    reverse, rotor_sandwich,
+                )
+                mv = embed_vectors_as_multivectors(W_unit)
+                mv_rot = rotor_sandwich(rotation, mv)
+                for gi in [1, 2, 3, 7]:
+                    comp = mv_rot[..., gi]
+                    diffs = comp.unsqueeze(-1) - centroids
+                    idx = diffs.abs().argmin(dim=-1)
+                    mv_rot[..., gi] = centroids[idx]
+                rotor_rev = reverse(rotation)
+                mv_recon = rotor_sandwich(rotor_rev, mv_rot)
+                W_mse = extract_vectors_from_multivectors(mv_recon, in_features)
+                mv2 = embed_vectors_as_multivectors(W_unit)
+                mv2_rot = rotor_sandwich(rotation, mv2)
+                coords = [mv2_rot[..., gi] for gi in [1, 2, 3, 7]]
+                flat_coords = torch.cat(
+                    [c.reshape(out_features, -1) for c in coords], dim=-1)
+                diffs = flat_coords.unsqueeze(-1) - centroids
+                mse_indices = diffs.abs().argmin(dim=-1)
+            else:
+                rotated = W_unit @ rotation.T
+                diffs = rotated.unsqueeze(-1) - centroids
+                mse_indices = diffs.abs().argmin(dim=-1)
+                quantized = centroids[mse_indices]
+                W_mse = quantized @ rotation
+
+            residual = W_unit - W_mse
+            res_norms = residual.norm(dim=-1)
+            projected = residual @ S.T
+            signs = torch.sign(projected)
+            signs[signs == 0] = 1.0
 
         from vllm.multiquant.shared.bitpack import pack_vectors_batched
         packed_W = pack_vectors_batched(
