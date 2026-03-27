@@ -277,19 +277,20 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         S = layer._archer_S
         centroids = layer._archer_centroids
 
-        # Try CUDA kernel first (100× faster)
-        try:
-            from vllm.multiquant.weight_quant.archer_ops import cuda_decompress
-            result = cuda_decompress(
-                packed, rotation, S, centroids, in_features,
-                out_dtype=torch.bfloat16,
-            )
-            if result is not None:
-                return result
-        except Exception:
-            pass
+        # CUDA kernel for D≤256, hybrid (kernel unpack + torch.mm) for D>256
+        if in_features <= 256:
+            try:
+                from vllm.multiquant.weight_quant.archer_ops import cuda_decompress
+                result = cuda_decompress(
+                    packed, rotation, S, centroids, in_features,
+                    out_dtype=torch.bfloat16,
+                )
+                if result is not None:
+                    return result
+            except Exception:
+                pass
 
-        # Python fallback
+        # Hybrid: vectorized unpack (GPU) + torch.mm for rotation (cuBLAS)
         centroids = layer._archer_centroids
 
         mse_bytes = math.ceil(in_features * mse_bits / 8)
@@ -297,6 +298,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         mask = (1 << mse_bits) - 1
         cpb = 8 // mse_bits
 
+        # Unpack MSE indices — vectorized over bytes
         idx = torch.zeros(out_features, in_features,
                           dtype=torch.long, device=device)
         for b in range(mse_bytes):
@@ -307,6 +309,7 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                     break
                 idx[:, j] = (bv >> (k * mse_bits)) & mask
 
+        # Unpack signs — vectorized over bytes
         signs = torch.zeros(out_features, in_features,
                             dtype=torch.float32, device=device)
         for b in range(qjl_bytes):
@@ -321,13 +324,15 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                     -torch.ones(out_features, device=device),
                 )
 
+        # Unpack norms
         no = mse_bytes + qjl_bytes
         row_norms = packed[:, no:no + 2].contiguous().view(
             torch.float16).float().squeeze(-1)
         res_norms = packed[:, no + 2:no + 4].contiguous().view(
             torch.float16).float().squeeze(-1)
 
-        c_vals = centroids[idx]
+        # Centroid lookup (GPU gather) + inverse rotation (cuBLAS GEMM)
+        c_vals = centroids[idx]  # (out, in) — fast GPU gather
         if layer._archer_method == "rq":
             from vllm.multiquant.rotorquant.clifford import (
                 embed_vectors_as_multivectors,
@@ -339,8 +344,9 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             mv_recon = rotor_sandwich(rotor_rev, mv_q)
             W_mse = extract_vectors_from_multivectors(mv_recon, in_features)
         else:
-            W_mse = c_vals @ rotation
+            W_mse = c_vals @ rotation  # cuBLAS GEMM — fast!
 
+        # QJL correction (cuBLAS GEMM)
         correction = math.sqrt(math.pi / 2) / in_features
         W_qjl = correction * res_norms.unsqueeze(-1) * (signs @ S)
         return row_norms.unsqueeze(-1) * (W_mse + W_qjl)
