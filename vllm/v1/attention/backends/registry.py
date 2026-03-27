@@ -88,6 +88,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     MULTIQUANT = (
         "vllm.v1.attention.backends.multiquant_attn.MultiQuantAttentionBackend"
     )
+    MULTIQUANT_MLA = (
+        "vllm.v1.attention.backends.mla.multiquant_mla.MultiQuantMLABackend"
+    )
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

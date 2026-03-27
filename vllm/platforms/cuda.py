@@ -59,6 +59,8 @@ def _get_backend_priorities(
     if kv_cache_dtype is not None and (
         kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")
     ):
+        if use_mla:
+            return [AttentionBackendEnum.MULTIQUANT_MLA]
         return [AttentionBackendEnum.MULTIQUANT]
 
     if use_mla:

@@ -329,20 +329,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             calculate_kv_scales = False
         self.quant_config = quant_config
 
-        # MultiQuant MLA: compress latent vectors, remap dtype for MLA backend
+        # MultiQuant MLA: init buffers, let MULTIQUANT_MLA backend handle cache
         from vllm.multiquant.registry import is_multiquant_dtype
         self._mq_enabled = is_multiquant_dtype(kv_cache_dtype)
         self._mq_cache_dtype = kv_cache_dtype if self._mq_enabled else None
         if self._mq_enabled:
             self._init_multiquant_buffers(
                 kv_cache_dtype, self.head_size, prefix)
-            # Remap to fp8 so MLA backend sees a supported dtype
-            kv_cache_dtype = "fp8"
-            if cache_config is not None:
-                cache_config.cache_dtype = "fp8"
+            # kv_cache_dtype stays as-is (tq3/rq3) — MULTIQUANT_MLA
+            # backend handles compressed cache natively
             logger.info_once(
-                "MultiQuant MLA: %s compression enabled, "
-                "handing off as fp8 to MLA backend",
+                "MultiQuant MLA: %s compression via MULTIQUANT_MLA backend",
                 self._mq_cache_dtype,
             )
 
@@ -889,12 +886,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # MultiQuant MLA: compressed cache with packed_size as head_size.
-        # The MLA impl still sees the full latent dimension — we compress
-        # in the KV-cache write hook and decompress in the read hook.
-        # TODO(m8): When we have a dedicated MQ-MLA backend, this can
-        # allocate with packed_size directly. For now, we keep FP8
-        # allocation so existing MLA backends work unchanged.
+        # MultiQuant MLA: allocate with packed_size (real compression)
+        if getattr(self, '_mq_enabled', False) and hasattr(self, '_tq_config'):
+            ps = self._tq_config.cache_head_size
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=ps,
+                dtype=torch.uint8,
+                cache_dtype_str=self._mq_cache_dtype,
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
