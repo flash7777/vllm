@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "mxfp8",
     "petit_nvfp4",
     "cpu_awq",
+    "multiquant",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -158,6 +159,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_awq": CPUAWQConfig,
     }
+
+    # Archer (MultiQuant online weight quantization) — lazy import
+    try:
+        from vllm.multiquant.weight_quant.config import ArcherConfig
+        method_to_config["multiquant"] = ArcherConfig
+    except ImportError:
+        pass
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
