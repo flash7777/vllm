@@ -121,6 +121,8 @@ def cuda_unpack(
             indices, signs, row_norms, res_norms,
             head_size, mse_bits,
         )
+        # Sync required: JIT kernel may run on different stream than cuBLAS
+        torch.cuda.synchronize()
         return indices, signs, row_norms, res_norms
     except Exception as e:
         logger.debug("Archer CUDA unpack failed: %s", e)
