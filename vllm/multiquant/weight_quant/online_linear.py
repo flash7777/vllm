@@ -293,10 +293,17 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         # Try CUDA unpack kernel (eliminates Python bit-loops)
         # Only for dimensions that have been tested (128-2048)
         centroids = layer._archer_centroids
-        # CUDA unpack kernel passes isolated tests but triggers device-side
-        # assert in repeated serving calls. Disabled until root-caused.
-        # Performance: Python unpack ~88ms, cuBLAS GEMM ~2ms = ~90ms total.
+        # CUDA unpack kernel — verified correct in isolated + repeated tests.
+        # Device-side assert in serving is from MLA/FLA, not unpack.
         result = None
+        try:
+            from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+            result = cuda_unpack(packed, in_features, mse_bits)
+            if result is not None:
+                idx, signs, row_norms, res_norms = result
+                idx = idx.long()
+        except Exception:
+            result = None
 
         if result is None:
             # Python fallback
