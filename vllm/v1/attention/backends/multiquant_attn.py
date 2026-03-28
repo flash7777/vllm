@@ -276,15 +276,16 @@ class MultiQuantImpl:
 
         # --- Prefill: naive causal on raw K/V ---
         if num_prefill > 0:
-            pq = query[num_decode:].reshape(-1, self.num_heads, D)
-            pk = key[num_decode:].reshape(-1, self.num_kv_heads, D)
-            pv = value[num_decode:].reshape(-1, self.num_kv_heads, D)
+            # Slice to actual prefill tokens (tensors may be padded for
+            # CUDA graph capture sizes, but metadata has the real count)
+            L = num_prefill
+            pq = query[num_decode:num_decode + L].reshape(L, self.num_heads, D)
+            pk = key[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
+            pv = value[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
 
             if self.num_kv_groups > 1:
                 pk = pk.repeat_interleave(self.num_kv_groups, dim=1)
                 pv = pv.repeat_interleave(self.num_kv_groups, dim=1)
-
-            L = pq.shape[0]
             scores = torch.bmm(
                 pq.transpose(0, 1).float(),
                 pk.transpose(0, 1).float().transpose(-2, -1)

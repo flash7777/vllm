@@ -449,6 +449,47 @@ def _mq_fused_decode_kernel_v2(
 # Python wrapper
 # ============================================================
 
+_cuda_kernel = None
+_cuda_kernel_tried = False
+
+
+def _load_cuda_kernel():
+    """JIT compile the CUDA fused decode kernel."""
+    global _cuda_kernel, _cuda_kernel_tried
+    if _cuda_kernel_tried:
+        return _cuda_kernel
+    _cuda_kernel_tried = True
+
+    import os
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "turboquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/tq_build"
+    src_file = os.path.join(src_dir, "tq_compressed_attention.cu")
+    if not os.path.exists(src_file):
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _cuda_kernel = load(
+            name="tq_fused_decode",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        return _cuda_kernel
+    except Exception:
+        return None
+
+
 def mq_fused_decode_attention(
     q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
     kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
@@ -463,65 +504,87 @@ def mq_fused_decode_attention(
     mse_bits: int,
     correction: float,         # sqrt(pi/2) / D
 ) -> torch.Tensor:
-    """Fused TQ decode: 2 pre-GEMMs + 1 Triton + 2 post-GEMMs = 5 launches."""
+    """Fused TQ decode: 2 pre-GEMMs + 1 CUDA/Triton + 2 post-GEMMs = 5 launches."""
     B, Hq, D = q.shape
     device = q.device
-
-    packed_size = kv_cache.shape[-1]
-    mse_bytes = (D * mse_bits + 7) // 8
-    qjl_bytes = (D + 7) // 8
     n_centroids = centroids.shape[0]
-    kv_group_size = Hq // num_kv_heads
 
     # 1. Pre-rotate + pre-project query (2 batched GEMMs via cuBLAS)
     q_flat = q.reshape(B * Hq, D).float()
-    q_rot = q_flat @ Pi.T.contiguous()    # [B*Hq, D]
-    q_proj = q_flat @ S.T.contiguous()    # [B*Hq, D]
+    q_rot = (q_flat @ Pi.T).contiguous()    # [B*Hq, D]
+    q_proj = (q_flat @ S.T).contiguous()    # [B*Hq, D]
+
+    # Reshape for kernel: [B, Hq, D]
+    q_rot_3d = q_rot.reshape(B, Hq, D)
+    q_proj_3d = q_proj.reshape(B, Hq, D)
 
     # 2. Allocate output accumulators
-    centroid_acc = torch.empty(B * Hq, D, device=device, dtype=torch.float32)
-    sign_acc = torch.empty(B * Hq, D, device=device, dtype=torch.float32)
+    centroid_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
+    sign_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
 
-    # KV cache strides (in elements = bytes for uint8)
-    # Shape: (num_blocks, 2, block_size, num_kv_heads, packed_size)
+    # KV cache strides
     s_block = kv_cache.stride(0)
     s_kv = kv_cache.stride(1)
     s_slot = kv_cache.stride(2)
     s_head = kv_cache.stride(3)
 
-    # Block table stride
-    s_bt = block_table.stride(0)
+    # 3. Try CUDA kernel first (CUDA Graph compatible), fallback to Triton
+    cuda_ok = False
+    kernel = _load_cuda_kernel()
+    if kernel is not None:
+        try:
+            kernel.tq_fused_decode_attention(
+                q_rot_3d.contiguous(),
+                q_proj_3d.contiguous(),
+                kv_cache.contiguous(),
+                centroids.contiguous(),
+                block_table.int().contiguous(),
+                seq_lens.int().contiguous(),
+                centroid_acc,
+                sign_acc,
+                D, mse_bits, n_centroids, scale,
+                s_block, s_kv, s_slot, s_head,
+            )
+            cuda_ok = True
+        except Exception:
+            pass
 
-    # 3. Launch Triton kernel
-    grid = (B, Hq)
-    _mq_fused_decode_kernel_v2[grid](
-        q_rot, q_proj,
-        kv_cache,
-        centroids,
-        block_table, seq_lens,
-        centroid_acc, sign_acc,
-        # Cache strides
-        s_block, s_kv, s_slot, s_head,
-        # Block table stride
-        s_bt,
-        # Constexprs
-        num_q_heads=Hq,
-        HEAD_DIM=D,
-        BLOCK_SIZE=block_size,
-        KV_GROUP_SIZE=kv_group_size,
-        PACKED_SIZE=packed_size,
-        MSE_BITS=mse_bits,
-        MSE_BYTES=mse_bytes,
-        QJL_BYTES=qjl_bytes,
-        N_CENTROIDS=n_centroids,
-        # Scalars
-        correction_scale=correction,
-        attn_scale=scale,
-        num_warps=4,
-        num_stages=1,
-    )
+    if not cuda_ok:
+        # Triton fallback (slower, not CUDA Graph safe)
+        packed_size = kv_cache.shape[-1]
+        mse_bytes = (D * mse_bits + 7) // 8
+        qjl_bytes = (D + 7) // 8
+        kv_group_size = Hq // num_kv_heads
+        s_bt = block_table.stride(0)
+
+        grid = (B, Hq)
+        _mq_fused_decode_kernel_v2[grid](
+            q_rot, q_proj,
+            kv_cache,
+            centroids,
+            block_table, seq_lens,
+            centroid_acc.reshape(B * Hq, D),
+            sign_acc.reshape(B * Hq, D),
+            s_block, s_kv, s_slot, s_head,
+            s_bt,
+            num_q_heads=Hq,
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            KV_GROUP_SIZE=kv_group_size,
+            PACKED_SIZE=packed_size,
+            MSE_BITS=mse_bits,
+            MSE_BYTES=mse_bytes,
+            QJL_BYTES=qjl_bytes,
+            N_CENTROIDS=n_centroids,
+            correction_scale=correction,
+            attn_scale=scale,
+            num_warps=4,
+            num_stages=1,
+        )
 
     # 4. Post-loop V reconstruction (2 batched GEMMs via cuBLAS)
-    output = centroid_acc @ Pi + correction * (sign_acc @ S)
+    c_flat = centroid_acc.reshape(B * Hq, D)
+    s_flat = sign_acc.reshape(B * Hq, D)
+    output = c_flat @ Pi + correction * (s_flat @ S)
 
     return output.reshape(B, Hq, D)
