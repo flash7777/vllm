@@ -300,20 +300,26 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
         S = layer._tq_S.to(device).float()
         centroids = layer._tq_centroids.to(device).float()
 
-        # Decompress all relevant cache pages to BF16
+        # Decompress ONLY pages used by current batch (not all 1M+ cache)
         # kv_c_and_k_pe_cache shape: [num_pages, page_size, packed_size]
         num_pages, page_size, cache_dim = kv_c_and_k_pe_cache.shape
+        block_table = attn_metadata.decode.block_table  # [B, max_blocks]
+        seq_lens = attn_metadata.decode.seq_lens  # [B]
 
-        # Create decompressed BF16 cache (same page/block structure)
+        # Gather only the pages we need
+        used_pages = block_table.flatten().unique()
+        used_pages = used_pages[used_pages >= 0]  # filter padding
+
+        # Decompress used pages only
+        packed = kv_c_and_k_pe_cache[used_pages, :, :self._packed_size]
+        flat_packed = packed.reshape(-1, self._packed_size)
+        N = flat_packed.shape[0]
+
+        # Build decompressed cache with full shape (sparse — only used pages filled)
         decompressed = torch.zeros(
             num_pages, page_size, head_size,
             dtype=q.dtype, device=device,
         )
-
-        # Decompress all pages at once (vectorized)
-        packed = kv_c_and_k_pe_cache[:, :, :self._packed_size]
-        flat_packed = packed.reshape(-1, self._packed_size)
-        N = flat_packed.shape[0]
 
         if N > 0:
             # CUDA unpack kernel — same as Archer, shared code
@@ -382,9 +388,11 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
             x_qjl = correction * rn.unsqueeze(-1) * (signs_all @ S)
             x_recon = vn.unsqueeze(-1) * (x_mse + x_qjl)
 
-            decompressed = x_recon.reshape(
-                num_pages, page_size, head_size
+            # Write decompressed data back to the correct pages
+            x_recon_pages = x_recon.reshape(
+                len(used_pages), page_size, head_size
             ).to(q.dtype)
+            decompressed[used_pages] = x_recon_pages
 
         # Now delegate to Triton MLA decode with decompressed BF16 cache
         from vllm.model_executor.layers.batch_invariant import (
