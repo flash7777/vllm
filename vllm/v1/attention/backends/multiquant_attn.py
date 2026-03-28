@@ -320,12 +320,10 @@ class MultiQuantImpl:
                     k_packed = kv_cache[bi_phys, 0, bo, kv_h]  # (sl, packed_size)
                     v_packed = kv_cache[bi_phys, 1, bo, kv_h]  # (sl, packed_size)
 
-                    # CUDA unpack K
-                    try:
-                        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
-                        k_result = cuda_unpack(k_packed, D, self._mse_bits)
-                    except Exception:
-                        k_result = None
+                    # CUDA unpack disabled in decode — device-side assert on
+                    # fancy-indexed cache tensors. Python unpack is fast enough
+                    # (the Q4 TQ3 benchmark did 45 tok/s with Python unpack).
+                    k_result = None
 
                     if k_result is not None:
                         idx_all, signs_all, k_vn, k_rn = k_result
