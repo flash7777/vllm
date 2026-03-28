@@ -218,16 +218,23 @@ class MultiQuantImpl:
         Pi, S, centroids = self._get_matrices(layer, device)
 
         num_tokens, num_heads = key.shape[0], key.shape[1]
-        for i in range(num_tokens):
-            slot = slot_mapping[i].item()
-            if slot < 0:
-                continue
-            bi, bo = slot // block_size, slot % block_size
-            for h in range(num_heads):
-                kv_cache[bi, 0, bo, h, :self._packed_size] = self._pack(
-                    key[i, h], Pi, S, centroids, D)
-                kv_cache[bi, 1, bo, h, :self._packed_size] = self._pack(
-                    value[i, h], Pi, S, centroids, D)
+
+        # Vectorized pack: all tokens × all heads in one batch
+        # key/value: (num_tokens, num_heads, D) → flat (N, D)
+        k_flat = key.reshape(-1, D)  # (num_tokens * num_heads, D)
+        v_flat = value.reshape(-1, D)
+        k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)  # (N, packed)
+        v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
+        k_packed = k_packed.reshape(num_tokens, num_heads, -1)
+        v_packed = v_packed.reshape(num_tokens, num_heads, -1)
+
+        # Write to cache via slot_mapping
+        valid = slot_mapping >= 0
+        slots = slot_mapping[valid]
+        bi = slots // block_size
+        bo = slots % block_size
+        kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed[valid]
+        kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed[valid]
 
     @torch.compiler.disable
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
@@ -406,30 +413,26 @@ class MultiQuantImpl:
             layer._tq_c_f32 = layer._tq_centroids.to(device).float().contiguous()
         return layer._tq_Pi_f32, layer._tq_S_f32, layer._tq_c_f32
 
-    def _pack(self, vec, Pi, S, centroids, D):
-        x = vec.float(); vn = x.norm(); xh = x / (vn + 1e-8)
-        rot = self._rotate_forward(xh.unsqueeze(0), Pi).squeeze(0)
-        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1).to(torch.uint8)
-        xm = self._rotate_inverse(centroids[idx.long()].unsqueeze(0), Pi).squeeze(0)
-        r = xh - xm; rn = r.norm()
-        signs = (r @ S.T >= 0).to(torch.uint8)
+    def _pack_single(self, vec, Pi, S, centroids, D):
+        """Pack a single vector — slow, per-vector. Use _pack_batch instead."""
+        return self._pack_batch(vec.unsqueeze(0), Pi, S, centroids, D).squeeze(0)
 
-        packed = torch.zeros(self._packed_size, dtype=torch.uint8, device=vec.device)
-        if self._mse_bits == 2:
-            for j in range(0, D, 4):
-                v = 0
-                for k in range(min(4, D - j)):
-                    v |= (idx[j+k].item() & 0x3) << (k*2)
-                packed[j//4] = v
-        for j in range(0, D, 8):
-            v = 0
-            for k in range(min(8, D - j)):
-                v |= (signs[j+k].item() & 1) << k
-            packed[self._mse_bytes + j//8] = v
-        no = self._mse_bytes + self._qjl_bytes
-        packed[no:no+2] = vn.half().reshape(1).view(torch.uint8)
-        packed[no+2:no+4] = rn.half().reshape(1).view(torch.uint8)
-        return packed
+    def _pack_batch(self, vecs, Pi, S, centroids, D):
+        """Pack a batch of vectors — vectorized, no .item() calls."""
+        x = vecs.float()
+        vn = x.norm(dim=-1)
+        xh = x / (vn.unsqueeze(-1) + 1e-8)
+
+        rot = self._rotate_forward(xh, Pi)
+        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1)
+        xm = self._rotate_inverse(centroids[idx], Pi)
+        r = xh - xm
+        rn = r.norm(dim=-1)
+        signs = (r @ S.T >= 0).float()
+        signs[signs == 0] = -1.0
+
+        from vllm.multiquant.shared.bitpack import pack_vectors_batched
+        return pack_vectors_batched(idx, signs, vn, rn, D, self._mse_bits)
 
     def _score_packed(self, q_rot, q_proj, packed, centroids):
         D = self.head_size
