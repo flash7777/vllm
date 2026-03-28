@@ -1,0 +1,99 @@
+#!/bin/bash
+# ============================================================
+# MultiQuant Serve — Modell + KV-Cache Quantisierung
+#
+# Decode: Fused Triton Kernel (5 Launches statt ~100)
+# Kein FlashInfer Autotuner, kein enforce-eager.
+#
+# Nutzung:
+#   ./start.multiquant                              # INT4 + TQ3 (default)
+#   ./start.multiquant tq4                          # INT4 + TQ4
+#   ./start.multiquant tq3 /data/tensordata/GLM-4.7-Flash-FP8   # FP8 + TQ3
+#   ./start.multiquant rq3 /data/tensordata/GLM-4.7-Flash-FP8   # FP8 + RQ3
+# ============================================================
+
+set -euo pipefail
+
+# ── Konfiguration ──────────────────────────────────────────
+KV_DTYPE="${1:-tq3}"
+MODEL_PATH="${2:-/data/tensordata/GLM-4.7-Flash-int4-AutoRound}"
+IMAGE="localhost/vllm-multiquant"
+CONTAINER_NAME="mq-serve"
+PORT=8011
+MODEL_NAME=$(basename "$MODEL_PATH")
+
+printf "╔══════════════════════════════════════════════════════╗\n"
+printf "║  MultiQuant Serve                                    ║\n"
+printf "╠══════════════════════════════════════════════════════╣\n"
+printf "║  Modell:   %-40s ║\n" "$MODEL_NAME"
+printf "║  KV-Cache: %-40s ║\n" "$KV_DTYPE"
+printf "║  Port:     %-40s ║\n" "$PORT"
+printf "╚══════════════════════════════════════════════════════╝\n"
+echo ""
+
+# ── Prüfungen ─────────────────────────────��────────────────
+if ! podman image exists "$IMAGE"; then
+    echo "FEHLER: Image '$IMAGE' nicht gefunden."
+    echo "Bauen mit: podman build -f Dockerfile.multiquant -t vllm-multiquant ."
+    exit 1
+fi
+
+if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "FEHLER: Modell nicht gefunden: $MODEL_PATH"
+    exit 1
+fi
+
+# Vorherigen Container stoppen
+podman stop "$CONTAINER_NAME" 2>/dev/null || true
+podman rm "$CONTAINER_NAME" 2>/dev/null || true
+
+# ── Container starten ──────────────────────────────────────
+podman run -d \
+  --replace \
+  --name "$CONTAINER_NAME" \
+  --device nvidia.com/gpu=all \
+  --security-opt=label=disable \
+  --hooks-dir=/usr/share/containers/oci/hooks.d \
+  --log-driver=k8s-file \
+  --log-opt path=/data/tensordata/logs/mq-serve.log \
+  --ipc=host \
+  --network host \
+  -v /data/tensordata:/data/tensordata \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -e VLLM_MLA_DISABLE=1 \
+  -e VLLM_WORKER_MULTIPROC_METHOD=fork \
+  -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+  -e FLASHINFER_DISABLE_AUTOTUNER=1 \
+  -e VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
+  -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  "$IMAGE" \
+  vllm serve "$MODEL_PATH" \
+    --host 0.0.0.0 \
+    --port "$PORT" \
+    --served-model-name "$MODEL_NAME" \
+    --gpu-memory-utilization 0.90 \
+    --max-model-len 100000 \
+    --kv-cache-dtype "$KV_DTYPE" \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --enable-auto-tool-choice \
+    --disable-log-requests \
+    --trust-remote-code
+
+echo ""
+echo "Container '$CONTAINER_NAME' gestartet."
+echo ""
+echo "  Logs:     podman logs -f $CONTAINER_NAME"
+echo "  API:      http://localhost:$PORT/v1/chat/completions"
+echo "  Stoppen:  podman stop $CONTAINER_NAME"
+echo ""
+echo "  Schnelltest:"
+echo "    curl -s http://localhost:$PORT/v1/chat/completions \\"
+echo "      -H 'Content-Type: application/json' \\"
+echo "      -d '{\"model\":\"glm-4.7-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hallo\"}]}' | python3 -m json.tool"
+echo ""
+echo "  Beispiele:"
+echo "    ./start.multiquant                                        # INT4 + TQ3"
+echo "    ./start.multiquant tq4                                    # INT4 + TQ4"
+echo "    ./start.multiquant tq3 /data/tensordata/GLM-4.7-Flash-FP8 # FP8 + TQ3"
+echo "    ./start.multiquant rq3 /data/tensordata/GLM-4.7-Flash-FP8 # FP8 + RQ3"
