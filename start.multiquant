@@ -25,6 +25,7 @@ SERVED_NAME="glm-4.7-flash"
 REASONING_PARSER="glm45"
 TOOL_PARSER="glm47"
 MAX_MODEL_LEN=100000
+GPU_MEM_UTIL=0.05
 KV_CACHE_MEM=""
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --reasoning-parser)    REASONING_PARSER="$2"; shift 2 ;;
         --tool-call-parser)    TOOL_PARSER="$2"; shift 2 ;;
         --max-model-len)       MAX_MODEL_LEN="$2"; shift 2 ;;
+        --gpu-memory-utilization) GPU_MEM_UTIL="$2"; shift 2 ;;
         --kv-cache-memory-bytes) KV_CACHE_MEM="$2"; shift 2 ;;
         --port)     PORT="$2"; shift 2 ;;
         --image)    IMAGE="$2"; shift 2 ;;
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
             echo "  --max-model-len N          Max Kontext-Länge (default: 100000)"
+            echo "  --gpu-memory-utilization F GPU Memory Fraction (default: 0.05, GB10 Unified)"
             echo "  --kv-cache-memory-bytes N  KV-Cache Speicher, z.B. 10G (default: auto)"
             echo "  --served-model-name NAME   API Model-Name (default: glm-4.7-flash)"
             echo "  --reasoning-parser PARSER  Reasoning Parser (default: glm45)"
@@ -188,13 +191,12 @@ podman run -d \
     --port "$PORT" \
     --served-model-name "$SERVED_NAME" \
     --tensor-parallel-size "$TP" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --kv-cache-dtype "$KV_DTYPE" \
     --tool-call-parser "$TOOL_PARSER" \
     --reasoning-parser "$REASONING_PARSER" \
     --enable-auto-tool-choice \
-    --disable-log-requests \
     --trust-remote-code \
     "${QUANT_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"
