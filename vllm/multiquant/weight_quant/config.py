@@ -31,13 +31,20 @@ class ArcherConfig(QuantizationConfig):
     # Source dtypes that Archer can quantize from
     SUPPORTED_SOURCE_DTYPES = {"bfloat16", "float16", "float32", "fp8"}
 
+    VALID_METHODS = {"tq", "rq"}
+
     def __init__(
         self,
         bits: int = 3,
-        method: str = "tq",  # "tq" (TurboQuant) or "rq" (RotorQuant)
-        act_dtype: str = "bf16",  # "bf16" or "fp8"
+        method: str = "tq",
+        act_dtype: str = "bf16",
         seed: int = 42,
     ):
+        if method not in self.VALID_METHODS:
+            raise ValueError(
+                f"Archer method must be one of {self.VALID_METHODS}, "
+                f"got '{method}'"
+            )
         self.bits = bits
         self.method = method
         self.act_dtype = act_dtype
