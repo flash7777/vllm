@@ -320,10 +320,12 @@ class MultiQuantImpl:
                     k_packed = kv_cache[bi_phys, 0, bo, kv_h]  # (sl, packed_size)
                     v_packed = kv_cache[bi_phys, 1, bo, kv_h]  # (sl, packed_size)
 
-                    # CUDA unpack disabled in decode — device-side assert on
-                    # fancy-indexed cache tensors. Python unpack is fast enough
-                    # (the Q4 TQ3 benchmark did 45 tok/s with Python unpack).
-                    k_result = None
+                    # CUDA unpack — must .contiguous() on fancy-indexed data
+                    try:
+                        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+                        k_result = cuda_unpack(k_packed.contiguous(), D, self._mse_bits)
+                    except Exception:
+                        k_result = None
 
                     if k_result is not None:
                         idx_all, signs_all, k_vn, k_rn = k_result
@@ -370,10 +372,10 @@ class MultiQuantImpl:
                         # Score
                         scores = k_vn * (term1 + self._correction * k_rn * term2) * self.scale
 
-                        # Decompress V: CUDA unpack
+                        # Decompress V: CUDA unpack (same .contiguous() fix)
                         if k_result is not None:
                             try:
-                                v_result = cuda_unpack(v_packed, D, self._mse_bits)
+                                v_result = cuda_unpack(v_packed.contiguous(), D, self._mse_bits)
                             except Exception:
                                 v_result = None
                         else:
