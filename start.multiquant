@@ -3,12 +3,11 @@
 # MultiQuant Serve — GLM-4.7-Flash mit konfigurierbarem Profil
 #
 # Nutzung:
-#   ./start.multiquant                                       # INT4 AutoRound + TQ3 KV
-#   ./start.multiquant --kv tq4                              # INT4 + TQ4 KV
-#   ./start.multiquant --model GLM-4.7-Flash-FP8             # FP8 Modell + TQ3 KV
-#   ./start.multiquant --model GLM-4.7-Flash --weights tq3   # BF16 → Archer TQ3 Gewichte
-#   ./start.multiquant --mtp                                 # + Multi-Token Prediction
-#   ./start.multiquant --riy /data/tensordata/riy_profile_397b.json
+#   ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound
+#   ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4
+#   ./start.multiquant --model GLM-4.7-Flash --weights tq3   # BF16 → Archer TQ3
+#   ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp
+#   ./start.multiquant --model GLM-4.7-Flash-FP8 --riy /data/tensordata/riy_profile_397b.json
 # ============================================================
 
 set -euo pipefail
@@ -17,7 +16,7 @@ set -euo pipefail
 KV_DTYPE="tq3"
 WEIGHTS=""               # tq3 | tq4 | rq3 | rq4 (Archer online-quant, leer=keine)
 MODEL_DIR="/data/tensordata"
-MODEL="GLM-4.7-Flash-int4-AutoRound"
+MODEL=""
 MTP=false
 RIY_PROFILE=""
 PORT=8011
@@ -43,7 +42,7 @@ while [[ $# -gt 0 ]]; do
             echo "Optionen:"
             echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 auto (default: tq3)"
             echo "  --weights TYPE   Archer online-quant: tq3 tq4 rq3 rq4 (leer=keine)"
-            echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/"
+            echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
             echo "  --port PORT      API Port (default: 8011)"
@@ -58,6 +57,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Modell-Pfad auflösen ─────────────────────────────────
+if [[ -z "$MODEL" ]]; then
+    echo "FEHLER: --model ist pflicht."
+    echo "Verfügbare Modelle:"
+    ls -d "$MODEL_DIR"/GLM-4.7-Flash* "$MODEL_DIR"/Qwen* 2>/dev/null | sed 's|.*/|  |'
+    echo ""
+    echo "Beispiel: $0 --model GLM-4.7-Flash-int4-AutoRound"
+    exit 1
+fi
+
 # Absoluter Pfad oder relativ zu MODEL_DIR
 if [[ "$MODEL" != /* ]]; then
     MODEL_PATH="$MODEL_DIR/$MODEL"
@@ -174,8 +182,8 @@ echo "  API:      http://localhost:$PORT/v1/chat/completions"
 echo "  Stoppen:  podman stop $CONTAINER_NAME"
 echo ""
 echo "  Beispiele:"
-echo "    ./start.multiquant                                       # INT4 + TQ3 KV"
-echo "    ./start.multiquant --model GLM-4.7-Flash-FP8            # FP8 + TQ3 KV"
-echo "    ./start.multiquant --model GLM-4.7-Flash --weights tq3  # BF16 → Archer TQ3"
-echo "    ./start.multiquant --kv rq3 --mtp                       # RQ3 KV + MTP"
-echo "    ./start.multiquant --riy /data/tensordata/riy_profile_397b.json"
+echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound"
+echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4"
+echo "    ./start.multiquant --model GLM-4.7-Flash --weights tq3"
+echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp"
+echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --riy /data/tensordata/riy_profile_397b.json"
