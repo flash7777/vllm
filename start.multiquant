@@ -19,6 +19,7 @@ MODEL_DIR="/data/tensordata"
 MODEL=""
 MTP=false
 RIY_PROFILE=""
+TP=1
 PORT=8011
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --kv)       KV_DTYPE="$2"; shift 2 ;;
         --weights)  WEIGHTS="$2"; shift 2 ;;
         --model)    MODEL="$2"; shift 2 ;;
+        --tp)       TP="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
         --riy)      RIY_PROFILE="$2"; shift 2 ;;
         --port)     PORT="$2"; shift 2 ;;
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Optionen:"
             echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 auto (default: tq3)"
+            echo "  --tp N           Tensor Parallelism (default: 1)"
             echo "  --weights TYPE   Archer online-quant: tq3 tq4 rq3 rq4 (leer=keine)"
             echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
@@ -114,6 +117,7 @@ printf "╠═══════════════════════
 printf "║  Modell:   %-40s ║\n" "$MODEL_NAME"
 printf "║  Gewichte: %-40s ║\n" "$QUANT_LABEL"
 printf "║  KV-Cache: %-40s ║\n" "$KV_DTYPE"
+printf "║  TP:       %-40s ║\n" "$TP"
 printf "║  MTP:      %-40s ║\n" "$MTP_LABEL"
 printf "║  RIY:      %-40s ║\n" "$RIY_LABEL"
 printf "║  Port:     %-40s ║\n" "$PORT"
@@ -163,6 +167,7 @@ podman run -d \
     --host 0.0.0.0 \
     --port "$PORT" \
     --served-model-name glm-4.7-flash \
+    --tensor-parallel-size "$TP" \
     --gpu-memory-utilization 0.90 \
     --max-model-len 100000 \
     --kv-cache-dtype "$KV_DTYPE" \
