@@ -21,6 +21,9 @@ MTP=false
 RIY_PROFILE=""
 TP=1
 PORT=8011
+SERVED_NAME="glm-4.7-flash"
+REASONING_PARSER="glm45"
+TOOL_PARSER="glm47"
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
 EXTRA_ARGS=()
@@ -34,6 +37,9 @@ while [[ $# -gt 0 ]]; do
         --tp)       TP="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
         --riy)      RIY_PROFILE="$2"; shift 2 ;;
+        --served-model-name)  SERVED_NAME="$2"; shift 2 ;;
+        --reasoning-parser)  REASONING_PARSER="$2"; shift 2 ;;
+        --tool-call-parser)  TOOL_PARSER="$2"; shift 2 ;;
         --port)     PORT="$2"; shift 2 ;;
         --image)    IMAGE="$2"; shift 2 ;;
         --name)     CONTAINER_NAME="$2"; shift 2 ;;
@@ -48,10 +54,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
-            echo "  --port PORT      API Port (default: 8011)"
-            echo "  --eager          enforce-eager (kein CUDA Graphs)"
-            echo "  --image IMAGE    Container Image (default: localhost/vllm-multiquant)"
-            echo "  --name NAME      Container Name (default: mq-serve)"
+            echo "  --served-model-name NAME   API Model-Name (default: glm-4.7-flash)"
+            echo "  --reasoning-parser PARSER  Reasoning Parser (default: glm45)"
+            echo "  --tool-call-parser PARSER  Tool-Call Parser (default: glm47)"
+            echo "  --port PORT                API Port (default: 8011)"
+            echo "  --eager                    enforce-eager (kein CUDA Graphs)"
+            echo "  --image IMAGE              Container Image (default: localhost/vllm-multiquant)"
+            echo "  --name NAME                Container Name (default: mq-serve)"
             exit 0 ;;
         *)
             echo "Unbekannte Option: $1 (--help für Hilfe)"
@@ -166,13 +175,13 @@ podman run -d \
   vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --served-model-name glm-4.7-flash \
+    --served-model-name "$SERVED_NAME" \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization 0.90 \
     --max-model-len 100000 \
     --kv-cache-dtype "$KV_DTYPE" \
-    --tool-call-parser glm47 \
-    --reasoning-parser glm45 \
+    --tool-call-parser "$TOOL_PARSER" \
+    --reasoning-parser "$REASONING_PARSER" \
     --enable-auto-tool-choice \
     --disable-log-requests \
     --trust-remote-code \
