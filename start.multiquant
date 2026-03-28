@@ -1,37 +1,141 @@
 #!/bin/bash
 # ============================================================
-# MultiQuant Serve — Modell + KV-Cache Quantisierung
-#
-# Decode: Fused Triton Kernel (5 Launches statt ~100)
-# Kein FlashInfer Autotuner, kein enforce-eager.
+# MultiQuant Serve — GLM-4.7-Flash mit konfigurierbarem Profil
 #
 # Nutzung:
-#   ./start.multiquant                              # INT4 + TQ3 (default)
-#   ./start.multiquant tq4                          # INT4 + TQ4
-#   ./start.multiquant tq3 /data/tensordata/GLM-4.7-Flash-FP8   # FP8 + TQ3
-#   ./start.multiquant rq3 /data/tensordata/GLM-4.7-Flash-FP8   # FP8 + RQ3
+#   ./start.multiquant                                    # Defaults: INT4 + TQ3
+#   ./start.multiquant --kv tq4                           # TQ4 KV-Cache
+#   ./start.multiquant --kv rq3 --model GLM-4.7-Flash-FP8 # FP8 Modell + RQ3
+#   ./start.multiquant --weights archer-tq3               # Archer Online-Quant
+#   ./start.multiquant --mtp                              # Multi-Token Prediction
+#   ./start.multiquant --riy                              # RIY Profil (MoE Routing)
+#   ./start.multiquant --kv tq3 --weights int4 --mtp --riy  # Alles kombiniert
 # ============================================================
 
 set -euo pipefail
 
-# ── Konfiguration ──────────────────────────────────────────
-KV_DTYPE="${1:-tq3}"
-MODEL_PATH="${2:-/data/tensordata/GLM-4.7-Flash-int4-AutoRound}"
+# ── Defaults ──────────────────────────────────────────────
+KV_DTYPE="tq3"
+WEIGHTS="int4"           # int4 | fp8 | bf16 | archer-tq3 | archer-rq3
+MODEL_DIR="/data/tensordata"
+MODEL=""
+MTP=false
+RIY=false
+PORT=8011
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
-PORT=8011
+EXTRA_ARGS=()
+
+# ── Argparse ──────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kv)       KV_DTYPE="$2"; shift 2 ;;
+        --weights)  WEIGHTS="$2"; shift 2 ;;
+        --model)    MODEL="$2"; shift 2 ;;
+        --mtp)      MTP=true; shift ;;
+        --riy)      RIY=true; shift ;;
+        --port)     PORT="$2"; shift 2 ;;
+        --image)    IMAGE="$2"; shift 2 ;;
+        --name)     CONTAINER_NAME="$2"; shift 2 ;;
+        --eager)    EXTRA_ARGS+=("--enforce-eager"); shift ;;
+        --help|-h)
+            echo "Nutzung: $0 [Optionen]"
+            echo ""
+            echo "Optionen:"
+            echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 auto (default: tq3)"
+            echo "  --weights TYPE   Gewichte: int4 fp8 bf16 archer-tq3 archer-rq3 (default: int4)"
+            echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/"
+            echo "  --mtp            Multi-Token Prediction aktivieren"
+            echo "  --riy            RIY Profil (MoE Expert Routing)"
+            echo "  --port PORT      API Port (default: 8011)"
+            echo "  --eager          enforce-eager (kein CUDA Graphs)"
+            echo "  --image IMAGE    Container Image (default: localhost/vllm-multiquant)"
+            echo "  --name NAME      Container Name (default: mq-serve)"
+            exit 0 ;;
+        *)
+            echo "Unbekannte Option: $1 (--help für Hilfe)"
+            exit 1 ;;
+    esac
+done
+
+# ── Modell-Pfad auflösen ─────────────────────────────────
+if [[ -z "$MODEL" ]]; then
+    case "$WEIGHTS" in
+        int4)        MODEL="GLM-4.7-Flash-int4-AutoRound" ;;
+        fp8)         MODEL="GLM-4.7-Flash-FP8" ;;
+        bf16)        MODEL="GLM-4.7-Flash" ;;
+        archer-tq3)  MODEL="GLM-4.7-Flash" ;;
+        archer-rq3)  MODEL="GLM-4.7-Flash" ;;
+        *)           MODEL="GLM-4.7-Flash-int4-AutoRound" ;;
+    esac
+fi
+
+# Absoluter Pfad oder relativ zu MODEL_DIR
+if [[ "$MODEL" != /* ]]; then
+    MODEL_PATH="$MODEL_DIR/$MODEL"
+else
+    MODEL_PATH="$MODEL"
+fi
 MODEL_NAME=$(basename "$MODEL_PATH")
 
+# ── Gewichte-spezifische Flags ────────────────────────────
+QUANT_ARGS=()
+QUANT_ENV=()
+QUANT_LABEL="$WEIGHTS"
+
+case "$WEIGHTS" in
+    int4)
+        # INT4 AutoRound → Marlin Kernel, keine extra Flags
+        QUANT_LABEL="INT4 Marlin"
+        ;;
+    fp8)
+        QUANT_LABEL="FP8 Dynamic"
+        ;;
+    bf16)
+        QUANT_LABEL="BF16 (unquantisiert)"
+        ;;
+    archer-tq3)
+        QUANT_ARGS+=("--quantization" "multiquant")
+        QUANT_LABEL="Archer TQ3 (online BF16→3bit)"
+        ;;
+    archer-rq3)
+        QUANT_ARGS+=("--quantization" "multiquant")
+        QUANT_LABEL="Archer RQ3 (online BF16→3bit Clifford)"
+        ;;
+    *)
+        echo "WARNUNG: Unbekannter Gewichte-Typ '$WEIGHTS', verwende default"
+        ;;
+esac
+
+# ── MTP ───────────────────────────────────────────────────
+MTP_LABEL="aus"
+if $MTP; then
+    EXTRA_ARGS+=("--num-speculative-tokens" "1")
+    EXTRA_ARGS+=("--speculative-model" "[ngram]")
+    MTP_LABEL="an (ngram, 1 token)"
+fi
+
+# ── RIY ───────────────────────────────────────────────────
+RIY_LABEL="aus"
+if $RIY; then
+    QUANT_ENV+=("-e" "VLLM_RIY_ENABLED=1")
+    RIY_LABEL="an"
+fi
+
+# ── Banner ────────────────────────────────────────────────
 printf "╔══════════════════════════════════════════════════════╗\n"
 printf "║  MultiQuant Serve                                    ║\n"
 printf "╠══════════════════════════════════════════════════════╣\n"
 printf "║  Modell:   %-40s ║\n" "$MODEL_NAME"
+printf "║  Gewichte: %-40s ║\n" "$QUANT_LABEL"
 printf "║  KV-Cache: %-40s ║\n" "$KV_DTYPE"
+printf "║  MTP:      %-40s ║\n" "$MTP_LABEL"
+printf "║  RIY:      %-40s ║\n" "$RIY_LABEL"
 printf "║  Port:     %-40s ║\n" "$PORT"
 printf "╚══════════════════════════════════════════════════════╝\n"
 echo ""
 
-# ── Prüfungen ─────────────────────────────��────────────────
+# ── Prüfungen ────────────────────────────────────────────
 if ! podman image exists "$IMAGE"; then
     echo "FEHLER: Image '$IMAGE' nicht gefunden."
     echo "Bauen mit: podman build -f Dockerfile.multiquant -t vllm-multiquant ."
@@ -40,6 +144,8 @@ fi
 
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "FEHLER: Modell nicht gefunden: $MODEL_PATH"
+    echo "Verfügbare Modelle:"
+    ls -d "$MODEL_DIR"/GLM-4.7-Flash* 2>/dev/null | sed 's|.*/|  |'
     exit 1
 fi
 
@@ -47,7 +153,7 @@ fi
 podman stop "$CONTAINER_NAME" 2>/dev/null || true
 podman rm "$CONTAINER_NAME" 2>/dev/null || true
 
-# ── Container starten ──────────────────────────────────────
+# ── Container starten ────────────────────────────────────
 podman run -d \
   --replace \
   --name "$CONTAINER_NAME" \
@@ -66,11 +172,12 @@ podman run -d \
   -e FLASHINFER_DISABLE_AUTOTUNER=1 \
   -e VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
   -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  "${QUANT_ENV[@]}" \
   "$IMAGE" \
   vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --served-model-name "$MODEL_NAME" \
+    --served-model-name glm-4.7-flash \
     --gpu-memory-utilization 0.90 \
     --max-model-len 100000 \
     --kv-cache-dtype "$KV_DTYPE" \
@@ -78,7 +185,9 @@ podman run -d \
     --reasoning-parser glm45 \
     --enable-auto-tool-choice \
     --disable-log-requests \
-    --trust-remote-code
+    --trust-remote-code \
+    "${QUANT_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
 
 echo ""
 echo "Container '$CONTAINER_NAME' gestartet."
@@ -87,13 +196,11 @@ echo "  Logs:     podman logs -f $CONTAINER_NAME"
 echo "  API:      http://localhost:$PORT/v1/chat/completions"
 echo "  Stoppen:  podman stop $CONTAINER_NAME"
 echo ""
-echo "  Schnelltest:"
-echo "    curl -s http://localhost:$PORT/v1/chat/completions \\"
-echo "      -H 'Content-Type: application/json' \\"
-echo "      -d '{\"model\":\"glm-4.7-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hallo\"}]}' | python3 -m json.tool"
-echo ""
 echo "  Beispiele:"
-echo "    ./start.multiquant                                        # INT4 + TQ3"
-echo "    ./start.multiquant tq4                                    # INT4 + TQ4"
-echo "    ./start.multiquant tq3 /data/tensordata/GLM-4.7-Flash-FP8 # FP8 + TQ3"
-echo "    ./start.multiquant rq3 /data/tensordata/GLM-4.7-Flash-FP8 # FP8 + RQ3"
+echo "    ./start.multiquant                                  # INT4 + TQ3 (default)"
+echo "    ./start.multiquant --kv tq4                         # INT4 + TQ4"
+echo "    ./start.multiquant --weights fp8 --kv tq3           # FP8 + TQ3"
+echo "    ./start.multiquant --weights archer-tq3 --kv tq3    # BF16→Archer + TQ3"
+echo "    ./start.multiquant --kv tq3 --mtp                   # + Multi-Token Prediction"
+echo "    ./start.multiquant --kv tq3 --riy                   # + RIY Profil"
+echo "    ./start.multiquant --kv tq3 --mtp --riy --eager     # Alles + Debug"
