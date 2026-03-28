@@ -60,7 +60,7 @@ class MultiQuantAttentionBackend(AttentionBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "tq3", "tq4", "rq3", "rq4",
+        "tq3", "tq4", "rq2", "rq3", "rq4",
     ]
 
     @staticmethod

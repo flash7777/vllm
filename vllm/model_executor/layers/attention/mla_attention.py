@@ -336,10 +336,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if self._mq_enabled:
             self._init_multiquant_buffers(
                 kv_cache_dtype, self.head_size, prefix)
-            # kv_cache_dtype stays as-is (tq3/rq3) — MULTIQUANT_MLA
-            # backend handles compressed cache natively
             logger.info_once(
-                "MultiQuant MLA: %s compression via MULTIQUANT_MLA backend",
+                "MultiQuant Attention: %s — eigenständiger Pfad (kein MLA Backend)",
                 self._mq_cache_dtype,
             )
 
@@ -348,7 +346,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.head_size,
             dtype,
             kv_cache_dtype,
-            use_mla=True,
+            # MultiQuant: use_mla=False — Latent treated as normal K/V
+            use_mla=False if self._mq_enabled else True,
             use_sparse=use_sparse,
             num_heads=self.num_heads,
         )
