@@ -162,8 +162,8 @@ class MultiQuantImpl:
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
-        from vllm.turboquant.config import TurboQuantConfig
-        self._tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        from vllm.multiquant.registry import get_kv_quantizer_config
+        self._tq_config = get_kv_quantizer_config(kv_cache_dtype, head_size)
         self._packed_size = self._tq_config.key_packed_size
         self._mse_bits = self._tq_config.mse_bits
         self._mse_bytes = (head_size * self._mse_bits + 7) // 8
