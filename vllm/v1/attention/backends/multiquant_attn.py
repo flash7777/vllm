@@ -320,37 +320,41 @@ class MultiQuantImpl:
                     k_packed = kv_cache[bi_phys, 0, bo, kv_h]  # (sl, packed_size)
                     v_packed = kv_cache[bi_phys, 1, bo, kv_h]  # (sl, packed_size)
 
-                    # Vectorized unpack K → compute scores
-                    # Unpack MSE indices: 2 bits per coord, 4 per byte
-                    k_bytes = k_packed[:, :self._mse_bytes]  # (sl, mse_bytes)
-                    # Expand bytes to indices
-                    idx_all = torch.zeros(sl, D, dtype=torch.long, device=device)
-                    for b in range(self._mse_bytes):
-                        bv = k_bytes[:, b].long()  # (sl,)
-                        for k in range(4):
-                            j = b * 4 + k
-                            if j >= D: break
-                            idx_all[:, j] = (bv >> (k * 2)) & self._mask
+                    # CUDA unpack K
+                    try:
+                        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+                        k_result = cuda_unpack(k_packed, D, self._mse_bits)
+                    except Exception:
+                        k_result = None
 
-                    # Unpack signs
-                    s_bytes = k_packed[:, self._mse_bytes:self._mse_bytes + self._qjl_bytes]
-                    signs_all = torch.zeros(sl, D, dtype=torch.float32, device=device)
-                    for b in range(self._qjl_bytes):
-                        bv = s_bytes[:, b].long()
-                        for k in range(8):
-                            j = b * 8 + k
-                            if j >= D: break
-                            signs_all[:, j] = torch.where(
-                                ((bv >> k) & 1).bool(),
-                                torch.ones(sl, device=device),
-                                -torch.ones(sl, device=device))
+                    if k_result is not None:
+                        idx_all, signs_all, k_vn, k_rn = k_result
+                        idx_all = idx_all.long()
+                    else:
+                        no = self._mse_bytes + self._qjl_bytes
+                        idx_all = torch.zeros(sl, D, dtype=torch.long, device=device)
+                        for b in range(self._mse_bytes):
+                            bv = k_packed[:, b].long()
+                            for k in range(4):
+                                j = b * 4 + k
+                                if j >= D: break
+                                idx_all[:, j] = (bv >> (k * 2)) & self._mask
+                        signs_all = torch.zeros(sl, D, dtype=torch.float32, device=device)
+                        for b in range(self._qjl_bytes):
+                            bv = k_packed[:, self._mse_bytes + b].long()
+                            for k in range(8):
+                                j = b * 8 + k
+                                if j >= D: break
+                                signs_all[:, j] = torch.where(
+                                    ((bv >> k) & 1).bool(),
+                                    torch.ones(sl, device=device),
+                                    -torch.ones(sl, device=device))
+                        vn_bytes = k_packed[:, no:no+2].contiguous()
+                        rn_bytes = k_packed[:, no+2:no+4].contiguous()
+                        k_vn = vn_bytes.view(torch.float16).float().squeeze(-1)
+                        k_rn = rn_bytes.view(torch.float16).float().squeeze(-1)
 
-                    # Unpack norms
                     no = self._mse_bytes + self._qjl_bytes
-                    vn_bytes = k_packed[:, no:no+2].contiguous()
-                    rn_bytes = k_packed[:, no+2:no+4].contiguous()
-                    k_vn = vn_bytes.view(torch.float16).float().squeeze(-1)  # (sl,)
-                    k_rn = rn_bytes.view(torch.float16).float().squeeze(-1)
 
                     # Centroids lookup: (sl, D)
                     c_idx = centroids[idx_all]  # (sl, D)
@@ -368,28 +372,40 @@ class MultiQuantImpl:
                         # Score
                         scores = k_vn * (term1 + self._correction * k_rn * term2) * self.scale
 
-                        # Decompress V: same process
-                        v_idx = torch.zeros(sl, D, dtype=torch.long, device=device)
-                        for b in range(self._mse_bytes):
-                            bv = v_packed[:, b].long()
-                            for k in range(4):
-                                j = b * 4 + k
-                                if j >= D: break
-                                v_idx[:, j] = (bv >> (k * 2)) & self._mask
-                        v_signs = torch.zeros(sl, D, dtype=torch.float32, device=device)
-                        for b in range(self._qjl_bytes):
-                            bv = v_packed[:, self._mse_bytes + b].long()
-                            for k in range(8):
-                                j = b * 8 + k
-                                if j >= D: break
-                                v_signs[:, j] = torch.where(
-                                    ((bv >> k) & 1).bool(),
-                                    torch.ones(sl, device=device),
-                                    -torch.ones(sl, device=device))
-                        v_vn_bytes = v_packed[:, no:no+2].contiguous()
-                        v_rn_bytes = v_packed[:, no+2:no+4].contiguous()
-                        v_vn = v_vn_bytes.view(torch.float16).float().squeeze(-1)
-                        v_rn = v_rn_bytes.view(torch.float16).float().squeeze(-1)
+                        # Decompress V: CUDA unpack
+                        if k_result is not None:
+                            try:
+                                v_result = cuda_unpack(v_packed, D, self._mse_bits)
+                            except Exception:
+                                v_result = None
+                        else:
+                            v_result = None
+
+                        if v_result is not None:
+                            v_idx, v_signs, v_vn, v_rn = v_result
+                            v_idx = v_idx.long()
+                        else:
+                            v_idx = torch.zeros(sl, D, dtype=torch.long, device=device)
+                            for b in range(self._mse_bytes):
+                                bv = v_packed[:, b].long()
+                                for bk in range(4):
+                                    j = b * 4 + bk
+                                    if j >= D: break
+                                    v_idx[:, j] = (bv >> (bk * 2)) & self._mask
+                            v_signs = torch.zeros(sl, D, dtype=torch.float32, device=device)
+                            for b in range(self._qjl_bytes):
+                                bv = v_packed[:, self._mse_bytes + b].long()
+                                for bk in range(8):
+                                    j = b * 8 + bk
+                                    if j >= D: break
+                                    v_signs[:, j] = torch.where(
+                                        ((bv >> bk) & 1).bool(),
+                                        torch.ones(sl, device=device),
+                                        -torch.ones(sl, device=device))
+                            v_vn_bytes = v_packed[:, no:no+2].contiguous()
+                            v_rn_bytes = v_packed[:, no+2:no+4].contiguous()
+                            v_vn = v_vn_bytes.view(torch.float16).float().squeeze(-1)
+                            v_rn = v_rn_bytes.view(torch.float16).float().squeeze(-1)
                         v_c = centroids[v_idx]
                         v_xm = self._rotate_inverse(v_c, Pi)  # (sl, D)
                         v_xq = self._correction * v_rn.unsqueeze(-1) * (v_signs @ S)
