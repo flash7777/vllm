@@ -230,6 +230,102 @@ class TestPrefillForward:
         assert not output.isnan().any()
 
 
+# ── 2b. Prefill GQA Mixed Batch (Warmup Crash) ──────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestPrefillGQAMixed:
+    """Prefill mit GQA wo num_heads != num_kv_heads — der Serving-Crash."""
+
+    def test_prefill_gqa_warmup_pattern(self):
+        """Simuliert vLLM Warmup: mixed batch mit num_prefill != query count."""
+        D = 128
+        num_heads = 32      # GLM-4.7 Q-Heads
+        num_kv_heads = 4    # GLM-4.7 KV-Heads
+
+        # vLLM Warmup sendet mixed prefill-decode:
+        # num_decode=4, num_prefill=6, aber query hat 10 Tokens total
+        num_decode = 4
+        num_prefill = 6
+        N = num_decode + num_prefill
+
+        impl, layer = _make_impl(D, num_heads=num_heads,
+                                 num_kv_heads=num_kv_heads)
+        packed_size = impl._packed_size
+        cache = _make_cache(2, 16, num_kv_heads, packed_size)
+
+        # Fill cache for decode tokens
+        torch.manual_seed(42)
+        k_ctx = torch.randn(8, num_kv_heads, D,
+                            dtype=torch.bfloat16, device="cuda")
+        v_ctx = torch.randn(8, num_kv_heads, D,
+                            dtype=torch.bfloat16, device="cuda")
+        slot_ctx = torch.arange(8, device="cuda")
+        impl.do_kv_cache_update(layer, k_ctx, v_ctx, cache, slot_ctx)
+
+        query = torch.randn(N, num_heads * D,
+                            dtype=torch.bfloat16, device="cuda")
+        key = torch.randn(N, num_kv_heads * D,
+                          dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(N, num_kv_heads * D,
+                            dtype=torch.bfloat16, device="cuda")
+
+        slot_mapping = torch.arange(N, device="cuda")
+        block_table = torch.tensor([[0, 1]] * num_decode, device="cuda")
+
+        meta = _make_metadata(
+            seq_lens=torch.tensor([6] * num_decode, device="cuda"),
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            num_prefill=num_prefill,
+            num_decode=num_decode,
+            max_seq_len=6,
+        )
+
+        # This crashed with: RuntimeError: shape '[6, -1]' is invalid
+        # for input of size 40960 (before L vs num_prefill fix)
+        output = impl.forward(layer, query, key, value, cache, meta)
+
+        assert output.shape == (N, num_heads * D)
+        assert not output.isnan().any(), "GQA mixed prefill output has NaN"
+
+    def test_prefill_32_heads_4_kv(self):
+        """Pure prefill with GLM-4.7 head config (32Q / 4KV)."""
+        D = 128
+        num_heads = 32
+        num_kv_heads = 4
+        seq_len = 8
+
+        impl, layer = _make_impl(D, num_heads=num_heads,
+                                 num_kv_heads=num_kv_heads)
+        packed_size = impl._packed_size
+        cache = _make_cache(1, 16, num_kv_heads, packed_size)
+
+        torch.manual_seed(42)
+        query = torch.randn(seq_len, num_heads * D,
+                            dtype=torch.bfloat16, device="cuda")
+        key = torch.randn(seq_len, num_kv_heads * D,
+                          dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(seq_len, num_kv_heads * D,
+                            dtype=torch.bfloat16, device="cuda")
+
+        slot_mapping = torch.arange(seq_len, device="cuda")
+        block_table = torch.tensor([[0]], device="cuda")
+
+        meta = _make_metadata(
+            seq_lens=torch.tensor([seq_len], device="cuda"),
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            num_prefill=seq_len,
+            num_decode=0,
+            max_seq_len=seq_len,
+        )
+
+        output = impl.forward(layer, query, key, value, cache, meta)
+
+        assert output.shape == (seq_len, num_heads * D)
+        assert not output.isnan().any()
+
+
 # ── 3. Decode Forward (Full Pipeline) ────────────────────────────────
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -289,8 +289,8 @@ class MultiQuantImpl:
             scores = scores + causal_mask.unsqueeze(0)
             weights = F.softmax(scores, dim=-1)
             prefill_out = torch.bmm(weights, pv.transpose(0, 1).float())
-            output[num_decode:] = prefill_out.transpose(0, 1).reshape(
-                num_prefill, -1).to(output.dtype)
+            output[num_decode:num_decode + L] = prefill_out.transpose(0, 1).reshape(
+                L, -1).to(output.dtype)
 
         # --- Decode: fused Triton kernel (TQ) or Python fallback (RQ) ---
         if num_decode > 0:
