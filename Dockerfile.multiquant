@@ -7,10 +7,8 @@
 # No patches, no sed, no build/deps — everything is in the source tree.
 # Only external deps: CUTLASS, FlashInfer wheels, MoE configs.
 #
-# Build: ./build.sh (empfohlen, mit pip-Cache)
-# Oder manuell:
-#   podman build -f Dockerfile.multiquant -t vllm-multiquant \
-#     -v /data/sources/pip-cache:/pip-cache:rw .
+# Build: ./build.sh (empfohlen, mit pip/ccache/cutlass Cache)
+# Caches unter /data/sources/{pip-cache,ccache,torch-extensions,cutlass}
 # ============================================================
 
 ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3
@@ -20,9 +18,9 @@ ARG CUDA_ARCHS="12.0a;12.1a"
 ARG VLLM_BRANCH=multiquant
 ARG MAX_JOBS=16
 
-# ─── System deps ─────────────────────────────────────────────
+# ─── System deps + ccache ────────────────────────────────────
 RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends wget libibverbs-dev && \
+    apt-get install -y --no-install-recommends wget libibverbs-dev ccache && \
     ln -sf libibverbs.so.1 /usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs.so && \
     ARCH_DIR=$(dpkg --print-architecture | sed 's/arm64/sbsa/;s/amd64/x86_64/') && \
     wget -qO /tmp/cuda-keyring.deb \
@@ -33,6 +31,12 @@ RUN apt-get update -qq && \
       libcusparse-dev-13-1 libcusolver-dev-13-1 libcufft-dev-13-1 && \
     rm -rf /var/lib/apt/lists/*
 
+# ccache for nvcc/gcc — persistent via volume mount (-v /data/sources/ccache:/ccache:rw)
+ENV CCACHE_DIR=/ccache
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
 RUN pip install --cache-dir /pip-cache cmake ninja setuptools-scm scipy pytest
 
 # Save NVIDIA's CUDA-aware PyTorch before anything overwrites it
@@ -40,8 +44,13 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     tar cf /opt/nvidia-torch.tar torch/ $(ls -d torch*.dist-info 2>/dev/null)
 
 # ─── CUTLASS 4.4.1 (SM120a/SM121a) ──────────────────────────
-RUN git clone --depth 1 --branch v4.4.1 \
-      https://github.com/NVIDIA/cutlass.git /opt/cutlass
+# Use local mount if available (-v cutlass:/opt/cutlass-local:ro), else clone
+RUN if [ -d /opt/cutlass-local/include ]; then \
+      ln -s /opt/cutlass-local /opt/cutlass && echo "CUTLASS: local mount"; \
+    else \
+      git clone --depth 1 --branch v4.4.1 \
+        https://github.com/NVIDIA/cutlass.git /opt/cutlass && echo "CUTLASS: cloned"; \
+    fi
 ENV VLLM_CUTLASS_SRC_DIR=/opt/cutlass
 RUN sed -i '/nvidia-cutlass-dsl/d' /etc/pip/constraint.txt && \
     pip install --cache-dir /pip-cache --force-reinstall nvidia-cutlass-dsl==4.4.1

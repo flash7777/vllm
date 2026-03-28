@@ -26,15 +26,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PIP_CACHE="/data/sources/pip-cache"
-mkdir -p "$PIP_CACHE"
+CACHE_BASE="/data/sources"
+PIP_CACHE="$CACHE_BASE/pip-cache"
+CCACHE_DIR="$CACHE_BASE/ccache"
+TORCH_EXT="$CACHE_BASE/torch-extensions"
+CUTLASS_DIR="$CACHE_BASE/cutlass"
+
+mkdir -p "$PIP_CACHE" "$CCACHE_DIR" "$TORCH_EXT"
+
+# Pre-clone CUTLASS locally (saves ~30s per build)
+if [[ ! -d "$CUTLASS_DIR/.git" ]]; then
+    echo "Cloning CUTLASS 4.4.1 locally..."
+    git clone --depth 1 --branch v4.4.1 https://github.com/NVIDIA/cutlass.git "$CUTLASS_DIR"
+fi
 
 echo "================================================"
 echo "  Building ${IMAGE}"
-echo "  Base:  ${BASE}"
-echo "  Archs: ${ARCHS}"
-echo "  Jobs:  ${JOBS}"
-echo "  pip:   ${PIP_CACHE}"
+echo "  Base:   ${BASE}"
+echo "  Archs:  ${ARCHS}"
+echo "  Jobs:   ${JOBS}"
+echo "  Caches: ${CACHE_BASE}/"
 echo "================================================"
 
 # Copy FlashInfer wheels if available
@@ -56,6 +67,9 @@ podman build \
     --build-arg CUDA_ARCHS="$ARCHS" \
     --build-arg MAX_JOBS="$JOBS" \
     -v "$PIP_CACHE:/pip-cache:rw" \
+    -v "$CCACHE_DIR:/ccache:rw" \
+    -v "$TORCH_EXT:/root/.cache/torch_extensions:rw" \
+    -v "$CUTLASS_DIR:/opt/cutlass-local:ro" \
     $EXTRA \
     .
 
@@ -63,4 +77,6 @@ echo ""
 echo "================================================"
 echo "  Done: ${IMAGE}"
 echo "  Size: $(podman image inspect "$IMAGE" --format '{{.Size}}' | numfmt --to=iec)"
+echo "  ccache: $(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1) ($(ls "$CCACHE_DIR" 2>/dev/null | wc -l) entries)"
+echo "  pip:    $(du -sh "$PIP_CACHE" 2>/dev/null | cut -f1)"
 echo "================================================"
