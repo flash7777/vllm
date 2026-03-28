@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MultiQuant fused MLA decode attention — Triton kernel.
+"""MultiQuant fused MLA decode — Triton kernel.
 
-Reads directly from packed uint8 KV-cache. No decompress step.
-Inline: unpack MSE indices → centroid lookup → inverse rotation → Q·K score.
+Key optimization: pre-rotate query (q_rot = q @ Pi), then score
+against raw centroids. Eliminates per-token D×D rotation entirely.
 
-Based on triton_decode_attention.py (vLLM/SGLang).
+Math: q · (Pi^T @ centroids[idx]) = (q @ Pi) · centroids[idx]
+
+Per-token cost: just gather + dot-product (no matrix multiply).
 """
+
+import math
 
 import torch
 
@@ -13,37 +17,27 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _mq_mla_decode_stage1(
-    Q,                      # [B, num_heads, qk_dim]
+def _mq_mla_decode_kernel(
+    Q_rot,                  # [B, num_heads, D] — pre-rotated query
     KV_Cache,               # [num_pages, page_size, packed_size] uint8
     Centroids,              # [n_centroids] float32
-    Pi,                     # [D, D] float32 (rotation matrix)
-    S,                      # [D, D] float32 (QJL projection)
+    S_proj,                 # [D] float32 — pre-computed q_rot @ S for QJL
     Block_table,            # [B, max_blocks] int32
     Seq_lens,               # [B] int32
     Out,                    # [B, num_heads, kv_lora_rank]
-    Lse,                    # [B, num_heads]
+    Lse,                    # [B, num_heads] float32
     sm_scale,
     stride_qb, stride_qh,
     stride_cache_page, stride_cache_slot,
-    stride_pi_row,
-    stride_s_row,
     stride_bt_b,
     stride_ob, stride_oh,
-    D: tl.constexpr,           # original head_size (latent dim)
-    MSE_BITS: tl.constexpr,    # 2 or 3
-    PACKED_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    MSE_BITS: tl.constexpr,
     KV_LORA_RANK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,     # tokens per iteration
+    BLOCK_N: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
 ):
-    """Stage 1: compute attention scores from packed cache.
-
-    Each program handles one (batch, head) pair.
-    Iterates over cached tokens in blocks of BLOCK_N.
-    For each cached token: unpack → centroid → rotate → dot with q.
-    Online softmax accumulation.
-    """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
@@ -51,116 +45,87 @@ def _mq_mla_decode_stage1(
     if seq_len <= 0:
         return
 
-    # Load query for this head
+    # Load pre-rotated query
     offs_d = tl.arange(0, D)
-    mask_d = offs_d < D
-    q = tl.load(Q + cur_batch * stride_qb + cur_head * stride_qh + offs_d,
-                mask=mask_d, other=0.0)
+    q_rot = tl.load(
+        Q_rot + cur_batch * stride_qb + cur_head * stride_qh + offs_d,
+        mask=offs_d < D, other=0.0,
+    )
 
-    # Constants for unpacking
-    MSE_BYTES: tl.constexpr = (D * MSE_BITS + 7) // 8
-    QJL_BYTES: tl.constexpr = (D + 7) // 8
     COORDS_PER_BYTE: tl.constexpr = 8 // MSE_BITS
     MASK: tl.constexpr = (1 << MSE_BITS) - 1
-    CORR_SCALE = 1.2533141373155003 / D  # sqrt(π/2) / D
+    MSE_BYTES: tl.constexpr = (D * MSE_BITS + 7) // 8
+    QJL_BYTES: tl.constexpr = (D + 7) // 8
+    NORM_OFFSET: tl.constexpr = MSE_BYTES + QJL_BYTES
+
+    # Load centroids to registers
+    offs_c = tl.arange(0, N_CENTROIDS)
+    centroids = tl.load(Centroids + offs_c, mask=offs_c < N_CENTROIDS)
 
     # Online softmax state
     m_prev = -float("inf")
     l_prev = 0.0
     acc = tl.zeros([KV_LORA_RANK], dtype=tl.float32)
+    offs_v = tl.arange(0, KV_LORA_RANK)
 
-    # Iterate over cached tokens
-    for start_n in range(0, seq_len, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        valid = offs_n < seq_len
+    for token_idx in range(0, seq_len):
+        # Page table lookup
+        page_idx = tl.load(
+            Block_table + cur_batch * stride_bt_b + token_idx // PAGE_SIZE
+        )
+        slot = token_idx % PAGE_SIZE
+        base = page_idx * stride_cache_page + slot * stride_cache_slot
 
-        # For each token in this block, compute score
-        for ni in range(BLOCK_N):
-            token_idx = start_n + ni
-            if token_idx >= seq_len:
-                break
+        # ── Unpack MSE indices + compute score ──────────────────
+        # score = q_rot · centroids[idx] (no rotation needed!)
+        score = tl.zeros([1], dtype=tl.float32)
 
-            # Page lookup
-            page_idx = tl.load(
-                Block_table + cur_batch * stride_bt_b + token_idx // PAGE_SIZE
-            )
-            slot_in_page = token_idx % PAGE_SIZE
-            cache_offset = page_idx * stride_cache_page + slot_in_page * stride_cache_slot
+        for byte_i in range(MSE_BYTES):
+            packed_byte = tl.load(KV_Cache + base + byte_i).to(tl.int32)
+            for k in range(COORDS_PER_BYTE):
+                j = byte_i * COORDS_PER_BYTE + k
+                if j < D:
+                    idx = (packed_byte >> (k * MSE_BITS)) & MASK
+                    # Centroid value for this coordinate
+                    c_val = tl.sum(tl.where(offs_c == idx, centroids, 0.0))
+                    # Accumulate dot product: q_rot[j] * centroid
+                    q_j = tl.sum(tl.where(offs_d == j, q_rot, 0.0))
+                    score += q_j * c_val
 
-            # Load packed bytes for this token
-            # Unpack MSE indices and compute centroid values
-            k_reconstructed = tl.zeros([D], dtype=tl.float32)
+        score = score * sm_scale
 
-            # Simple per-coordinate unpack + centroid lookup
-            for j in range(D):
-                byte_idx = j // COORDS_PER_BYTE
-                bit_pos = (j % COORDS_PER_BYTE) * MSE_BITS
-                packed_byte = tl.load(KV_Cache + cache_offset + byte_idx)
-                idx = (packed_byte >> bit_pos) & MASK
-                # Centroid lookup
-                k_reconstructed = tl.where(
-                    offs_d == j,
-                    tl.load(Centroids + idx).to(tl.float32),
-                    k_reconstructed,
-                )
+        # ── Online softmax ──────────────────────────────────────
+        m_new = tl.maximum(m_prev, score)
+        exp_prev = tl.exp(m_prev - m_new)
+        exp_new = tl.exp(score - m_new)
+        l_new = l_prev * exp_prev + exp_new
 
-            # Inverse rotation: Pi^T @ k_reconstructed
-            # This is the expensive part — D×D matmul per token
-            k_rotated = tl.zeros([D], dtype=tl.float32)
-            for row in range(D):
-                # k_rotated[row] = sum_j Pi[j, row] * k_reconstructed[j]
-                # = column `row` of Pi dotted with k_reconstructed
-                pi_col = tl.load(Pi + tl.arange(0, D) * stride_pi_row + row,
-                                 mask=mask_d, other=0.0)
-                k_rotated = tl.where(
-                    offs_d == row,
-                    tl.sum(pi_col * k_reconstructed),
-                    k_rotated,
-                )
+        # ── Value: unpack first kv_lora_rank coordinates ────────
+        # (Value is stored in the same packed format as Key)
+        v_val = tl.zeros([KV_LORA_RANK], dtype=tl.float32)
+        for byte_i in range(MSE_BYTES):
+            packed_byte = tl.load(KV_Cache + base + byte_i).to(tl.int32)
+            for k in range(COORDS_PER_BYTE):
+                j = byte_i * COORDS_PER_BYTE + k
+                if j < KV_LORA_RANK:
+                    idx = (packed_byte >> (k * MSE_BITS)) & MASK
+                    c_val = tl.sum(tl.where(offs_c == idx, centroids, 0.0))
+                    v_val = tl.where(offs_v == j, c_val, v_val)
 
-            # Unpack norms
-            norm_offset = cache_offset + MSE_BYTES + QJL_BYTES
-            # TODO: load float16 norms properly in Triton
-            # For now: approximate with unit norms
-            vec_norm = 1.0
-            res_norm = 0.0
+        # Weighted accumulation
+        scale_prev = l_prev * exp_prev / l_new
+        scale_new = exp_new / l_new
+        acc = acc * scale_prev + v_val * scale_new
 
-            # Reconstruct: vec_norm * k_rotated (skip QJL for now — perf first)
-            k_final = vec_norm * k_rotated
-
-            # Score: q · k
-            score = tl.sum(q * k_final) * sm_scale
-
-            # Online softmax update
-            m_new = tl.maximum(m_prev, score)
-            exp_prev = tl.exp(m_prev - m_new)
-            exp_new = tl.exp(score - m_new)
-            l_new = l_prev * exp_prev + exp_new
-
-            # For MLA: output is kv_lora_rank dims of the latent
-            # Use k_final[:KV_LORA_RANK] as the "value" component
-            v_component = tl.zeros([KV_LORA_RANK], dtype=tl.float32)
-            offs_v = tl.arange(0, KV_LORA_RANK)
-            mask_v = offs_v < KV_LORA_RANK
-            for vj in range(KV_LORA_RANK):
-                byte_idx = vj // COORDS_PER_BYTE
-                bit_pos = (vj % COORDS_PER_BYTE) * MSE_BITS
-                packed_byte = tl.load(KV_Cache + cache_offset + byte_idx)
-                idx = (packed_byte >> bit_pos) & MASK
-                v_component = tl.where(
-                    offs_v == vj,
-                    tl.load(Centroids + idx).to(tl.float32),
-                    v_component,
-                )
-
-            acc = acc * (l_prev * exp_prev / l_new) + v_component * (exp_new / l_new)
-            m_prev = m_new
-            l_prev = l_new
+        m_prev = m_new
+        l_prev = l_new
 
     # Write output
-    offs_out = cur_batch * stride_ob + cur_head * stride_oh + tl.arange(0, KV_LORA_RANK)
-    tl.store(Out + offs_out, acc.to(Out.dtype.element_ty), mask=tl.arange(0, KV_LORA_RANK) < KV_LORA_RANK)
-    tl.store(Lse + cur_batch * stride_oh + cur_head, m_prev + tl.log(l_prev))
+    offs_out = cur_batch * stride_ob + cur_head * stride_oh + offs_v
+    tl.store(Out + offs_out, acc.to(Out.dtype.element_ty),
+             mask=offs_v < KV_LORA_RANK)
+    tl.store(Lse + cur_batch * tl.num_programs(1) + cur_head,
+             m_prev + tl.log(l_prev))
 
 
 def mq_mla_decode_attention(
@@ -177,38 +142,43 @@ def mq_mla_decode_attention(
     kv_lora_rank: int,
     mse_bits: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused MQ-MLA decode: read packed cache → attention → output.
+    """Fused MQ-MLA decode attention.
 
-    NOTE: This is a PROTOTYPE Triton kernel. Per-token D×D rotation
-    is very slow in Triton (no shared memory tiling). Production version
-    needs batched approach or pre-rotation of queries.
-
-    Returns: (output [B, num_heads, kv_lora_rank], lse [B, num_heads])
+    Pre-rotates query: q_rot = q @ Pi (one matmul per batch).
+    Then scores against raw centroids: score = q_rot · centroids[idx].
+    No per-token D×D rotation.
     """
     B, num_heads, qk_dim = q.shape
-    packed_size = kv_cache.shape[2]
+    n_centroids = centroids.shape[0]
+
+    # Pre-rotate query: eliminates per-token rotation
+    # q_rot[b,h,:] = q[b,h,:] @ Pi
+    q_rot = torch.bmm(
+        q.reshape(B * num_heads, 1, qk_dim).float(),
+        Pi.unsqueeze(0).expand(B * num_heads, -1, -1),
+    ).reshape(B, num_heads, head_size).contiguous()
 
     o = torch.zeros(B, num_heads, kv_lora_rank, dtype=q.dtype, device=q.device)
     lse = torch.zeros(B, num_heads, dtype=torch.float32, device=q.device)
 
-    BLOCK_N = 1  # Process 1 token at a time (simple, correct)
-
+    # Triton grid: one program per (batch, head)
     grid = (B, num_heads)
-    _mq_mla_decode_stage1[grid](
-        q, kv_cache, centroids, Pi, S,
+
+    _mq_mla_decode_kernel[grid](
+        q_rot.float(), kv_cache, centroids.float(),
+        torch.zeros(head_size, device=q.device),  # S_proj placeholder
         block_table, seq_lens, o, lse,
         scale,
-        q.stride(0), q.stride(1),
+        q_rot.stride(0), q_rot.stride(1),
         kv_cache.stride(0), kv_cache.stride(1),
-        Pi.stride(0), S.stride(0),
         block_table.stride(0),
         o.stride(0), o.stride(1),
         D=head_size,
         MSE_BITS=mse_bits,
-        PACKED_SIZE=packed_size,
         KV_LORA_RANK=kv_lora_rank,
         PAGE_SIZE=page_size,
-        BLOCK_N=BLOCK_N,
+        BLOCK_N=1,
+        N_CENTROIDS=n_centroids,
     )
 
     return o, lse

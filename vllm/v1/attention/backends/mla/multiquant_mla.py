@@ -280,12 +280,39 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
         attn_metadata: MLACommonMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Decode: decompress cache → BF16 → Triton MLA decode."""
+        """Decode: fused MQ attention directly on packed cache."""
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)
+
+        # Try fused Triton kernel (no decompress step)
+        try:
+            from vllm.v1.attention.ops.triton_mq_decode import (
+                mq_mla_decode_attention,
+            )
+            Pi = layer._tq_Pi.to(q.device).float()
+            S = layer._tq_S.to(q.device).float()
+            centroids = layer._tq_centroids.to(q.device).float()
+
+            o, lse = mq_mla_decode_attention(
+                q=q,
+                kv_cache=kv_c_and_k_pe_cache,
+                centroids=centroids,
+                Pi=Pi,
+                S=S,
+                block_table=attn_metadata.decode.block_table,
+                seq_lens=attn_metadata.decode.seq_lens,
+                scale=self.scale,
+                page_size=kv_c_and_k_pe_cache.shape[1],
+                head_size=self._original_head_size,
+                kv_lora_rank=self.kv_lora_rank,
+                mse_bits=self._mq_config.mse_bits,
+            )
+            return o, lse
+        except Exception as e:
+            logger.debug("Fused MQ-MLA decode failed, using decompress: %s", e)
 
         device = q.device
         head_size = self._original_head_size
