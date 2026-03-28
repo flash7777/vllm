@@ -106,11 +106,13 @@ class MultiQuantAttentionBackend(AttentionBackend):
 # ============================================================
 
 class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
-    # CUDA Graph capture with Triton JIT kernels causes
-    # StreamCaptureInvalidated. PIECEWISE mode is handled by vLLM —
-    # attention is called outside the graph, rest is graphed.
+    # TODO: UNIFORM_SINGLE_TOKEN_DECODE crashes with StreamCaptureInvalidated.
+    # Root cause: something in mq_fused_decode_attention is not graph-safe
+    # (possibly torch.zeros allocation or .contiguous() during capture).
+    # CUDA kernel itself is 0.1ms (6700 tok/s isolated). Bottleneck is
+    # PIECEWISE overhead (~20ms/step Python dispatch).
     from vllm.v1.attention.backend import AttentionCGSupport
-    _cudagraph_support = AttentionCGSupport.NEVER
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -173,6 +175,15 @@ class MultiQuantImpl:
         self._mse_bits = self._tq_config.mse_bits
         self._mse_bytes = (head_size * self._mse_bits + 7) // 8
         self._qjl_bytes = (head_size + 7) // 8
+
+        # Pre-load decode kernel at init (not in forward — graph-safe)
+        self._decode_fn = None
+        if not kv_cache_dtype.startswith("rq"):
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                mq_fused_decode_attention, _load_cuda_kernel,
+            )
+            _load_cuda_kernel()  # JIT compile now, not during graph capture
+            self._decode_fn = mq_fused_decode_attention
         self._mask = (1 << self._mse_bits) - 1
         self._correction = math.sqrt(math.pi / 2) / head_size
         self._is_rq = kv_cache_dtype.startswith("rq")
@@ -207,8 +218,18 @@ class MultiQuantImpl:
     @torch.compiler.disable
     @torch.no_grad()
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        """Pack K+V into compressed uint8 cache."""
+        """Pack K+V into compressed uint8 cache.
+
+        During CUDA Graph capture, this is a no-op — the actual packing
+        happens at replay time with real data. The capture just sees
+        the tensor shapes.
+        """
         if self.kv_sharing_target_layer_name is not None:
+            return
+
+        # Skip during CUDA Graph capture — pack_vectors_batched has Python
+        # loops that are not capture-safe. The real update happens on replay.
+        if torch.cuda.is_current_stream_capturing():
             return
 
         D = self.head_size
@@ -236,14 +257,13 @@ class MultiQuantImpl:
         kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed[valid]
         kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed[valid]
 
-    @torch.compiler.disable
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        """Decode: compressed attention. Prefill: naive causal."""
+        """Dispatch to decode (graph-safe) or prefill (compiler-disabled)."""
         D = self.head_size
         N = query.shape[0]
 
-        # vLLM passes 3D tensors [N, heads, D] — flatten to 2D for our logic
+        # vLLM passes 3D tensors [N, heads, D] — flatten to 2D
         if query.dim() == 3:
             query = query.reshape(N, -1)
         if key is not None and key.dim() == 3:
@@ -255,8 +275,6 @@ class MultiQuantImpl:
         if output is not None and output.dim() == 3:
             output_3d = True
             out_shape = output.shape
-            # Use view (not reshape) to keep same storage — in-place writes
-            # propagate back to the caller's tensor.
             output = output.view(N, -1)
         elif output is None:
             output = torch.empty(N, self.num_heads * D,
@@ -274,65 +292,62 @@ class MultiQuantImpl:
         num_prefill = attn_metadata.num_prefill_tokens
         num_decode = attn_metadata.num_decode_tokens
 
-        # --- Prefill: naive causal on raw K/V ---
         if num_prefill > 0:
-            # Slice to actual prefill tokens (tensors may be padded for
-            # CUDA graph capture sizes, but metadata has the real count)
-            L = num_prefill
-            pq = query[num_decode:num_decode + L].reshape(L, self.num_heads, D)
-            pk = key[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
-            pv = value[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
+            self._forward_prefill(
+                query, key, value, output, Pi, S, centroids,
+                num_decode, num_prefill, D, device,
+            )
 
-            if self.num_kv_groups > 1:
-                pk = pk.repeat_interleave(self.num_kv_groups, dim=1)
-                pv = pv.repeat_interleave(self.num_kv_groups, dim=1)
-            scores = torch.bmm(
-                pq.transpose(0, 1).float(),
-                pk.transpose(0, 1).float().transpose(-2, -1)
-            ) * self.scale
-            causal_mask = torch.triu(
-                torch.full((L, L), float('-inf'), device=device), diagonal=1)
-            scores = scores + causal_mask.unsqueeze(0)
-            weights = F.softmax(scores, dim=-1)
-            prefill_out = torch.bmm(weights, pv.transpose(0, 1).float())
-            output[num_decode:num_decode + L] = prefill_out.transpose(0, 1).reshape(
-                L, -1).to(output.dtype)
-
-        # --- Decode: fused Triton kernel (TQ) or Python fallback (RQ) ---
         if num_decode > 0:
-            dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
-            seq_lens = attn_metadata.seq_lens[:num_decode]
-            block_table = attn_metadata.block_table[:num_decode]
-
-            if not self._is_rq:
-                # Fused TQ decode: 1 Triton + 4 cuBLAS = 5 launches total
-                # No Python loops, CUDA Graph compatible.
-                from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    mq_fused_decode_attention,
-                )
-                decode_out = mq_fused_decode_attention(
-                    q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
-                    centroids=centroids,
-                    block_table=block_table,
-                    seq_lens=seq_lens,
-                    scale=self.scale, block_size=block_size,
-                    num_kv_heads=self.num_kv_heads,
-                    mse_bits=self._mse_bits,
-                    correction=self._correction,
-                )
-                output[:num_decode] = decode_out.reshape(
-                    num_decode, -1
-                ).to(output.dtype)
-            else:
-                # RQ fallback: Python loop (Clifford rotation not fusible)
-                self._decode_python_loop(
-                    dq, kv_cache, Pi, S, centroids, seq_lens,
-                    block_table, block_size, D, device, output,
-                )
+            self._forward_decode(
+                query, output, kv_cache, Pi, S, centroids,
+                attn_metadata, num_decode, block_size, D, device,
+            )
 
         if output_3d:
             return output.view(out_shape)
         return output
+
+    @torch.compiler.disable
+    def _forward_prefill(self, query, key, value, output, Pi, S, centroids,
+                         num_decode, num_prefill, D, device):
+        """Prefill: naive causal bmm. Not graph-captured."""
+        L = num_prefill
+        pq = query[num_decode:num_decode + L].reshape(L, self.num_heads, D)
+        pk = key[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
+        pv = value[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
+
+        if self.num_kv_groups > 1:
+            pk = pk.repeat_interleave(self.num_kv_groups, dim=1)
+            pv = pv.repeat_interleave(self.num_kv_groups, dim=1)
+
+        scores = torch.bmm(
+            pq.transpose(0, 1).float(),
+            pk.transpose(0, 1).float().transpose(-2, -1)
+        ) * self.scale
+        causal_mask = torch.triu(
+            torch.full((L, L), float('-inf'), device=device), diagonal=1)
+        scores = scores + causal_mask.unsqueeze(0)
+        weights = F.softmax(scores, dim=-1)
+        prefill_out = torch.bmm(weights, pv.transpose(0, 1).float())
+        output[num_decode:num_decode + L] = prefill_out.transpose(0, 1).reshape(
+            L, -1).to(output.dtype)
+
+    def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
+                        attn_metadata, num_decode, block_size, D, device):
+        """Decode: CUDA fused kernel. Linear CUDA-only path, graph-safe."""
+        dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
+        decode_out = self._decode_fn(
+            q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
+            centroids=centroids,
+            block_table=attn_metadata.block_table[:num_decode],
+            seq_lens=attn_metadata.seq_lens[:num_decode],
+            scale=self.scale, block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            mse_bits=self._mse_bits,
+            correction=self._correction,
+        )
+        output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
 
     # --- Helpers ---
 

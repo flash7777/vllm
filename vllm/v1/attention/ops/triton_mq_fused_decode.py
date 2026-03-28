@@ -536,7 +536,7 @@ def mq_fused_decode_attention(
             kernel.tq_fused_decode_attention(
                 q_rot_3d.contiguous(),
                 q_proj_3d.contiguous(),
-                kv_cache.contiguous(),
+                kv_cache,
                 centroids.contiguous(),
                 block_table.int().contiguous(),
                 seq_lens.int().contiguous(),
@@ -546,10 +546,13 @@ def mq_fused_decode_attention(
                 s_block, s_kv, s_slot, s_head,
             )
             cuda_ok = True
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger("vllm").warning("CUDA fused decode failed: %s", e)
 
     if not cuda_ok:
+        # WARNING: Triton fallback invalidates CUDA Graphs!
+        # Only safe outside graph capture.
         # Triton fallback (slower, not CUDA Graph safe)
         packed_size = kv_cache.shape[-1]
         mse_bytes = (D * mse_bits + 7) // 8
