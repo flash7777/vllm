@@ -24,6 +24,8 @@ PORT=8011
 SERVED_NAME="glm-4.7-flash"
 REASONING_PARSER="glm45"
 TOOL_PARSER="glm47"
+MAX_MODEL_LEN=100000
+KV_CACHE_MEM=""
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
 EXTRA_ARGS=()
@@ -37,9 +39,11 @@ while [[ $# -gt 0 ]]; do
         --tp)       TP="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
         --riy)      RIY_PROFILE="$2"; shift 2 ;;
-        --served-model-name)  SERVED_NAME="$2"; shift 2 ;;
-        --reasoning-parser)  REASONING_PARSER="$2"; shift 2 ;;
-        --tool-call-parser)  TOOL_PARSER="$2"; shift 2 ;;
+        --served-model-name)    SERVED_NAME="$2"; shift 2 ;;
+        --reasoning-parser)    REASONING_PARSER="$2"; shift 2 ;;
+        --tool-call-parser)    TOOL_PARSER="$2"; shift 2 ;;
+        --max-model-len)       MAX_MODEL_LEN="$2"; shift 2 ;;
+        --kv-cache-memory-bytes) KV_CACHE_MEM="$2"; shift 2 ;;
         --port)     PORT="$2"; shift 2 ;;
         --image)    IMAGE="$2"; shift 2 ;;
         --name)     CONTAINER_NAME="$2"; shift 2 ;;
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
+            echo "  --max-model-len N          Max Kontext-Länge (default: 100000)"
+            echo "  --kv-cache-memory-bytes N  KV-Cache Speicher, z.B. 10G (default: auto)"
             echo "  --served-model-name NAME   API Model-Name (default: glm-4.7-flash)"
             echo "  --reasoning-parser PARSER  Reasoning Parser (default: glm45)"
             echo "  --tool-call-parser PARSER  Tool-Call Parser (default: glm47)"
@@ -119,6 +125,11 @@ if [[ -n "$RIY_PROFILE" ]]; then
     RIY_LABEL=$(basename "$RIY_PROFILE")
 fi
 
+# ── KV Cache Memory ──────────────────────────────────────
+if [[ -n "$KV_CACHE_MEM" ]]; then
+    EXTRA_ARGS+=("--kv-cache-memory-bytes" "$KV_CACHE_MEM")
+fi
+
 # ── Banner ────────────────────────────────────────────────
 printf "╔══════════════════════════════════════════════════════╗\n"
 printf "║  MultiQuant Serve                                    ║\n"
@@ -178,7 +189,7 @@ podman run -d \
     --served-model-name "$SERVED_NAME" \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 100000 \
+    --max-model-len "$MAX_MODEL_LEN" \
     --kv-cache-dtype "$KV_DTYPE" \
     --tool-call-parser "$TOOL_PARSER" \
     --reasoning-parser "$REASONING_PARSER" \
