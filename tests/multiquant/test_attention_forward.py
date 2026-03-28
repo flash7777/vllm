@@ -236,9 +236,7 @@ class TestPrefillForward:
 class TestDecodeForward:
     """Decode: block_table → gather → unpack → score → softmax → output."""
 
-    @pytest.mark.parametrize("dtype", ["tq3", "rq3", "tq4", "rq4",
-                                       pytest.param("rq2", marks=pytest.mark.xfail(
-                                           reason="RQ2 1-bit MSE: CUDA unpack only supports 2/3 bit"))])
+    @pytest.mark.parametrize("dtype", ["tq3", "rq3", "tq4", "rq4", "rq2"])
     def test_single_token_decode(self, dtype):
         """Single decode token — the bread-and-butter of serving."""
         D = 128

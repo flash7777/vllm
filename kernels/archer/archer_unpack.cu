@@ -76,7 +76,15 @@ void archer_unpack(
     int num_rows = packed.size(0);
     int packed_size = packed.size(1);
 
-    if (mse_bits == 2) {
+    if (mse_bits == 1) {
+        archer_unpack_kernel<1><<<num_rows, BLOCK_SIZE>>>(
+            packed.data_ptr<uint8_t>(),
+            indices.data_ptr<int32_t>(),
+            signs.data_ptr<float>(),
+            row_norms.data_ptr<float>(),
+            res_norms.data_ptr<float>(),
+            num_rows, packed_size, head_size);
+    } else if (mse_bits == 2) {
         archer_unpack_kernel<2><<<num_rows, BLOCK_SIZE>>>(
             packed.data_ptr<uint8_t>(),
             indices.data_ptr<int32_t>(),

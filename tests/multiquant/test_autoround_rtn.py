@@ -88,5 +88,121 @@ class TestAutoRoundRTNMethod:
         assert method.uses_meta_device is False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestAutoRoundRTNPackDecompress:
+    """Full pack → decompress → F.linear pipeline on GPU."""
+
+    def test_int4_pack_decompress_roundtrip(self):
+        """Pack to INT4, decompress, verify quality."""
+        from vllm.multiquant.autoround.online_linear import (
+            AutoRoundRTNLinearMethod,
+        )
+        from vllm.multiquant.autoround.config import AutoRoundRTNConfig
+
+        cfg = AutoRoundRTNConfig(bits=4, group_size=128)
+        method = AutoRoundRTNLinearMethod(cfg)
+
+        torch.manual_seed(42)
+        layer = torch.nn.Module()
+        W = torch.randn(256, 128, device="cuda")
+        layer.weight = torch.nn.Parameter(W.clone(), requires_grad=False)
+
+        method.process_weights_after_loading(layer)
+
+        assert layer._rtn_packed is True
+        assert layer.weight.dtype == torch.int32
+        assert hasattr(layer, "_rtn_scales")
+
+        # Decompress
+        W_d = method._decompress(layer)
+        assert W_d.shape == (256, 128)
+        cos = torch.nn.functional.cosine_similarity(
+            W, W_d.float(), dim=-1
+        ).mean()
+        assert cos > 0.95, f"INT4 RTN quality too low: {cos:.4f}"
+
+    def test_int4_linear_inference(self):
+        """Full inference: pack weights, run F.linear, check output."""
+        from vllm.multiquant.autoround.online_linear import (
+            AutoRoundRTNLinearMethod,
+        )
+        from vllm.multiquant.autoround.config import AutoRoundRTNConfig
+
+        cfg = AutoRoundRTNConfig(bits=4, group_size=128)
+        method = AutoRoundRTNLinearMethod(cfg)
+
+        torch.manual_seed(42)
+        layer = torch.nn.Module()
+        W = torch.randn(64, 128, device="cuda")
+        layer.weight = torch.nn.Parameter(W.clone(), requires_grad=False)
+
+        # Quantize
+        method.process_weights_after_loading(layer)
+
+        # Inference
+        x = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
+        y_quant = method.apply(layer, x)
+
+        # Reference
+        y_ref = torch.nn.functional.linear(x, W.bfloat16())
+
+        assert y_quant.shape == (4, 64)
+        assert not y_quant.isnan().any()
+        cos = torch.nn.functional.cosine_similarity(
+            y_quant.float(), y_ref.float(), dim=-1
+        ).mean()
+        assert cos > 0.95, f"INT4 linear output quality: {cos:.4f}"
+
+    def test_memory_reduction(self):
+        """Packed INT4 should use ~12.5% of BF16 memory."""
+        from vllm.multiquant.autoround.online_linear import (
+            AutoRoundRTNLinearMethod,
+        )
+        from vllm.multiquant.autoround.config import AutoRoundRTNConfig
+
+        cfg = AutoRoundRTNConfig(bits=4, group_size=128)
+        method = AutoRoundRTNLinearMethod(cfg)
+
+        layer = torch.nn.Module()
+        W = torch.randn(1024, 1024, device="cuda")
+        layer.weight = torch.nn.Parameter(W.clone(), requires_grad=False)
+        bf16_bytes = 1024 * 1024 * 2
+
+        method.process_weights_after_loading(layer)
+
+        packed_bytes = layer.weight.numel() * layer.weight.element_size()
+        ratio = packed_bytes / bf16_bytes
+        # INT4 packed in int32: 1024 * (1024/8) * 4 = 512KB vs 2MB = 25%
+        # (int32 packing is less efficient than uint8)
+        assert ratio < 0.30, f"Packed {ratio:.1%} of BF16 — expected <30%"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestAutoRoundRTNGroupSizes:
+    """Test different group sizes."""
+
+    @pytest.mark.parametrize("group_size", [32, 64, 128, -1])
+    def test_group_size(self, group_size):
+        from vllm.multiquant.autoround.online_linear import (
+            AutoRoundRTNLinearMethod,
+        )
+        from vllm.multiquant.autoround.config import AutoRoundRTNConfig
+
+        cfg = AutoRoundRTNConfig(bits=4, group_size=group_size)
+        method = AutoRoundRTNLinearMethod(cfg)
+
+        torch.manual_seed(42)
+        layer = torch.nn.Module()
+        W = torch.randn(64, 256, device="cuda")
+        layer.weight = torch.nn.Parameter(W.clone(), requires_grad=False)
+
+        method.process_weights_after_loading(layer)
+        W_d = method._decompress(layer)
+        cos = torch.nn.functional.cosine_similarity(
+            W, W_d.float(), dim=-1
+        ).mean()
+        assert cos > 0.90, f"group_size={group_size}: cos={cos:.4f}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
