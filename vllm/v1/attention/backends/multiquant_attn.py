@@ -170,6 +170,39 @@ class MultiQuantImpl:
         self._qjl_bytes = (head_size + 7) // 8
         self._mask = (1 << self._mse_bits) - 1
         self._correction = math.sqrt(math.pi / 2) / head_size
+        self._is_rq = kv_cache_dtype.startswith("rq")
+
+    def _rotate_forward(self, x, Pi):
+        """Forward rotation: TQ = x @ Pi.T, RQ = rotor sandwich."""
+        if self._is_rq:
+            from vllm.multiquant.rotorquant.clifford import (
+                embed_vectors_as_multivectors, rotor_sandwich,
+                extract_vectors_from_multivectors,
+            )
+            D = x.shape[-1]
+            mv = embed_vectors_as_multivectors(x)
+            mv_rot = rotor_sandwich(Pi, mv)
+            # Extract all coords for quantization
+            coords = []
+            for gi in [1, 2, 3, 7]:
+                coords.append(mv_rot[..., gi])
+            return torch.cat([c.reshape(*x.shape[:-1], -1) for c in coords],
+                             dim=-1)[..., :D]
+        return x @ Pi.T
+
+    def _rotate_inverse(self, x, Pi):
+        """Inverse rotation: TQ = x @ Pi, RQ = reverse rotor sandwich."""
+        if self._is_rq:
+            from vllm.multiquant.rotorquant.clifford import (
+                embed_vectors_as_multivectors, rotor_sandwich,
+                extract_vectors_from_multivectors, reverse,
+            )
+            D = x.shape[-1]
+            mv = embed_vectors_as_multivectors(x)
+            rotor_rev = reverse(Pi)
+            mv_recon = rotor_sandwich(rotor_rev, mv)
+            return extract_vectors_from_multivectors(mv_recon, D)
+        return x @ Pi
 
     @torch.compiler.disable
     @torch.no_grad()
@@ -318,7 +351,7 @@ class MultiQuantImpl:
                     # For each Q head that maps to this KV head
                     for h in range(kv_h * self.num_kv_groups,
                                    (kv_h + 1) * self.num_kv_groups):
-                        q_rot_h = dq[qi, h].float() @ Pi.T  # (D,)
+                        q_rot_h = self._rotate_forward(dq[qi, h].float().unsqueeze(0), Pi).squeeze(0)
                         q_proj_h = dq[qi, h].float() @ S.T
 
                         # Term 1: (sl,) = sum over D of q_rot * centroids[idx]
@@ -351,7 +384,7 @@ class MultiQuantImpl:
                         v_vn = v_vn_bytes.view(torch.float16).float().squeeze(-1)
                         v_rn = v_rn_bytes.view(torch.float16).float().squeeze(-1)
                         v_c = centroids[v_idx]
-                        v_xm = v_c @ Pi  # (sl, D)
+                        v_xm = self._rotate_inverse(v_c, Pi)  # (sl, D)
                         v_xq = self._correction * v_rn.unsqueeze(-1) * (v_signs @ S)
                         v_recon = v_vn.unsqueeze(-1) * (v_xm + v_xq)  # (sl, D)
 
@@ -375,9 +408,10 @@ class MultiQuantImpl:
 
     def _pack(self, vec, Pi, S, centroids, D):
         x = vec.float(); vn = x.norm(); xh = x / (vn + 1e-8)
-        rot = xh @ Pi.T
+        rot = self._rotate_forward(xh.unsqueeze(0), Pi).squeeze(0)
         idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1).to(torch.uint8)
-        xm = centroids[idx.long()] @ Pi; r = xh - xm; rn = r.norm()
+        xm = self._rotate_inverse(centroids[idx.long()].unsqueeze(0), Pi).squeeze(0)
+        r = xh - xm; rn = r.norm()
         signs = (r @ S.T >= 0).to(torch.uint8)
 
         packed = torch.zeros(self._packed_size, dtype=torch.uint8, device=vec.device)
