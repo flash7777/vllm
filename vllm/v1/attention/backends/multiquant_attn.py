@@ -106,6 +106,11 @@ class MultiQuantAttentionBackend(AttentionBackend):
 # ============================================================
 
 class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
+    # CUDA Graph capture with Triton JIT kernels causes
+    # StreamCaptureInvalidated. PIECEWISE mode is handled by vLLM —
+    # attention is called outside the graph, rest is graphed.
+    from vllm.v1.attention.backend import AttentionCGSupport
+    _cudagraph_support = AttentionCGSupport.NEVER
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
