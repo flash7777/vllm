@@ -316,38 +316,49 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
         N = flat_packed.shape[0]
 
         if N > 0:
-            # Unpack MSE indices
-            idx_all = torch.zeros(N, head_size, dtype=torch.long,
-                                  device=device)
-            for b in range(mse_bytes):
-                bv = flat_packed[:, b].long()
-                for k in range(coords_per_byte):
-                    j = b * coords_per_byte + k
-                    if j >= head_size:
-                        break
-                    idx_all[:, j] = (bv >> (k * mse_bits)) & mask
+            # CUDA unpack kernel — same as Archer, shared code
+            unpack_ok = False
+            try:
+                from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+                result = cuda_unpack(flat_packed, head_size, mse_bits)
+                if result is not None:
+                    idx_all, signs_all, vn, rn = result
+                    idx_all = idx_all.long()
+                    unpack_ok = True
+            except Exception:
+                pass
 
-            # Unpack signs
-            signs_all = torch.zeros(N, head_size, dtype=torch.float32,
-                                    device=device)
-            for b in range(qjl_bytes):
-                bv = flat_packed[:, mse_bytes + b].long()
-                for k in range(8):
-                    j = b * 8 + k
-                    if j >= head_size:
-                        break
-                    signs_all[:, j] = torch.where(
-                        ((bv >> k) & 1).bool(),
-                        torch.ones(N, device=device),
-                        -torch.ones(N, device=device),
-                    )
+            if not unpack_ok:
+                # Python fallback
+                idx_all = torch.zeros(N, head_size, dtype=torch.long,
+                                      device=device)
+                for b in range(mse_bytes):
+                    bv = flat_packed[:, b].long()
+                    for k in range(coords_per_byte):
+                        j = b * coords_per_byte + k
+                        if j >= head_size:
+                            break
+                        idx_all[:, j] = (bv >> (k * mse_bits)) & mask
 
-            # Unpack norms
-            no = mse_bytes + qjl_bytes
-            vn = flat_packed[:, no:no + 2].contiguous().view(
-                torch.float16).float().squeeze(-1)
-            rn = flat_packed[:, no + 2:no + 4].contiguous().view(
-                torch.float16).float().squeeze(-1)
+                signs_all = torch.zeros(N, head_size, dtype=torch.float32,
+                                        device=device)
+                for b in range(qjl_bytes):
+                    bv = flat_packed[:, mse_bytes + b].long()
+                    for k in range(8):
+                        j = b * 8 + k
+                        if j >= head_size:
+                            break
+                        signs_all[:, j] = torch.where(
+                            ((bv >> k) & 1).bool(),
+                            torch.ones(N, device=device),
+                            -torch.ones(N, device=device),
+                        )
+
+                no = mse_bytes + qjl_bytes
+                vn = flat_packed[:, no:no + 2].contiguous().view(
+                    torch.float16).float().squeeze(-1)
+                rn = flat_packed[:, no + 2:no + 4].contiguous().view(
+                    torch.float16).float().squeeze(-1)
 
             # Reconstruct: inverse rotation + QJL correction
             c_vals = centroids[idx_all]
