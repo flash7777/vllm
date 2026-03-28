@@ -1,0 +1,527 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Fused MultiQuant Decode Kernel — single Triton launch for full decode.
+
+Replaces the Python loop in MultiQuantImpl.forward() with a single kernel
+that does: K-unpack → Score → Online Softmax → V-unpack → V-accumulate.
+
+Key insight (Post-Loop GEMV): the D×D inverse rotation is moved OUTSIDE the
+token loop. Inside the kernel we accumulate centroid values and signs in
+rotated space. After the kernel, two batched GEMVs reconstruct the output:
+    output = centroid_acc @ Pi + correction * sign_acc @ S
+
+Total kernel launches: 5 (constant, independent of batch/heads/seq_len):
+    1. Q @ Pi.T  (pre-rotate query)
+    2. Q @ S.T   (pre-project query)
+    3. Triton fused decode (this kernel)
+    4. centroid_acc @ Pi  (V reconstruction)
+    5. sign_acc @ S       (QJL correction)
+
+TQ only (TQ3/TQ4). RQ keeps Python fallback.
+"""
+
+import math
+
+import torch
+
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _mq_fused_decode_kernel(
+    # Pre-computed query projections [B*Hq, D]
+    q_rot_ptr,
+    q_proj_ptr,
+    # KV cache [num_blocks, 2, block_size, num_kv_heads, packed_size] uint8
+    kv_cache_ptr,
+    # Centroids [n_centroids] float32
+    centroids_ptr,
+    # Block table [B, max_blocks] int32
+    block_table_ptr,
+    # Sequence lengths [B] int32
+    seq_lens_ptr,
+    # Outputs [B, Hq, D] float32
+    centroid_acc_ptr,
+    sign_acc_ptr,
+    # Strides for kv_cache: [s_block, s_kv, s_bslot, s_head, s_pack]
+    s_cache_block: tl.constexpr,   # stride for block dimension
+    s_cache_kv: tl.constexpr,      # stride for K/V dimension (=1 means K=0,V=1)
+    s_cache_slot: tl.constexpr,    # stride for slot within block
+    s_cache_head: tl.constexpr,    # stride for kv_head
+    # Strides for block_table
+    s_bt_batch: tl.constexpr,      # stride for batch dim in block_table
+    # Dims
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,   # Hq // Hkv
+    PACKED_SIZE: tl.constexpr,
+    MSE_BITS: tl.constexpr,
+    MSE_BYTES: tl.constexpr,
+    QJL_BYTES: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    # Constants
+    correction_scale,              # sqrt(pi/2) / D
+    attn_scale,                    # 1/sqrt(D)
+):
+    """One program per (batch, q_head). Processes all tokens sequentially."""
+    batch_idx = tl.program_id(0)
+    q_head_idx = tl.program_id(1)
+    kv_head_idx = q_head_idx // KV_GROUP_SIZE
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if seq_len <= 0:
+        return
+
+    # Load pre-rotated/projected query vectors [D]
+    d_offs = tl.arange(0, HEAD_DIM)
+    q_base = (batch_idx * tl.num_programs(1) + q_head_idx) * HEAD_DIM
+    q_rot = tl.load(q_rot_ptr + q_base + d_offs)     # [D]
+    q_proj = tl.load(q_proj_ptr + q_base + d_offs)   # [D]
+
+    # Load centroids
+    c_offs = tl.arange(0, N_CENTROIDS)
+    centroids = tl.load(centroids_ptr + c_offs)       # [n_centroids]
+
+    # Online softmax state
+    m_prev = float("-inf")
+    l_prev = 0.0
+
+    # V accumulators [D] — in rotated space (no Pi/S needed)
+    centroid_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    sign_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+
+    # Process all cached tokens
+    for pos in range(0, seq_len):
+        # Block table gather: logical → physical block
+        block_logical = pos // BLOCK_SIZE
+        slot_in_block = pos % BLOCK_SIZE
+        phys_block = tl.load(
+            block_table_ptr + batch_idx * s_bt_batch + block_logical
+        ).to(tl.int32)
+
+        # ── K: Unpack + Score ───────────────────────────────────
+        k_base = (
+            phys_block * s_cache_block
+            + 0 * s_cache_kv           # K is index 0
+            + slot_in_block * s_cache_slot
+            + kv_head_idx * s_cache_head
+        )
+
+        # Unpack MSE indices → dot(q_rot, centroids[idx])
+        term1 = tl.zeros([], dtype=tl.float32)
+        if MSE_BITS == 2:
+            for b in tl.static_range(MSE_BYTES):
+                byte_val = tl.load(kv_cache_ptr + k_base + b).to(tl.int32)
+                for k in tl.static_range(4):
+                    j = b * 4 + k
+                    if j < HEAD_DIM:
+                        idx_j = (byte_val >> (k * 2)) & 0x3
+                        c_val = tl.sum(tl.where(c_offs == idx_j, centroids, 0.0))
+                        q_r_j = tl.sum(tl.where(d_offs == j, q_rot, 0.0))
+                        term1 += q_r_j * c_val
+        elif MSE_BITS == 3:
+            for j in tl.static_range(HEAD_DIM):
+                bit_off = j * 3
+                byte_idx = bit_off // 8
+                bit_idx = bit_off % 8
+                b0 = tl.load(kv_cache_ptr + k_base + byte_idx).to(tl.int32)
+                idx_j = (b0 >> bit_idx) & 0x7
+                if bit_idx > 5 and byte_idx + 1 < MSE_BYTES:
+                    b1 = tl.load(
+                        kv_cache_ptr + k_base + byte_idx + 1
+                    ).to(tl.int32)
+                    idx_j = idx_j | ((b1 << (8 - bit_idx)) & 0x7)
+                c_val = tl.sum(tl.where(c_offs == (idx_j & 0x7), centroids, 0.0))
+                q_r_j = tl.sum(tl.where(d_offs == j, q_rot, 0.0))
+                term1 += q_r_j * c_val
+
+        # Unpack QJL signs → dot(q_proj, signs)
+        term2 = tl.zeros([], dtype=tl.float32)
+        sign_base_k = k_base + MSE_BYTES
+        for b in tl.static_range(QJL_BYTES):
+            byte_val = tl.load(kv_cache_ptr + sign_base_k + b).to(tl.int32)
+            for k in tl.static_range(8):
+                j = b * 8 + k
+                if j < HEAD_DIM:
+                    sign_bit = (byte_val >> k) & 1
+                    sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                    q_p_j = tl.sum(tl.where(d_offs == j, q_proj, 0.0))
+                    term2 += q_p_j * sign_val
+
+        # Load K norms (float16 packed as 2 uint8 each)
+        k_norm_base = k_base + MSE_BYTES + QJL_BYTES
+        vn_lo = tl.load(kv_cache_ptr + k_norm_base).to(tl.uint16)
+        vn_hi = tl.load(kv_cache_ptr + k_norm_base + 1).to(tl.uint16)
+        vn_u16 = vn_lo | (vn_hi << 8)
+        k_vn = vn_u16.to(tl.float16, bitcast=True).to(tl.float32)
+
+        rn_lo = tl.load(kv_cache_ptr + k_norm_base + 2).to(tl.uint16)
+        rn_hi = tl.load(kv_cache_ptr + k_norm_base + 3).to(tl.uint16)
+        rn_u16 = rn_lo | (rn_hi << 8)
+        k_rn = rn_u16.to(tl.float16, bitcast=True).to(tl.float32)
+
+        # Score
+        score = k_vn * (term1 + correction_scale * k_rn * term2) * attn_scale
+
+        # ── Online Softmax ──────────────────────────────────────
+        m_new = tl.maximum(m_prev, score)
+        exp_prev = tl.exp(m_prev - m_new)
+        exp_cur = tl.exp(score - m_new)
+        l_new = l_prev * exp_prev + exp_cur
+
+        # Rescale accumulators
+        centroid_acc = centroid_acc * exp_prev
+        sign_acc = sign_acc * exp_prev
+
+        # ── V: Unpack + Accumulate ──────────────────────────────
+        v_base = (
+            phys_block * s_cache_block
+            + 1 * s_cache_kv           # V is index 1
+            + slot_in_block * s_cache_slot
+            + kv_head_idx * s_cache_head
+        )
+
+        # Unpack V MSE indices → centroid gather [D]
+        if MSE_BITS == 2:
+            for b in tl.static_range(MSE_BYTES):
+                byte_val = tl.load(kv_cache_ptr + v_base + b).to(tl.int32)
+                for kk in tl.static_range(4):
+                    j = b * 4 + kk
+                    if j < HEAD_DIM:
+                        v_idx_j = (byte_val >> (kk * 2)) & 0x3
+                        v_c_val = tl.sum(
+                            tl.where(c_offs == v_idx_j, centroids, 0.0)
+                        )
+                        # Accumulate: centroid_acc[j] += w * v_vn * c_val
+                        # Use masked update
+                        mask_j = (d_offs == j)
+                        # Load v_vn once (will be loaded below for full code)
+                        # For now, accumulate centroid value per dim
+                        centroid_acc = tl.where(
+                            mask_j,
+                            centroid_acc + v_c_val,  # placeholder, scaled below
+                            centroid_acc,
+                        )
+        # NOTE: This per-element approach via tl.where is correct but slow for
+        # large HEAD_DIM. It will be optimized in a future iteration with
+        # vectorized loads. For correctness-first, this pattern matches the
+        # existing triton_tq_attention_score.py approach.
+
+        # Actually, let's do the full V unpack + accumulate properly.
+        # We need v_vn and v_rn first, then scale.
+        # Reset centroid_acc update — do it properly below.
+
+        # The above partial update was incorrect. Let me restructure:
+        # Load V norms first, then unpack indices and signs together.
+        pass  # Restructure below
+
+    # Placeholder — kernel needs restructuring for V path
+    # Store results
+    out_base = (batch_idx * tl.num_programs(1) + q_head_idx) * HEAD_DIM
+    tl.store(centroid_acc_ptr + out_base + d_offs, centroid_acc)
+    tl.store(sign_acc_ptr + out_base + d_offs, sign_acc)
+
+
+# ============================================================
+# The above kernel sketch has a structural problem: Triton's
+# tl.where per-element approach for V accumulation is too slow
+# for D=128. We need a different strategy.
+#
+# REVISED APPROACH: Scalar score loop + vectorized V accumulate
+# using explicit per-dimension arrays built from byte loads.
+# ============================================================
+
+@triton.jit
+def _mq_fused_decode_kernel_v2(
+    # Pre-computed query projections [B*Hq, D]
+    q_rot_ptr,
+    q_proj_ptr,
+    # KV cache — flat uint8 pointer
+    kv_cache_ptr,
+    # Centroids [n_centroids] float32
+    centroids_ptr,
+    # Block table [B, max_blocks] int32
+    block_table_ptr,
+    # Sequence lengths [B] int32
+    seq_lens_ptr,
+    # Outputs [B*Hq, D] float32
+    centroid_acc_ptr,
+    sign_acc_ptr,
+    # KV cache strides (in bytes, since uint8)
+    stride_cache_block,   # num_blocks dim
+    stride_cache_kv,      # K/V dim (2)
+    stride_cache_slot,    # block_size dim
+    stride_cache_head,    # num_kv_heads dim
+    # Block table stride
+    stride_bt_batch,
+    # Scalar params
+    num_q_heads: tl.constexpr,
+    # Dims
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    PACKED_SIZE: tl.constexpr,
+    MSE_BITS: tl.constexpr,
+    MSE_BYTES: tl.constexpr,
+    QJL_BYTES: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+    # Constants
+    correction_scale,
+    attn_scale,
+):
+    """Fused MQ decode: score K + softmax + accumulate V centroids/signs.
+
+    Grid: (B, Hq). One program per (batch, query_head).
+    Each program iterates over all seq_len tokens sequentially.
+    """
+    batch_idx = tl.program_id(0)
+    q_head_idx = tl.program_id(1)
+    kv_head_idx = q_head_idx // KV_GROUP_SIZE
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if seq_len <= 0:
+        return
+
+    # Load query vectors
+    d_offs = tl.arange(0, HEAD_DIM)
+    q_base = (batch_idx * num_q_heads + q_head_idx) * HEAD_DIM
+    q_rot = tl.load(q_rot_ptr + q_base + d_offs)
+    q_proj = tl.load(q_proj_ptr + q_base + d_offs)
+
+    # Load centroids to registers
+    c_offs = tl.arange(0, N_CENTROIDS)
+    centroids = tl.load(centroids_ptr + c_offs)
+
+    # Online softmax state
+    m_prev = float("-inf")
+    l_prev = 0.0
+
+    # V accumulators [D]
+    v_cent_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    v_sign_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+
+    for pos in range(0, seq_len):
+        block_log = pos // BLOCK_SIZE
+        slot = pos % BLOCK_SIZE
+        phys_block = tl.load(
+            block_table_ptr + batch_idx * stride_bt_batch + block_log
+        ).to(tl.int32)
+
+        base_k = (
+            phys_block * stride_cache_block
+            + 0 * stride_cache_kv
+            + slot * stride_cache_slot
+            + kv_head_idx * stride_cache_head
+        )
+
+        # ── K Score (scalar) ────────────────────────────────
+        # Load packed bytes and compute score serially
+        # For 2-bit: 4 indices per byte, MSE_BYTES bytes total
+        term1 = tl.zeros([], dtype=tl.float32)
+        term2 = tl.zeros([], dtype=tl.float32)
+
+        if MSE_BITS == 2:
+            for b in tl.static_range(MSE_BYTES):
+                bv = tl.load(kv_cache_ptr + base_k + b).to(tl.int32)
+                for ki in tl.static_range(4):
+                    j = b * 4 + ki
+                    if j < HEAD_DIM:
+                        idx = (bv >> (ki * 2)) & 0x3
+                        c_val = tl.sum(tl.where(c_offs == idx, centroids, 0.0))
+                        q_r = tl.sum(tl.where(d_offs == j, q_rot, 0.0))
+                        term1 += q_r * c_val
+        elif MSE_BITS == 3:
+            for j in tl.static_range(HEAD_DIM):
+                bo = j * 3
+                bi = bo // 8
+                bs = bo % 8
+                b0 = tl.load(kv_cache_ptr + base_k + bi).to(tl.int32)
+                idx = (b0 >> bs) & 0x7
+                if bs > 5 and bi + 1 < MSE_BYTES:
+                    b1 = tl.load(kv_cache_ptr + base_k + bi + 1).to(tl.int32)
+                    idx = idx | ((b1 << (8 - bs)) & 0x7)
+                c_val = tl.sum(tl.where(c_offs == (idx & 0x7), centroids, 0.0))
+                q_r = tl.sum(tl.where(d_offs == j, q_rot, 0.0))
+                term1 += q_r * c_val
+
+        # QJL signs for K
+        for b in tl.static_range(QJL_BYTES):
+            bv = tl.load(kv_cache_ptr + base_k + MSE_BYTES + b).to(tl.int32)
+            for ki in tl.static_range(8):
+                j = b * 8 + ki
+                if j < HEAD_DIM:
+                    sv = tl.where(((bv >> ki) & 1) == 1, 1.0, -1.0)
+                    q_p = tl.sum(tl.where(d_offs == j, q_proj, 0.0))
+                    term2 += q_p * sv
+
+        # K norms
+        k_no = base_k + MSE_BYTES + QJL_BYTES
+        vn_lo = tl.load(kv_cache_ptr + k_no).to(tl.uint16)
+        vn_hi = tl.load(kv_cache_ptr + k_no + 1).to(tl.uint16)
+        k_vn = (vn_lo | (vn_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        rn_lo = tl.load(kv_cache_ptr + k_no + 2).to(tl.uint16)
+        rn_hi = tl.load(kv_cache_ptr + k_no + 3).to(tl.uint16)
+        k_rn = (rn_lo | (rn_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+
+        score = k_vn * (term1 + correction_scale * k_rn * term2) * attn_scale
+
+        # ── Online Softmax ──────────────────────────────────
+        m_new = tl.maximum(m_prev, score)
+        rescale = tl.exp(m_prev - m_new)
+        w = tl.exp(score - m_new)
+        l_new = l_prev * rescale + w
+
+        v_cent_acc = v_cent_acc * rescale
+        v_sign_acc = v_sign_acc * rescale
+
+        # ── V: Unpack + Accumulate [D] ──────────────────────
+        base_v = (
+            phys_block * stride_cache_block
+            + 1 * stride_cache_kv          # V=1
+            + slot * stride_cache_slot
+            + kv_head_idx * stride_cache_head
+        )
+
+        # V norms
+        v_no = base_v + MSE_BYTES + QJL_BYTES
+        v_vn_lo = tl.load(kv_cache_ptr + v_no).to(tl.uint16)
+        v_vn_hi = tl.load(kv_cache_ptr + v_no + 1).to(tl.uint16)
+        v_vn = (v_vn_lo | (v_vn_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_rn_lo = tl.load(kv_cache_ptr + v_no + 2).to(tl.uint16)
+        v_rn_hi = tl.load(kv_cache_ptr + v_no + 3).to(tl.uint16)
+        v_rn = (v_rn_lo | (v_rn_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+
+        # V centroid values per dimension (same unpack as K but vectorized [D])
+        v_centroids_d = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        if MSE_BITS == 2:
+            for b in tl.static_range(MSE_BYTES):
+                bv = tl.load(kv_cache_ptr + base_v + b).to(tl.int32)
+                for ki in tl.static_range(4):
+                    j = b * 4 + ki
+                    if j < HEAD_DIM:
+                        idx = (bv >> (ki * 2)) & 0x3
+                        c_val = tl.sum(tl.where(c_offs == idx, centroids, 0.0))
+                        v_centroids_d = tl.where(
+                            d_offs == j, c_val, v_centroids_d
+                        )
+        elif MSE_BITS == 3:
+            for j in tl.static_range(HEAD_DIM):
+                bo_v = j * 3
+                bi_v = bo_v // 8
+                bs_v = bo_v % 8
+                b0 = tl.load(kv_cache_ptr + base_v + bi_v).to(tl.int32)
+                idx = (b0 >> bs_v) & 0x7
+                if bs_v > 5 and bi_v + 1 < MSE_BYTES:
+                    b1 = tl.load(kv_cache_ptr + base_v + bi_v + 1).to(tl.int32)
+                    idx = idx | ((b1 << (8 - bs_v)) & 0x7)
+                c_val = tl.sum(tl.where(c_offs == (idx & 0x7), centroids, 0.0))
+                v_centroids_d = tl.where(d_offs == j, c_val, v_centroids_d)
+
+        # V signs per dimension [D]
+        v_signs_d = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        for b in tl.static_range(QJL_BYTES):
+            bv = tl.load(kv_cache_ptr + base_v + MSE_BYTES + b).to(tl.int32)
+            for ki in tl.static_range(8):
+                j = b * 8 + ki
+                if j < HEAD_DIM:
+                    sv = tl.where(((bv >> ki) & 1) == 1, 1.0, -1.0)
+                    v_signs_d = tl.where(d_offs == j, sv, v_signs_d)
+
+        # Accumulate: weighted V components
+        v_cent_acc += w * v_vn * v_centroids_d
+        v_sign_acc += w * v_vn * v_rn * v_signs_d
+
+        m_prev = m_new
+        l_prev = l_new
+
+    # Normalize by softmax denominator
+    v_cent_acc = v_cent_acc / l_prev
+    v_sign_acc = v_sign_acc / l_prev
+
+    # Store
+    out_base = (batch_idx * num_q_heads + q_head_idx) * HEAD_DIM
+    tl.store(centroid_acc_ptr + out_base + d_offs, v_cent_acc)
+    tl.store(sign_acc_ptr + out_base + d_offs, v_sign_acc)
+
+
+# ============================================================
+# Python wrapper
+# ============================================================
+
+def mq_fused_decode_attention(
+    q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
+    kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
+    Pi: torch.Tensor,          # [D, D] float32 (TQ rotation matrix)
+    S: torch.Tensor,           # [D, D] float32 (QJL projection matrix)
+    centroids: torch.Tensor,   # [n_centroids] float32
+    block_table: torch.Tensor, # [B, max_blocks] int32
+    seq_lens: torch.Tensor,    # [B] int32
+    scale: float,              # 1/sqrt(D)
+    block_size: int,
+    num_kv_heads: int,
+    mse_bits: int,
+    correction: float,         # sqrt(pi/2) / D
+) -> torch.Tensor:
+    """Fused TQ decode: 2 pre-GEMMs + 1 Triton + 2 post-GEMMs = 5 launches."""
+    B, Hq, D = q.shape
+    device = q.device
+
+    packed_size = kv_cache.shape[-1]
+    mse_bytes = (D * mse_bits + 7) // 8
+    qjl_bytes = (D + 7) // 8
+    n_centroids = centroids.shape[0]
+    kv_group_size = Hq // num_kv_heads
+
+    # 1. Pre-rotate + pre-project query (2 batched GEMMs via cuBLAS)
+    q_flat = q.reshape(B * Hq, D).float()
+    q_rot = q_flat @ Pi.T.contiguous()    # [B*Hq, D]
+    q_proj = q_flat @ S.T.contiguous()    # [B*Hq, D]
+
+    # 2. Allocate output accumulators
+    centroid_acc = torch.empty(B * Hq, D, device=device, dtype=torch.float32)
+    sign_acc = torch.empty(B * Hq, D, device=device, dtype=torch.float32)
+
+    # KV cache strides (in elements = bytes for uint8)
+    # Shape: (num_blocks, 2, block_size, num_kv_heads, packed_size)
+    s_block = kv_cache.stride(0)
+    s_kv = kv_cache.stride(1)
+    s_slot = kv_cache.stride(2)
+    s_head = kv_cache.stride(3)
+
+    # Block table stride
+    s_bt = block_table.stride(0)
+
+    # 3. Launch Triton kernel
+    grid = (B, Hq)
+    _mq_fused_decode_kernel_v2[grid](
+        q_rot, q_proj,
+        kv_cache,
+        centroids,
+        block_table, seq_lens,
+        centroid_acc, sign_acc,
+        # Cache strides
+        s_block, s_kv, s_slot, s_head,
+        # Block table stride
+        s_bt,
+        # Constexprs
+        num_q_heads=Hq,
+        HEAD_DIM=D,
+        BLOCK_SIZE=block_size,
+        KV_GROUP_SIZE=kv_group_size,
+        PACKED_SIZE=packed_size,
+        MSE_BITS=mse_bits,
+        MSE_BYTES=mse_bytes,
+        QJL_BYTES=qjl_bytes,
+        N_CENTROIDS=n_centroids,
+        # Scalars
+        correction_scale=correction,
+        attn_scale=scale,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    # 4. Post-loop V reconstruction (2 batched GEMMs via cuBLAS)
+    output = centroid_acc @ Pi + correction * (sign_acc @ S)
+
+    return output.reshape(B, Hq, D)

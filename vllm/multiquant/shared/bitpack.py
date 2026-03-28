@@ -44,17 +44,17 @@ def pack_vector(
     packed = torch.zeros(packed_size, dtype=torch.uint8, device=indices.device)
 
     mask = (1 << mse_bits) - 1
-    coords_per_byte = 8 // mse_bits
 
-    # Pack MSE indices
-    for b in range(mse_bytes):
-        val = 0
-        for k in range(coords_per_byte):
-            j = b * coords_per_byte + k
-            if j >= head_dim:
-                break
-            val |= (int(indices[j].item()) & mask) << (k * mse_bits)
-        packed[b] = val
+    # Pack MSE indices as bitstream (handles any mse_bits, including 3)
+    for j in range(head_dim):
+        bit_offset = j * mse_bits
+        byte_idx = bit_offset // 8
+        bit_shift = bit_offset % 8
+        val = int(indices[j].item()) & mask
+        packed[byte_idx] = int(packed[byte_idx].item()) | ((val << bit_shift) & 0xFF)
+        spill = bit_shift + mse_bits - 8
+        if spill > 0 and byte_idx + 1 < mse_bytes:
+            packed[byte_idx + 1] = int(packed[byte_idx + 1].item()) | (val >> (mse_bits - spill))
 
     # Pack QJL signs
     for b in range(qjl_bytes):
@@ -97,19 +97,20 @@ def unpack_vector(
     mse_bytes = math.ceil(head_dim * mse_bits / 8)
     qjl_bytes = math.ceil(head_dim / 8)
     mask = (1 << mse_bits) - 1
-    coords_per_byte = 8 // mse_bits
 
     device = packed.device
 
-    # Unpack MSE indices
+    # Unpack MSE indices from bitstream (handles any mse_bits)
     indices = torch.zeros(head_dim, dtype=torch.long, device=device)
-    for b in range(mse_bytes):
-        bv = packed[b].item()
-        for k in range(coords_per_byte):
-            j = b * coords_per_byte + k
-            if j >= head_dim:
-                break
-            indices[j] = (bv >> (k * mse_bits)) & mask
+    for j in range(head_dim):
+        bit_offset = j * mse_bits
+        byte_idx = bit_offset // 8
+        bit_shift = bit_offset % 8
+        val = packed[byte_idx].item() >> bit_shift
+        spill = bit_shift + mse_bits - 8
+        if spill > 0 and byte_idx + 1 < mse_bytes:
+            val |= packed[byte_idx + 1].item() << (mse_bits - spill)
+        indices[j] = val & mask
 
     mse_values = centroids.to(device)[indices]
 
@@ -159,17 +160,19 @@ def pack_vectors_batched(
 
     packed = torch.zeros(batch, packed_size, dtype=torch.uint8, device=device)
     mask = (1 << mse_bits) - 1
-    coords_per_byte = 8 // mse_bits
 
-    # Pack MSE indices (vectorized over batch)
-    for b in range(mse_bytes):
-        val = torch.zeros(batch, dtype=torch.uint8, device=device)
-        for k in range(coords_per_byte):
-            j = b * coords_per_byte + k
-            if j >= head_dim:
-                break
-            val = val | ((indices[:, j].byte() & mask) << (k * mse_bits))
-        packed[:, b] = val
+    # Pack MSE indices as bitstream (handles any mse_bits, including 3)
+    for j in range(head_dim):
+        bit_offset = j * mse_bits
+        byte_idx = bit_offset // 8
+        bit_shift = bit_offset % 8
+        val = (indices[:, j].int() & mask)
+        # Low part fits in current byte
+        packed[:, byte_idx] = packed[:, byte_idx] | (val << bit_shift).byte()
+        # High part may spill into next byte
+        spill = bit_shift + mse_bits - 8
+        if spill > 0 and byte_idx + 1 < mse_bytes:
+            packed[:, byte_idx + 1] = packed[:, byte_idx + 1] | (val >> (mse_bits - spill)).byte()
 
     # Pack QJL signs (vectorized over batch)
     for b in range(qjl_bytes):

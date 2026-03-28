@@ -76,7 +76,9 @@ RUN mkdir -p /opt/tests && \
     cp -r kernels/turboquant /opt/tq_build && \
     cp -r kernels/archer /opt/archer_build && \
     cp -r tests/multiquant /opt/tests/multiquant && \
-    cp -r tests/turboquant /opt/tests/turboquant
+    cp -r tests/turboquant /opt/tests/turboquant && \
+    echo "Fused decode kernel:" && \
+    ls /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/triton_mq_fused_decode.py
 
 WORKDIR /
 RUN rm -rf /tmp/vllm-build

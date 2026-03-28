@@ -28,18 +28,23 @@ __global__ void archer_unpack_kernel(
 
     const int MSE_BYTES = (D * MSE_BITS + 7) / 8;
     const int QJL_BYTES = (D + 7) / 8;
-    constexpr int COORDS_PER_BYTE = 8 / MSE_BITS;
     constexpr int MASK = (1 << MSE_BITS) - 1;
 
     const uint8_t* row_packed = packed + row * packed_size;
     int32_t* row_indices = indices + row * D;
     float* row_signs = signs + row * D;
 
-    // Unpack MSE indices
+    // Unpack MSE indices from bitstream (handles non-power-of-2 bit widths)
     for (int j = tid; j < D; j += BLOCK_SIZE) {
-        int byte_idx = j / COORDS_PER_BYTE;
-        int bit_pos = (j % COORDS_PER_BYTE) * MSE_BITS;
-        row_indices[j] = (row_packed[byte_idx] >> bit_pos) & MASK;
+        int bit_offset = j * MSE_BITS;
+        int byte_idx = bit_offset / 8;
+        int bit_shift = bit_offset % 8;
+        int val = row_packed[byte_idx] >> bit_shift;
+        int spill = bit_shift + MSE_BITS - 8;
+        if (spill > 0 && byte_idx + 1 < MSE_BYTES) {
+            val |= row_packed[byte_idx + 1] << (MSE_BITS - spill);
+        }
+        row_indices[j] = val & MASK;
     }
 
     // Unpack QJL signs

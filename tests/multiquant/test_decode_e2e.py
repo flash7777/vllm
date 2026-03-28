@@ -193,26 +193,19 @@ class TestRQDecode:
         signs = torch.sign(r @ S.T)
         signs[signs == 0] = 1.0
 
-        # RQ score: rotate query too
+        # RQ score: rotate query too (extract as flat vector, group-by-group)
         q_mv = embed_vectors_as_multivectors(q.unsqueeze(0))
         q_rot_mv = rotor_sandwich(rotors, q_mv)
-        q_rot_coords = []
-        for gi in [1, 2, 3, 7]:
-            q_rot_coords.append(q_rot_mv[..., gi])
-        q_rot = torch.cat([c.reshape(1, -1) for c in q_rot_coords], dim=-1)[0, :D]
+        q_rot = extract_vectors_from_multivectors(q_rot_mv, D).squeeze(0)
 
         correction = math.sqrt(math.pi / 2) / D
         q_proj = q @ S.T
 
-        # Gather the quantized centroid values for score
+        # Gather the quantized centroid values for score (flat, group-by-group)
         mv_rot2 = rotor_sandwich(rotors, embed_vectors_as_multivectors(kh))
-        k_coords = []
-        for gi in [1, 2, 3, 7]:
-            comp = mv_rot2[..., gi]
-            diffs = comp.unsqueeze(-1) - centroids
-            idx = diffs.abs().argmin(dim=-1)
-            k_coords.append(centroids[idx])
-        c_flat = torch.cat([c.reshape(1, -1) for c in k_coords], dim=-1)[0, :D]
+        k_rotated = extract_vectors_from_multivectors(mv_rot2, D).squeeze(0)
+        k_idx = (k_rotated.unsqueeze(-1) - centroids).abs().argmin(dim=-1)
+        c_flat = centroids[k_idx]
 
         term1 = (q_rot * c_flat).sum()
         term2 = (q_proj * signs).sum()

@@ -88,7 +88,6 @@ archer_decompress_kernel(
     constexpr int D = HEAD_SIZE;
     constexpr int MSE_BYTES = (D * MSE_BITS + 7) / 8;
     constexpr int QJL_BYTES = (D + 7) / 8;
-    constexpr int COORDS_PER_BYTE = 8 / MSE_BITS;
     constexpr int MASK = (1 << MSE_BITS) - 1;
 
     // ── Shared memory layout ─────────────────────────────────────────
@@ -113,12 +112,17 @@ archer_decompress_kernel(
     __syncthreads();
 
     // ── Step 1: Unpack MSE indices → centroid values ─────────────────
-    // Each thread handles multiple coordinates
+    // Bitstream unpack: handles non-power-of-2 bit widths (e.g. 3-bit)
     for (int j = tid; j < D; j += BLOCK_SIZE) {
-        int byte_idx = j / COORDS_PER_BYTE;
-        int bit_pos = (j % COORDS_PER_BYTE) * MSE_BITS;
-        uint8_t packed_byte = row_packed[byte_idx];
-        int idx = (packed_byte >> bit_pos) & MASK;
+        int bit_offset = j * MSE_BITS;
+        int byte_idx = bit_offset / 8;
+        int bit_shift = bit_offset % 8;
+        int val = row_packed[byte_idx] >> bit_shift;
+        int spill = bit_shift + MSE_BITS - 8;
+        if (spill > 0 && byte_idx + 1 < MSE_BYTES) {
+            val |= row_packed[byte_idx + 1] << (MSE_BITS - spill);
+        }
+        int idx = val & MASK;
         s_quantized[j] = s_centroids[idx];
     }
     __syncthreads();
