@@ -34,7 +34,7 @@ class ArcherConfig(QuantizationConfig):
     def __init__(
         self,
         bits: int = 3,
-        method: str = "rq",  # "rq" (RotorQuant) or "tq" (TurboQuant)
+        method: str = "tq",  # "tq" (TurboQuant) or "rq" (RotorQuant)
         act_dtype: str = "bf16",  # "bf16" or "fp8"
         seed: int = 42,
     ):
@@ -68,7 +68,7 @@ class ArcherConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ArcherConfig:
         bits = config.get("bits", 3)
-        method = config.get("method", "rq")
+        method = config.get("method", "tq")
         act_dtype = config.get("act_dtype", "bf16")
         return cls(bits=bits, method=method, act_dtype=act_dtype)
 
