@@ -119,12 +119,12 @@ def make_random_rotor(shape: Tuple[int, ...], device='cpu', seed=None) -> torch.
     if seed is not None:
         gen.manual_seed(seed)
 
-    # Random bivector direction
+    # Random bivector direction (generate on CPU for determinism, move to device)
     full_shape = list(shape) + [3]
-    bv = torch.randn(full_shape, generator=gen).to(device)
+    bv = torch.randn(full_shape, generator=gen, device='cpu').to(device)
     # Random angle in [0, 2π)
     angle_shape = list(shape) if shape else [1]
-    angle = torch.rand(angle_shape, generator=gen).to(device) * 2 * math.pi
+    angle = torch.rand(angle_shape, generator=gen, device='cpu').to(device) * 2 * math.pi
 
     rotor = make_rotor(bv, angle)
     # Normalize: R / sqrt(R R̃)
