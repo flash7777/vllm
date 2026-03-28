@@ -7,12 +7,10 @@
 # No patches, no sed, no build/deps — everything is in the source tree.
 # Only external deps: CUTLASS, FlashInfer wheels, MoE configs.
 #
-# Build (DGX Spark):
-#   podman build -f Dockerfile.multiquant -t vllm-multiquant .
-#
-# Build (RTX PRO 6000 / Spiegel 2):
+# Build: ./build.sh (empfohlen, mit pip-Cache)
+# Oder manuell:
 #   podman build -f Dockerfile.multiquant -t vllm-multiquant \
-#     --build-arg CUDA_ARCHS="12.0a"
+#     -v /data/sources/pip-cache:/pip-cache:rw .
 # ============================================================
 
 ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3
@@ -35,7 +33,7 @@ RUN apt-get update -qq && \
       libcusparse-dev-13-1 libcusolver-dev-13-1 libcufft-dev-13-1 && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir cmake ninja setuptools-scm scipy pytest
+RUN pip install --cache-dir /pip-cache cmake ninja setuptools-scm scipy pytest
 
 # Save NVIDIA's CUDA-aware PyTorch before anything overwrites it
 RUN cd /usr/local/lib/python3.12/dist-packages && \
@@ -46,7 +44,7 @@ RUN git clone --depth 1 --branch v4.4.1 \
       https://github.com/NVIDIA/cutlass.git /opt/cutlass
 ENV VLLM_CUTLASS_SRC_DIR=/opt/cutlass
 RUN sed -i '/nvidia-cutlass-dsl/d' /etc/pip/constraint.txt && \
-    pip install --no-cache-dir --force-reinstall nvidia-cutlass-dsl==4.4.1
+    pip install --cache-dir /pip-cache --force-reinstall nvidia-cutlass-dsl==4.4.1
 
 # ─── vLLM from OUR FORK (everything included) ───────────────
 RUN git clone --filter=blob:none --branch ${VLLM_BRANCH} \
@@ -57,7 +55,7 @@ WORKDIR /tmp/vllm-build
 RUN python use_existing_torch.py
 RUN sed -i '/flashinfer-python/d' requirements/cuda.txt 2>/dev/null || true && \
     sed -i '/flashinfer-python/d' pyproject.toml 2>/dev/null || true
-RUN pip install --no-cache-dir -r requirements/build.txt
+RUN pip install --cache-dir /pip-cache -r requirements/build.txt
 
 # Remove container's pre-installed vLLM
 RUN pip uninstall -y vllm
@@ -66,7 +64,7 @@ RUN pip uninstall -y vllm
 ENV TORCH_CUDA_ARCH_LIST=${CUDA_ARCHS}
 ENV VLLM_TARGET_DEVICE=cuda
 ENV MAX_JOBS=${MAX_JOBS}
-RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 pip install --no-build-isolation --no-cache-dir .
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 pip install --no-build-isolation --cache-dir /pip-cache .
 
 # Save our source files that aren't part of pip install
 # (multiquant, turboquant, csrc kernels, tests)
@@ -87,7 +85,7 @@ RUN rm -rf /tmp/vllm-build
 # Save NVIDIA's pre-built cubins (SM120/SM121) before upgrading
 RUN cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /opt/flashinfer_cubin_backup
 # Upgrade to 0.6.6 (required by vLLM 0.17)
-RUN pip install --no-cache-dir --retries 10 flashinfer-python==0.6.6
+RUN pip install --cache-dir /pip-cache --retries 10 flashinfer-python==0.6.6
 # Restore NVIDIA cubins (version mismatch bypassed at runtime)
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer_cubin && \
     cp -r /opt/flashinfer_cubin_backup /usr/local/lib/python3.12/dist-packages/flashinfer_cubin && \
@@ -95,7 +93,7 @@ RUN rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer_cubin && \
 ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # ─── fastsafetensors + Ray ───────────────────────────────────
-RUN pip install --no-cache-dir fastsafetensors ray[default] nvidia-nvshmem-cu13
+RUN pip install --cache-dir /pip-cache fastsafetensors ray[default] nvidia-nvshmem-cu13
 # Restore NVIDIA CUDA torch (pip may have downgraded it)
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
     tar xf /opt/nvidia-torch.tar -C /usr/local/lib/python3.12/dist-packages/
@@ -110,9 +108,9 @@ open(p,'w').write(t.replace(old,new)); \
 print('torch_utils.py patched')"
 
 # ─── transformers 5.x ────────────────────────────────────────
-RUN pip install --no-cache-dir --no-deps "transformers>=5.2" && \
-    pip install --no-cache-dir --upgrade "huggingface_hub>=0.32" && \
-    pip install --no-cache-dir --no-deps "compressed-tensors>=0.13"
+RUN pip install --cache-dir /pip-cache --no-deps "transformers>=5.2" && \
+    pip install --cache-dir /pip-cache --upgrade "huggingface_hub>=0.32" && \
+    pip install --cache-dir /pip-cache --no-deps "compressed-tensors>=0.13"
 
 # ─── Pre-build TQ CUDA kernel ───────────────────────────────
 RUN python3 -c "from torch.utils.cpp_extension import load; \

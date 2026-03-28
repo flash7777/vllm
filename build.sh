@@ -26,11 +26,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+PIP_CACHE="/data/sources/pip-cache"
+mkdir -p "$PIP_CACHE"
+
 echo "================================================"
 echo "  Building ${IMAGE}"
 echo "  Base:  ${BASE}"
 echo "  Archs: ${ARCHS}"
 echo "  Jobs:  ${JOBS}"
+echo "  pip:   ${PIP_CACHE}"
 echo "================================================"
 
 # Copy FlashInfer wheels if available
@@ -51,6 +55,7 @@ podman build \
     --build-arg BASE_IMAGE="$BASE" \
     --build-arg CUDA_ARCHS="$ARCHS" \
     --build-arg MAX_JOBS="$JOBS" \
+    -v "$PIP_CACHE:/pip-cache:rw" \
     $EXTRA \
     .
 
