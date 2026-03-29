@@ -25,7 +25,12 @@ SERVED_NAME="glm-4.7-flash"
 REASONING_PARSER="glm45"
 TOOL_PARSER="glm47"
 MAX_MODEL_LEN=32768
-GPU_MEM_UTIL=0.90
+# Auto-detect: GB10 Unified Memory needs lower util (nvidia-smi shows "Not Supported")
+if nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -q "N/A\|Not Supported"; then
+    GPU_MEM_UTIL=0.50   # GB10 Unified Memory
+else
+    GPU_MEM_UTIL=0.95   # Discrete GPU (RTX, A100, etc.)
+fi
 KV_CACHE_MEM=""
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
