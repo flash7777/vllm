@@ -46,12 +46,12 @@ test_variant() {
     ./start.multiquant "${ARGS[@]}"
 
     echo -n "  Warte... "
-    for i in $(seq 1 120); do
+    for i in $(seq 1 600); do
         if curl -s http://localhost:8011/v1/models 2>/dev/null | grep -q "glm\|qwen\|llama"; then
             echo "ready (${i}x5s)"
             break
         fi
-        if [ $i -gt 15 ] && podman logs mq-serve 2>&1 | tail -5 | grep -q "RuntimeError"; then
+        if [ $i -gt 3 ] && podman logs mq-serve 2>&1 | tail -5 | grep -q "RuntimeError"; then
             if podman logs mq-serve 2>&1 | grep -q "out of memory\|OOM\|less than desired.*memory"; then
                 echo "OOM"
                 RESULTS+=("$LABEL: OOM")
@@ -62,7 +62,7 @@ test_variant() {
             fi
             return
         fi
-        if [ $i -eq 120 ]; then
+        if [ $i -eq 600 ]; then
             echo "TIMEOUT"
             RESULTS+=("$LABEL: TIMEOUT")
             return
