@@ -604,24 +604,36 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Fresh allocations every call (debug: testing if pre-alloc causes bug)
-    # TODO: restore pre-allocated buffers once bug is found
+    # Pre-allocated buffers for CUDA Graph compatibility + performance.
+    # Previous centroid_acc=0 bug was caused by head_dim=packed_size mismatch,
+    # now fixed by _recover_head_dim().
+    global _decode_buffers
+    buf_key = (B, Hq, D, device)
+    if buf_key not in _decode_buffers:
+        _decode_buffers[buf_key] = {
+            "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+            "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+        }
+    buf = _decode_buffers[buf_key]
+
     q_flat = q.reshape(B * Hq, D).float()
     if is_rq:
-        q_rot = _rq_rotate_forward(q_flat, Pi).contiguous()
+        _rq_rotate_forward(q_flat, Pi, out=buf["q_rot"])
     else:
-        q_rot = (q_flat @ Pi.T).contiguous()
-    q_proj = (q_flat @ S.T).contiguous()
+        torch.mm(q_flat, Pi.T, out=buf["q_rot"])
+    q_rot = buf["q_rot"]
+    torch.mm(q_flat, S.T, out=buf["q_proj"])
+    q_proj = buf["q_proj"]
 
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
 
-    centroid_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
-    sign_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
-
-    # Dummy buf for post-GEMV compatibility
-    buf = {"q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-           "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32)}
+    centroid_acc = buf["centroid_acc"]
+    sign_acc = buf["sign_acc"]
+    centroid_acc.zero_()
+    sign_acc.zero_()
 
     # Debug logging (MQ_DEBUG=1)
     import os
