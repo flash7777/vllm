@@ -146,8 +146,10 @@ try:
         fake_impl=_archer_apply_fake,
     )
     _archer_op = torch.ops.vllm.archer_apply
-except Exception:
-    # Fallback if registration fails (e.g. missing vllm.utils)
+    logger.info("Archer custom op registered (torch.compile safe)")
+except Exception as e:
+    logger.warning("Archer custom op registration failed: %s — "
+                   "torch.compile with --weights may not work", e)
     _archer_op = _archer_apply_impl
 
 
