@@ -74,9 +74,15 @@ podman build \
     .
 
 echo ""
+EXPECTED=$(git rev-parse --short HEAD)
+ACTUAL=$(podman run --rm "$IMAGE" cat /opt/vllm-commit 2>/dev/null || echo "???")
 echo "================================================"
 echo "  Done: ${IMAGE}"
-echo "  Size: $(podman image inspect "$IMAGE" --format '{{.Size}}' | numfmt --to=iec)"
-echo "  ccache: $(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1) ($(ls "$CCACHE_DIR" 2>/dev/null | wc -l) entries)"
+echo "  Size:   $(podman image inspect "$IMAGE" --format '{{.Size}}' | numfmt --to=iec)"
+echo "  Commit: ${ACTUAL} (expected: ${EXPECTED})"
+echo "  ccache: $(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1)"
 echo "  pip:    $(du -sh "$PIP_CACHE" 2>/dev/null | cut -f1)"
 echo "================================================"
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "  WARNING: Image commit mismatch! Push before build?"
+fi
