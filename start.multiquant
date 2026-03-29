@@ -27,7 +27,7 @@ TOOL_PARSER="glm47"
 MAX_MODEL_LEN=32768
 # Auto-detect: GB10 Unified Memory needs lower util (nvidia-smi shows "Not Supported")
 if nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -q "N/A\|Not Supported"; then
-    GPU_MEM_UTIL=0.50   # GB10 Unified Memory
+    GPU_MEM_UTIL=0.33   # GB10 Unified Memory (~40 GB for vLLM)
 else
     GPU_MEM_UTIL=0.95   # Discrete GPU (RTX, A100, etc.)
 fi
