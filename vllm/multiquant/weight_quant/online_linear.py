@@ -218,19 +218,20 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             self._quantize_layer(layer)
         layer._already_called_process_weights_after_loading = True
 
-    @torch.compiler.disable
     def apply(
         self,
         layer: nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if torch.compiler.is_dynamo_compiling():
+            # Tracing: use weight as-is (packed uint8 or original)
+            return F.linear(x, layer.weight, bias)
         if getattr(layer, "_archer_packed", False):
             W = self._decompress(layer).to(x.dtype).contiguous()
             return F.linear(x, W, bias)
         return F.linear(x, layer.weight, bias)
 
-    @torch.compiler.disable
     def _decompress(self, layer: nn.Module) -> torch.Tensor:
         packed = layer.weight.data
         out_features = packed.shape[0]

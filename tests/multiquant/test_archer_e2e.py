@@ -351,5 +351,64 @@ class TestMultiLayerPack:
         assert elapsed < 10
 
 
+# ── 12. torch.compile Compatibility ──────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestArcherTorchCompile:
+    """Verify Archer works with torch.compile (vLLM v1 requirement)."""
+
+    @pytest.fixture
+    def archer_linear(self):
+        from vllm.multiquant.weight_quant.config import ArcherConfig
+        from vllm.multiquant.weight_quant.online_linear import (
+            ArcherOnlineLinearMethod,
+        )
+        cfg = ArcherConfig(bits=3, method="tq")
+        method = ArcherOnlineLinearMethod(cfg)
+        layer = nn.Module()
+        torch.manual_seed(42)
+        layer.weight = nn.Parameter(
+            torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        method._quantize_layer(layer)
+        return layer, method
+
+    def test_apply_without_compile(self, archer_linear):
+        """Baseline: apply works without torch.compile."""
+        layer, method = archer_linear
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        out = method.apply(layer, x)
+        assert out.shape == (4, 64)
+        assert not out.isnan().any()
+
+    def test_apply_inside_torch_compile(self, archer_linear):
+        """Critical: apply must not crash inside torch.compile."""
+        layer, method = archer_linear
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+
+        @torch.compile(fullgraph=True, backend="eager")
+        def compiled_forward(x):
+            return method.apply(layer, x)
+
+        out = compiled_forward(x)
+        assert out.shape == (4, 64)
+
+    def test_dynamo_tracing_no_crash(self, archer_linear):
+        """torch._dynamo must trace without Unsupported error."""
+        layer, method = archer_linear
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+
+        import torch._dynamo
+        torch._dynamo.reset()
+
+        def fn(x):
+            return method.apply(layer, x)
+
+        compiled_fn = torch.compile(fn, backend="eager")
+        out = compiled_fn(x)
+        assert out.shape == (4, 64)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
