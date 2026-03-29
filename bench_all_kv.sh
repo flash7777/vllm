@@ -15,7 +15,7 @@ test_kv() {
     podman rm mq-serve 2>/dev/null || true
     sleep 2
 
-    ./start.multiquant --model "$MODEL" --kv "$KV" --max-model-len "$MAX_LEN"
+    ./start.multiquant --model "$MODEL" --kv "$KV"
 
     echo -n "  Warte... "
     for i in $(seq 1 100); do
