@@ -22,7 +22,13 @@ test_variant() {
 
     local MTP=${4:-false}
 
-    local ARGS=(--model "$MODEL" --kv "$KV" --max-model-len "$MAX_LEN")
+    # KV dtype: use Archer method if set, else default
+    local KV_USE="$KV"
+    if [ -n "$WEIGHTS" ]; then
+        KV_USE="$WEIGHTS"  # Archer rq3 → KV rq3
+    fi
+
+    local ARGS=(--model "$MODEL" --kv "$KV_USE" --max-model-len "$MAX_LEN")
     if [ -n "$WEIGHTS" ]; then
         ARGS+=(--weights "$WEIGHTS")
     fi
@@ -81,34 +87,33 @@ print(f'{a:.1f}/{p:.1f} GiB')
     fi
 }
 
-echo "MultiQuant Weight Bench — KV=$KV"
-echo "════════════════════════════════════════"
+echo "MultiQuant Weight Bench"
+echo "═══════════════════════════════════════════════════════════════════"
+printf "  %-4s  %-12s  %-10s  %-6s  %-3s\n" "#" "Modell-Quant" "Archer" "KV" "MTP"
+echo "───────────────────────────────────────────────────────────────────"
 
-# Native weights (no Archer)
-test_variant "INT4 Marlin"  "GLM-4.7-Flash-int4-AutoRound"  ""
-test_variant "FP8 Dynamic"  "GLM-4.7-Flash-FP8"             ""
-
-# Archer online-quant (BF16 → compressed at load)
-test_variant "BF16→Archer TQ3"  "GLM-4.7-Flash"  "tq3"
-test_variant "BF16→Archer RQ3"  "GLM-4.7-Flash"  "rq3"
-
-# FP8 model + Archer (FP8→compressed, double quant)
-test_variant "FP8→Archer TQ3"   "GLM-4.7-Flash-FP8"  "tq3"
-
-# MTP variants (GLM-4.7 supports MTP via num_nextn_predict_layers)
-test_variant "INT4+MTP"         "GLM-4.7-Flash-int4-AutoRound"  ""    "true"
-test_variant "FP8+MTP"          "GLM-4.7-Flash-FP8"             ""    "true"
-test_variant "BF16→TQ3+MTP"    "GLM-4.7-Flash"                 "tq3" "true"
+#                    Label                Model                            Archer  MTP
+#       Modell-Quant | Archer-Gewichte | KV-Cache | MTP
+test_variant "INT4  / —    / tq3 / —"    "GLM-4.7-Flash-int4-AutoRound"  ""      ""
+test_variant "FP8   / —    / tq3 / —"    "GLM-4.7-Flash-FP8"            ""      ""
+test_variant "BF16  / tq3  / tq3 / —"    "GLM-4.7-Flash"               "tq3"   ""
+test_variant "BF16  / rq3  / rq3 / —"    "GLM-4.7-Flash"               "rq3"   ""
+test_variant "FP8   / tq3  / tq3 / —"    "GLM-4.7-Flash-FP8"           "tq3"   ""
+test_variant "INT4  / —    / tq3 / mtp"  "GLM-4.7-Flash-int4-AutoRound" ""      "true"
+test_variant "FP8   / —    / tq3 / mtp"  "GLM-4.7-Flash-FP8"           ""      "true"
+test_variant "BF16  / tq3  / tq3 / mtp"  "GLM-4.7-Flash"               "tq3"   "true"
 
 echo ""
-echo "════════════════════════════════════════"
-echo "  ERGEBNISSE (KV=$KV)"
-echo "════════════════════════════════════════"
+echo "═══════════════════════════════════════════════════════════════════"
+echo "  ERGEBNISSE"
+echo "───────────────────────────────────────────────────────────────────"
+printf "  %-30s  %s\n" "Modell / Archer / KV / MTP" "tok/s     mem"
+echo "───────────────────────────────────────────────────────────────────"
 for r in "${RESULTS[@]}"; do
-    printf "  %-20s %s\n" "$(echo "$r" | cut -d: -f1):" "$(echo "$r" | cut -d: -f2-)"
+    printf "  %-30s  %s\n" "$(echo "$r" | cut -d: -f1)" "$(echo "$r" | cut -d: -f2-)"
 done
-echo ""
-echo "  FP8 Baseline (ohne MQ): 37-40 tok/s"
-echo "════════════════════════════════════════"
+echo "───────────────────────────────────────────────────────────────────"
+echo "  FP8 Baseline (ohne MQ):       37-40 tok/s"
+echo "═══════════════════════════════════════════════════════════════════"
 
 podman stop mq-serve 2>/dev/null || true
