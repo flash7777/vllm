@@ -1257,7 +1257,10 @@ def get_default_config(
             "GROUP_SIZE_M": 1 if M <= 16 else 32,
             "SPLIT_K": 1,
             "num_warps": 4,
-            "num_stages": 3 if not current_platform.is_rocm() else num_stages_rocm,
+            "num_stages": 2 if (current_platform.is_rocm()
+                or (current_platform.is_cuda()
+                    and current_platform.get_device_capability().major >= 12)
+                ) else 3,
         }
     elif dtype in ["int4_w4a16", "int8_w8a16"] and block_shape is not None:
         # moe wna16 kernels
@@ -1306,6 +1309,11 @@ def get_default_config(
 
         if current_platform.is_rocm():
             num_stages = num_stages_rocm
+        elif (current_platform.is_cuda()
+              and current_platform.get_device_capability().major >= 12):
+            # SM12x (GB10/RTX PRO 6000): 100KB SMEM/SM, 48KB/block
+            # num_stages=4 needs ~147KB → crash
+            num_stages = 2
         elif M <= 32:
             num_stages = 4
         else:
