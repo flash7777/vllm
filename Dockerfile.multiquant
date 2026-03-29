@@ -126,7 +126,7 @@ RUN python3 -c "from torch.utils.cpp_extension import load; \
 tq = load(name='tq_serve', \
     sources=['/opt/tq_build/tq_ext.cu', '/opt/tq_build/tq_round_trip.cu'], \
     extra_cuda_cflags=['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--use_fast_math', \
-                       '-gencode=arch=compute_121,code=sm_121', '-diag-suppress=177,3288'], \
+                       '-gencode=arch=compute_120,code=sm_120', '-gencode=arch=compute_121,code=sm_121', '-diag-suppress=177,3288'], \
     extra_include_paths=['/opt/tq_build'], verbose=True); \
 print('TQ kernel:', tq)"
 

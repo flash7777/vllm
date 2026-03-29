@@ -480,6 +480,7 @@ def _load_cuda_kernel():
                 "-O3", "-std=c++17",
                 "--expt-relaxed-constexpr",
                 "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
                 "-gencode=arch=compute_121,code=sm_121",
                 "-diag-suppress=177,3288",
             ],
