@@ -640,6 +640,17 @@ def mq_fused_decode_attention(
     centroid_acc.zero_()
     sign_acc.zero_()
 
+    # Debug logging (MQ_DEBUG=1)
+    import os
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] q: shape=%s norm=%.4f", q.shape, q.float().norm())
+        logger.info("[MQ_DEBUG] cache: shape=%s nonzero_rows=%d",
+                    kv_cache.shape, kv_cache.any(dim=-1).sum().item())
+        logger.info("[MQ_DEBUG] seq_lens=%s block_table=%s",
+                    seq_lens.tolist(), block_table.shape)
+        logger.info("[MQ_DEBUG] q_rot norm=%.4f, q_proj norm=%.4f",
+                    q_rot.norm(), q_proj.norm())
+
     # KV cache strides
     s_block = kv_cache.stride(0)
     s_kv = kv_cache.stride(1)
@@ -721,5 +732,11 @@ def mq_fused_decode_attention(
     # sign_correction = correction * (s_flat @ S)
     torch.mm(s_flat, S, out=buf["q_proj"])  # reuse q_proj buffer
     out_buf.add_(buf["q_proj"], alpha=correction)
+
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
+                    centroid_acc.norm(), sign_acc.norm())
+        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
+                    out_buf.norm(), out_buf.var())
 
     return out_buf.reshape(B, Hq, D)

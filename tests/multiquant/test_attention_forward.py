@@ -95,6 +95,148 @@ class TestImplInit:
         assert impl._mse_bits > 0
 
 
+# ── 0b. KV-Cache Integrity ───────────────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestKVCacheIntegrity:
+    """Verify KV-Cache write (prefill) → read (decode) roundtrip."""
+
+    def test_prefill_cache_then_decode_quality(self):
+        """Write KV via do_kv_cache_update, decode, compare vs reference."""
+        D = 128
+        num_heads = 32
+        num_kv_heads = 4
+        block_size = 16
+        seq_len = 64
+
+        impl, layer = _make_impl(D, num_heads=num_heads,
+                                 num_kv_heads=num_kv_heads)
+        packed_size = impl._packed_size
+        n_blocks = (seq_len + block_size - 1) // block_size
+        cache = _make_cache(n_blocks, block_size, num_kv_heads, packed_size)
+
+        torch.manual_seed(42)
+        key = torch.randn(seq_len, num_kv_heads, D,
+                          dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(seq_len, num_kv_heads, D,
+                            dtype=torch.bfloat16, device="cuda")
+
+        slot_mapping = torch.arange(seq_len, device="cuda")
+        impl.do_kv_cache_update(layer, key, value, cache, slot_mapping)
+
+        query = torch.randn(1, num_heads * D,
+                            dtype=torch.bfloat16, device="cuda")
+        block_table = torch.arange(n_blocks, device="cuda").unsqueeze(0)
+        meta = _make_metadata(
+            seq_lens=torch.tensor([seq_len], device="cuda"),
+            block_table=block_table,
+            slot_mapping=torch.tensor([seq_len], device="cuda"),
+            num_prefill=0, num_decode=1, max_seq_len=seq_len,
+        )
+        output = impl.forward(layer, query, None, None, cache, meta)
+
+        # Reference: naive bmm attention on raw K/V
+        q = query.reshape(1, num_heads, D).float()
+        k = key.float()
+        v = value.float()
+        if num_kv_heads < num_heads:
+            k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+            v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        scale = 1.0 / math.sqrt(D)
+        scores = torch.einsum("bhd,shd->bhs", q, k) * scale
+        weights = F.softmax(scores, dim=-1)
+        ref_out = torch.einsum("bhs,shd->bhd", weights, v).reshape(1, -1)
+
+        cos = F.cosine_similarity(output.float(), ref_out, dim=-1).mean()
+        assert cos > 0.3, f"Decode quality: cos={cos:.4f} (expected >0.3)"
+        assert not output.isnan().any()
+        out_var = output.float().var().item()
+        assert out_var > 0.001, f"Output degenerate: var={out_var:.6f}"
+
+    def test_cache_readback_matches_written(self):
+        """Unpack what was written to cache, compare vs original K/V."""
+        D = 128
+        num_kv_heads = 4
+        block_size = 16
+
+        impl, layer = _make_impl(D, num_kv_heads=num_kv_heads)
+        packed_size = impl._packed_size
+        cache = _make_cache(1, block_size, num_kv_heads, packed_size)
+
+        torch.manual_seed(42)
+        key = torch.randn(1, num_kv_heads, D,
+                          dtype=torch.bfloat16, device="cuda")
+        slot_mapping = torch.tensor([0], device="cuda")
+        impl.do_kv_cache_update(layer, key, key, cache, slot_mapping)
+
+        Pi, S, centroids = impl._get_matrices(layer, key.device)
+
+        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+        for kv_h in range(num_kv_heads):
+            packed = cache[0, 0, 0, kv_h].unsqueeze(0)
+            result = cuda_unpack(packed, D, impl._mse_bits)
+            if result is None:
+                pytest.skip("CUDA unpack not available")
+            idx, signs, vn, rn = result
+
+            c_vals = centroids[idx.long()]
+            W_mse = c_vals @ Pi
+            correction = math.sqrt(math.pi / 2) / D
+            W_qjl = correction * rn.unsqueeze(-1) * (signs @ S)
+            recon = vn.unsqueeze(-1) * (W_mse + W_qjl)
+
+            original = key[0, kv_h].float()
+            cos = F.cosine_similarity(
+                original.unsqueeze(0), recon, dim=-1
+            ).mean()
+            assert cos > 0.8, f"Cache readback kv_h={kv_h}: cos={cos:.4f}"
+
+    def test_10_step_autoregressive_not_degenerate(self):
+        """10 decode steps must produce diverse outputs (not all '1')."""
+        D = 128
+        num_heads = 32
+        num_kv_heads = 4
+        block_size = 16
+        seq_len = 32
+
+        impl, layer = _make_impl(D, num_heads=num_heads,
+                                 num_kv_heads=num_kv_heads)
+        packed_size = impl._packed_size
+        n_blocks = 3
+        cache = _make_cache(n_blocks, block_size, num_kv_heads, packed_size)
+
+        torch.manual_seed(42)
+        key = torch.randn(seq_len, num_kv_heads, D,
+                          dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(seq_len, num_kv_heads, D,
+                            dtype=torch.bfloat16, device="cuda")
+        slot_mapping = torch.arange(seq_len, device="cuda")
+        impl.do_kv_cache_update(layer, key, value, cache, slot_mapping)
+
+        outputs = []
+        for step in range(10):
+            query = torch.randn(1, num_heads * D,
+                                dtype=torch.bfloat16, device="cuda")
+            block_table = torch.arange(n_blocks, device="cuda").unsqueeze(0)
+            meta = _make_metadata(
+                seq_lens=torch.tensor([seq_len + step], device="cuda"),
+                block_table=block_table,
+                slot_mapping=torch.tensor([seq_len + step], device="cuda"),
+                num_prefill=0, num_decode=1, max_seq_len=seq_len + step,
+            )
+            out = impl.forward(layer, query, None, None, cache, meta)
+            outputs.append(out.float().clone())
+
+        all_same = all(
+            torch.allclose(outputs[0], o, atol=1e-3) for o in outputs[1:]
+        )
+        assert not all_same, "All 10 decode outputs identical — degenerate!"
+
+        stacked = torch.stack(outputs)
+        var = stacked.var().item()
+        assert var > 0.0001, f"Output variance too low: {var}"
+
+
 # ── 1. KV Cache Update (Pack + Write) ────────────────────────────────
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
