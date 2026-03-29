@@ -452,6 +452,7 @@ def _mq_fused_decode_kernel_v2(
 _cuda_kernel = None
 _cuda_kernel_tried = False
 _decode_path_logged = False
+_decode_buffers = {}  # Pre-allocated buffers keyed by (B, Hq, D, device)
 
 from vllm.logger import init_logger
 logger = init_logger(__name__)
@@ -541,15 +542,14 @@ def _load_clifford_kernel():
         return None
 
 
-def _rq_rotate_forward(x, rotors):
+def _rq_rotate_forward(x, rotors, out=None):
     """RQ forward rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
     kernel = _load_clifford_kernel()
     if kernel is not None:
-        out = torch.empty_like(x)
-        kernel.clifford_sandwich_forward(x.float().contiguous(),
-                                         rotors.float().contiguous(),
-                                         out, D)
+        if out is None:
+            out = torch.empty_like(x)
+        kernel.clifford_sandwich_forward(x.float(), rotors.float(), out, D)
         return out
     # Python fallback (~70 kernel launches, not graph-safe)
     from vllm.multiquant.rotorquant.clifford import (
@@ -561,15 +561,14 @@ def _rq_rotate_forward(x, rotors):
     return extract_vectors_from_multivectors(mv_rot, D)
 
 
-def _rq_rotate_inverse(x, rotors):
+def _rq_rotate_inverse(x, rotors, out=None):
     """RQ inverse rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
     kernel = _load_clifford_kernel()
     if kernel is not None:
-        out = torch.empty_like(x)
-        kernel.clifford_sandwich_inverse(x.float().contiguous(),
-                                          rotors.float().contiguous(),
-                                          out, D)
+        if out is None:
+            out = torch.empty_like(x)
+        kernel.clifford_sandwich_inverse(x.float(), rotors.float(), out, D)
         return out
     from vllm.multiquant.rotorquant.clifford import (
         embed_vectors_as_multivectors, rotor_sandwich,
@@ -605,21 +604,41 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # 1. Pre-rotate + pre-project query
+    # Use pre-allocated buffers for CUDA Graph compatibility.
+    # CUDA Graphs record pointer addresses at capture time — new allocations
+    # (torch.zeros, torch.empty) would create new addresses that the graph
+    # doesn't know about, causing stale data reads ("all outputs = 1" bug).
+    global _decode_buffers
+    buf_key = (B, Hq, D, device)
+    if buf_key not in _decode_buffers:
+        _decode_buffers[buf_key] = {
+            "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+            "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+        }
+    buf = _decode_buffers[buf_key]
+
+    # 1. Pre-rotate + pre-project query (in-place into pre-allocated buffers)
     q_flat = q.reshape(B * Hq, D).float()
     if is_rq:
-        q_rot = _rq_rotate_forward(q_flat, Pi).contiguous()
+        _rq_rotate_forward(q_flat, Pi, out=buf["q_rot"])
+        q_rot = buf["q_rot"]
     else:
-        q_rot = (q_flat @ Pi.T).contiguous()
-    q_proj = (q_flat @ S.T).contiguous()    # QJL projection (same for TQ/RQ)
+        torch.mm(q_flat, Pi.T, out=buf["q_rot"])
+        q_rot = buf["q_rot"]
+    torch.mm(q_flat, S.T, out=buf["q_proj"])
+    q_proj = buf["q_proj"]
 
-    # Reshape for kernel: [B, Hq, D]
+    # Reshape for kernel (views, no alloc)
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
 
-    # 2. Allocate output accumulators
-    centroid_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
-    sign_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
+    # 2. Zero accumulators (in-place, same addresses)
+    centroid_acc = buf["centroid_acc"]
+    sign_acc = buf["sign_acc"]
+    centroid_acc.zero_()
+    sign_acc.zero_()
 
     # KV cache strides
     s_block = kv_cache.stride(0)
@@ -633,12 +652,12 @@ def mq_fused_decode_attention(
     if kernel is not None:
         try:
             kernel.tq_fused_decode_attention(
-                q_rot_3d.contiguous(),
-                q_proj_3d.contiguous(),
+                q_rot_3d,
+                q_proj_3d,
                 kv_cache,
-                centroids.contiguous(),
-                block_table.int().contiguous(),
-                seq_lens.int().contiguous(),
+                centroids,
+                block_table.int(),
+                seq_lens.int(),
                 centroid_acc,
                 sign_acc,
                 D, mse_bits, n_centroids, scale,
@@ -690,13 +709,17 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # 4. Post-loop V reconstruction
+    # 4. Post-loop V reconstruction (reuse q_rot buffer for output)
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
+    out_buf = buf["q_rot"]  # reuse pre-allocated buffer
     if is_rq:
-        v_mse = _rq_rotate_inverse(c_flat, Pi)
+        _rq_rotate_inverse(c_flat, Pi, out=out_buf)
     else:
-        v_mse = c_flat @ Pi
-    output = v_mse + correction * (s_flat @ S)
+        torch.mm(c_flat, Pi, out=out_buf)
+    # out_buf now contains v_mse; add QJL correction in-place
+    # sign_correction = correction * (s_flat @ S)
+    torch.mm(s_flat, S, out=buf["q_proj"])  # reuse q_proj buffer
+    out_buf.add_(buf["q_proj"], alpha=correction)
 
-    return output.reshape(B, Hq, D)
+    return out_buf.reshape(B, Hq, D)
