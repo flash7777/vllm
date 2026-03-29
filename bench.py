@@ -180,6 +180,41 @@ def math_test(url, model, n=50):
             print(f"  ... und {len(errors)-5} weitere Fehler")
     return {"correct": correct, "total": total, "pct": round(pct, 1)}
 
+def memory_stats(url):
+    """Query vLLM /metrics endpoint for KV cache and GPU usage."""
+    try:
+        resp = urllib.request.urlopen(f"{url}/metrics", timeout=5).read().decode()
+        stats = {}
+        for line in resp.splitlines():
+            if line.startswith("#"):
+                continue
+            if "kv_cache_usage_perc" in line and not line.startswith("#"):
+                try:
+                    stats["kv_cache_usage_%"] = round(float(line.split()[-1]) * 100, 1)
+                except (ValueError, IndexError):
+                    pass
+            if "gpu_cache_usage_perc" in line and not line.startswith("#"):
+                try:
+                    stats["gpu_cache_usage_%"] = round(float(line.split()[-1]) * 100, 1)
+                except (ValueError, IndexError):
+                    pass
+            if "num_requests_running" in line and not line.startswith("#"):
+                try:
+                    stats["requests_running"] = int(float(line.split()[-1]))
+                except (ValueError, IndexError):
+                    pass
+        if stats:
+            parts = []
+            if "kv_cache_usage_%" in stats:
+                parts.append(f"KV cache: {stats['kv_cache_usage_%']:.1f}%")
+            if "gpu_cache_usage_%" in stats:
+                parts.append(f"GPU cache: {stats['gpu_cache_usage_%']:.1f}%")
+            print(f"  Memory: {', '.join(parts)}")
+        return stats
+    except Exception:
+        return {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
@@ -214,6 +249,10 @@ def main():
         results["context"] = context_test(
             args.url, args.model, args.context_sizes,
             args.context_rounds)
+
+    # Memory stats from /metrics
+    print(f"\n--- Memory ---")
+    results["memory"] = memory_stats(args.url)
 
     print(f"\n{'='*60}")
     # Output JSON for programmatic use

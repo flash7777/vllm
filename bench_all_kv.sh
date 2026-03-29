@@ -42,17 +42,6 @@ test_kv() {
         --perf-rounds 3 \
         --math-count 10 2>&1 | tee /tmp/bench_${KV}.log | grep -E "^\s+(short|medium|long|Math):"
 
-    # Memory
-    local CONTAINER=$(podman ps --filter "name=mq-serve" --format "{{.Names}}" | head -1)
-    if [ -n "$CONTAINER" ]; then
-        podman exec "$CONTAINER" python3 -c "
-import torch
-a=torch.cuda.memory_allocated()/1024**3
-p=torch.cuda.max_memory_allocated()/1024**3
-print(f'  mem: {a:.1f} GiB (peak {p:.1f} GiB)')
-" 2>/dev/null
-    fi
-
     # Extract summary for results table
     local TPS=$(grep "short" /tmp/bench_${KV}.log 2>/dev/null | awk '{print $2}' | head -1)
     local MATH=$(grep "Math:" /tmp/bench_${KV}.log 2>/dev/null | head -1 | sed 's/.*Math: //')

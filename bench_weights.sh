@@ -62,16 +62,6 @@ test_variant() {
         --perf-rounds 3 \
         --math-count 10 2>&1 | tee /tmp/bench_${SAFE_LABEL}.log | grep -E "^\s+(short|medium|long|Math):"
 
-    # Memory
-    if [ -n "$CONTAINER" ]; then
-        podman exec "$CONTAINER" python3 -c "
-import torch
-a=torch.cuda.memory_allocated()/1024**3
-p=torch.cuda.max_memory_allocated()/1024**3
-print(f'  mem: {a:.1f} GiB (peak {p:.1f} GiB)')
-" 2>/dev/null
-    fi
-
     local TPS=$(grep "short" /tmp/bench_${SAFE_LABEL}.log 2>/dev/null | awk '{print $2}' | head -1)
     local MATH=$(grep "Math:" /tmp/bench_${SAFE_LABEL}.log 2>/dev/null | head -1 | sed 's/.*Math: //')
     RESULTS+=("$LABEL: short=${TPS:-?} tok/s  $MATH")
