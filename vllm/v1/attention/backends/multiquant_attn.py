@@ -168,20 +168,52 @@ class MultiQuantImpl:
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         pass
 
+    @staticmethod
+    def _recover_head_dim(packed_size: int, kv_cache_dtype: str) -> int:
+        """Recover real head_dim from packed_size (uint8 bytes).
+
+        The KV-cache Spec passes packed_size as head_size. We need the
+        real dimension D to index the rotation matrix correctly.
+        packed = ceil(D * mse_bits / 8) + ceil(D / 8) + 4
+        """
+        import math
+        from vllm.multiquant.registry import get_kv_quantizer_config
+        # Common head dims to check
+        for d in [64, 96, 128, 192, 256, 512]:
+            try:
+                cfg = get_kv_quantizer_config(kv_cache_dtype, d)
+                if cfg.key_packed_size == packed_size:
+                    return d
+            except Exception:
+                continue
+        # Brute force search
+        for d in range(32, 1025):
+            try:
+                cfg = get_kv_quantizer_config(kv_cache_dtype, d)
+                if cfg.key_packed_size == packed_size:
+                    return d
+            except Exception:
+                continue
+        # Fallback: assume head_size IS the real D (non-MQ path)
+        return packed_size
+
     def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
                  alibi_slopes=None, sliding_window=None, kv_cache_dtype="tq3",
                  logits_soft_cap=None, attn_type=AttentionType.DECODER,
                  kv_sharing_target_layer_name=None, **kwargs):
         self.num_heads = num_heads
-        self.head_size = head_size  # This is the REAL head_dim, not packed
+        # head_size from Spec is packed_size (uint8 bytes), not real head_dim.
+        # Recover real D: packed = ceil(D*mse_bits/8) + ceil(D/8) + 4
+        from vllm.multiquant.registry import get_kv_quantizer_config
+        real_head_dim = self._recover_head_dim(head_size, kv_cache_dtype)
+        self.head_size = real_head_dim
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads or num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
-        from vllm.multiquant.registry import get_kv_quantizer_config
-        self._tq_config = get_kv_quantizer_config(kv_cache_dtype, head_size)
+        self._tq_config = get_kv_quantizer_config(kv_cache_dtype, real_head_dim)
         self._packed_size = self._tq_config.key_packed_size
         self._mse_bits = self._tq_config.mse_bits
         self._mse_bytes = (head_size * self._mse_bits + 7) // 8
