@@ -266,15 +266,11 @@ void tq_fused_decode_attention(
     } else if (head_dim == 64 && mse_bits == 3) {
         LAUNCH(64, 3, 8);
     }
-    // HEAD_DIM=256 (GLM-4.7: Hq=20, D=256)
-    else if (head_dim == 256 && mse_bits == 2) {
-        LAUNCH(256, 2, 4);
-    } else if (head_dim == 256 && mse_bits == 3) {
-        LAUNCH(256, 3, 8);
-    }
+    // HEAD_DIM=256: unit test passes but serving produces degenerate output.
+    // Triton fallback works correctly. Disable CUDA for D=256 until debugged.
     else {
-        TORCH_CHECK(false, "TQ fused decode: unsupported config head_dim=",
-                    head_dim, " mse_bits=", mse_bits);
+        TORCH_CHECK(false, "TQ fused decode: D=256 disabled (serving bug), "
+                    "head_dim=", head_dim, " mse_bits=", mse_bits);
     }
     #undef LAUNCH
 }
