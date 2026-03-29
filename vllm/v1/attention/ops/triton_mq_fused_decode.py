@@ -604,41 +604,24 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Use pre-allocated buffers for CUDA Graph compatibility.
-    # CUDA Graphs record pointer addresses at capture time — new allocations
-    # (torch.zeros, torch.empty) would create new addresses that the graph
-    # doesn't know about, causing stale data reads ("all outputs = 1" bug).
-    global _decode_buffers
-    buf_key = (B, Hq, D, device)
-    if buf_key not in _decode_buffers:
-        _decode_buffers[buf_key] = {
-            "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
-            "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
-        }
-    buf = _decode_buffers[buf_key]
-
-    # 1. Pre-rotate + pre-project query (in-place into pre-allocated buffers)
+    # Fresh allocations every call (debug: testing if pre-alloc causes bug)
+    # TODO: restore pre-allocated buffers once bug is found
     q_flat = q.reshape(B * Hq, D).float()
     if is_rq:
-        _rq_rotate_forward(q_flat, Pi, out=buf["q_rot"])
-        q_rot = buf["q_rot"]
+        q_rot = _rq_rotate_forward(q_flat, Pi).contiguous()
     else:
-        torch.mm(q_flat, Pi.T, out=buf["q_rot"])
-        q_rot = buf["q_rot"]
-    torch.mm(q_flat, S.T, out=buf["q_proj"])
-    q_proj = buf["q_proj"]
+        q_rot = (q_flat @ Pi.T).contiguous()
+    q_proj = (q_flat @ S.T).contiguous()
 
-    # Reshape for kernel (views, no alloc)
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
 
-    # 2. Zero accumulators (in-place, same addresses)
-    centroid_acc = buf["centroid_acc"]
-    sign_acc = buf["sign_acc"]
-    centroid_acc.zero_()
-    sign_acc.zero_()
+    centroid_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
+    sign_acc = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
+
+    # Dummy buf for post-GEMV compatibility
+    buf = {"q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+           "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32)}
 
     # Debug logging (MQ_DEBUG=1)
     import os
@@ -730,10 +713,17 @@ def mq_fused_decode_attention(
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
     out_buf = buf["q_rot"]  # reuse pre-allocated buffer
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] PRE-GEMV: c_flat shape=%s norm=%.4f, Pi shape=%s norm=%.4f, out_buf shape=%s",
+                    c_flat.shape, c_flat.norm(), Pi.shape, Pi.norm(), out_buf.shape)
+        logger.info("[MQ_DEBUG] c_flat dtype=%s, Pi dtype=%s, out_buf dtype=%s",
+                    c_flat.dtype, Pi.dtype, out_buf.dtype)
     if is_rq:
         _rq_rotate_inverse(c_flat, Pi, out=out_buf)
     else:
         torch.mm(c_flat, Pi, out=out_buf)
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] POST-GEMV: out_buf norm=%.4f", out_buf.norm())
     # out_buf now contains v_mse; add QJL correction in-place
     # sign_correction = correction * (s_flat @ S)
     torch.mm(s_flat, S, out=buf["q_proj"])  # reuse q_proj buffer
