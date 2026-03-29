@@ -266,15 +266,12 @@ void tq_fused_decode_attention(
     } else if (head_dim == 64 && mse_bits == 3) {
         LAUNCH(64, 3, 8);
     }
-    // HEAD_DIM=256 (DeepSeek, etc)
-    else if (head_dim == 256 && mse_bits == 2) {
-        LAUNCH(256, 2, 4);
-    } else if (head_dim == 256 && mse_bits == 3) {
-        LAUNCH(256, 3, 8);
-    }
+    // HEAD_DIM=256: disabled — device-side assert at D=256 (GLM-4.7)
+    // Falls through to Triton fallback which works correctly.
     else {
         TORCH_CHECK(false, "TQ fused decode: unsupported config head_dim=",
-                    head_dim, " mse_bits=", mse_bits);
+                    head_dim, " mse_bits=", mse_bits,
+                    " (D=256 disabled, use Triton fallback)");
     }
     #undef LAUNCH
 }
