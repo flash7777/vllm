@@ -22,8 +22,8 @@ RIY_PROFILE=""
 TP=1
 PORT=8011
 SERVED_NAME="glm-4.7-flash"
-REASONING_PARSER="glm45"
-TOOL_PARSER="glm47"
+REASONING_PARSER=""
+TOOL_PARSER=""
 MAX_MODEL_LEN=32768
 # Auto-detect: GB10 Unified Memory needs lower util (nvidia-smi shows "Not Supported")
 if nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -q "N/A\|Not Supported"; then
@@ -69,8 +69,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpu-memory-utilization F GPU Memory Fraction (default: 0.05, GB10 Unified)"
             echo "  --kv-cache-memory-bytes N  KV-Cache Speicher, z.B. 10G (default: auto)"
             echo "  --served-model-name NAME   API Model-Name (default: glm-4.7-flash)"
-            echo "  --reasoning-parser PARSER  Reasoning Parser (default: glm45)"
-            echo "  --tool-call-parser PARSER  Tool-Call Parser (default: glm47)"
+            echo "  --reasoning-parser PARSER  Reasoning Parser (optional, z.B. glm45)"
+            echo "  --tool-call-parser PARSER  Tool-Call Parser (optional, z.B. glm47)"
             echo "  --port PORT                API Port (default: 8011)"
             echo "  --eager                    enforce-eager (kein CUDA Graphs)"
             echo "  --image IMAGE              Container Image (default: localhost/vllm-multiquant)"
@@ -138,6 +138,14 @@ if [[ -n "$KV_CACHE_MEM" ]]; then
     EXTRA_ARGS+=("--kv-cache-memory-bytes" "$KV_CACHE_MEM")
 fi
 
+# ── Parsers (only if explicitly set) ────────────────────
+if [[ -n "$TOOL_PARSER" ]]; then
+    EXTRA_ARGS+=("--tool-call-parser" "$TOOL_PARSER" "--enable-auto-tool-choice")
+fi
+if [[ -n "$REASONING_PARSER" ]]; then
+    EXTRA_ARGS+=("--reasoning-parser" "$REASONING_PARSER")
+fi
+
 # ── Banner ────────────────────────────────────────────────
 printf "╔══════════════════════════════════════════════════════╗\n"
 printf "║  MultiQuant Serve                                    ║\n"
@@ -199,9 +207,6 @@ podman run -d \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --kv-cache-dtype "$KV_DTYPE" \
-    --tool-call-parser "$TOOL_PARSER" \
-    --reasoning-parser "$REASONING_PARSER" \
-    --enable-auto-tool-choice \
     --trust-remote-code \
     "${QUANT_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"
