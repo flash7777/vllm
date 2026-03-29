@@ -9,8 +9,10 @@ RESULTS=()
 
 test_kv() {
     local KV=$1
+    local MDL=${2:-$MODEL}
+    local LABEL="${MDL##*/} / $KV"
     echo ""
-    echo "══════════ $KV ══════════"
+    echo "══════════ $LABEL ══════════"
 
     # Stop any running serve containers
     podman stop mq-serve 2>/dev/null || true
@@ -26,7 +28,7 @@ test_kv() {
     fi
     sleep 2
 
-    ./start.multiquant --model "$MODEL" --kv "$KV"
+    ./start.multiquant --model "$MDL" --kv "$KV"
 
     echo -n "  Warte... "
     for i in $(seq 1 600); do
@@ -37,17 +39,17 @@ test_kv() {
         if [ $i -gt 3 ] && podman logs mq-serve 2>&1 | tail -5 | grep -q "RuntimeError"; then
             if podman logs mq-serve 2>&1 | grep -q "out of memory\|OOM\|less than desired.*memory"; then
                 echo "OOM"
-                RESULTS+=("$KV: OOM")
+                RESULTS+=("$LABEL: OOM")
             else
                 echo "CRASHED"
                 podman logs mq-serve 2>&1 | grep "Error:" | tail -1
-                RESULTS+=("$KV: CRASHED")
+                RESULTS+=("$LABEL: CRASHED")
             fi
             return
         fi
         if [ $i -eq 600 ]; then
             echo "TIMEOUT"
-            RESULTS+=("$KV: TIMEOUT")
+            RESULTS+=("$LABEL: TIMEOUT")
             return
         fi
         sleep 5
@@ -58,23 +60,31 @@ test_kv() {
     python3 "$(dirname "$0")/bench.py" \
         --url http://localhost:8011 \
         --model glm-4.7-flash \
-        --label "$KV" \
+        --label "$LABEL" \
         --perf-rounds 3 \
-        --math-count 10 2>&1 | tee /tmp/bench_${KV}.log | grep -E "^\s+(short|medium|long|Math):"
+        --math-count 10 2>&1 | tee "/tmp/bench_kv_${KV}_${MDL##*/}.log" | grep -E "^\s+(short|medium|long|Math):"
 
     # Extract summary for results table
-    local TPS=$(grep "short" /tmp/bench_${KV}.log 2>/dev/null | awk '{print $2}' | head -1)
-    local MATH=$(grep "Math:" /tmp/bench_${KV}.log 2>/dev/null | head -1 | sed 's/.*Math: //')
-    RESULTS+=("$KV: short=${TPS:-?} tok/s  $MATH")
+    local TPS=$(grep "short" "/tmp/bench_kv_${KV}_${MDL##*/}.log" 2>/dev/null | awk '{print $2}' | head -1)
+    local MATH=$(grep "Math:" "/tmp/bench_kv_${KV}_${MDL##*/}.log" 2>/dev/null | head -1 | sed 's/.*Math: //')
+    RESULTS+=("$LABEL: short=${TPS:-?} tok/s  $MATH")
 }
 
 echo "MultiQuant KV Bench — Model: $MODEL"
 echo "════════════════════════════════════════"
 
-# Baselines first, then MultiQuant variants
+# INT4 model + all KV variants
 for KV in auto fp8 tq3 tq4 rq3 rq4 rq2; do
-    test_kv "$KV"
+    test_kv "$KV" "$MODEL"
 done
+
+# BF16 model baselines (same KV variants, different weight format)
+BF16_MODEL="GLM-4.7-Flash"
+if [ -d "/data/tensordata/$BF16_MODEL" ]; then
+    for KV in auto fp8 tq3 tq4; do
+        test_kv "$KV" "$BF16_MODEL"
+    done
+fi
 
 echo ""
 echo "════════════════════════════════════════"
@@ -84,7 +94,7 @@ for r in "${RESULTS[@]}"; do
     printf "  %-6s %s\n" "$(echo "$r" | cut -d: -f1):" "$(echo "$r" | cut -d: -f2-)"
 done
 echo ""
-echo "  auto=BF16 KV, fp8=FP8 KV (baselines)"
+echo "  auto=BF16 KV, fp8=FP8 KV"
 echo "════════════════════════════════════════"
 
 podman stop mq-serve 2>/dev/null || true
