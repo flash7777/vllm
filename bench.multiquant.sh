@@ -75,6 +75,24 @@ bench "Short"  "Was ist 2+2? Antworte nur mit der Zahl." 16
 bench "Medium" "Erkläre was ein Transformer ist in 3 Sätzen." 128
 bench "Long"   "Schreibe eine ausführliche Erklärung von Attention in neuronalen Netzen." 512
 
+# Memory usage (via container python)
+echo ""
+echo "Speicher:"
+CONTAINER=$(podman ps --filter "publish=8011" --format "{{.Names}}" | head -1)
+if [ -n "$CONTAINER" ]; then
+    podman exec "$CONTAINER" python3 -c "
+import torch
+alloc = torch.cuda.memory_allocated() / 1024**3
+reserved = torch.cuda.memory_reserved() / 1024**3
+max_alloc = torch.cuda.max_memory_allocated() / 1024**3
+free, total = torch.cuda.mem_get_info()
+print(f'  Allocated:     {alloc:.2f} GiB')
+print(f'  Reserved:      {reserved:.2f} GiB')
+print(f'  Peak:          {max_alloc:.2f} GiB')
+print(f'  GPU Free:      {free/1024**3:.2f} / {total/1024**3:.2f} GiB')
+" 2>/dev/null || echo "  (Container nicht erreichbar)"
+fi
+
 echo ""
 echo "Vergleich FP8 (Baseline):"
 echo "  Short:  37.2 tok/s"
