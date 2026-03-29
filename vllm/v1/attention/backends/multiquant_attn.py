@@ -114,12 +114,16 @@ class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
         from vllm.v1.attention.backend import AttentionCGSupport
-        # kv_cache_spec.dtype is torch.uint8 (packed), not the string "rq3".
-        # Get the actual KV dtype string from cache config.
         kv_dtype = str(getattr(vllm_config.cache_config, 'cache_dtype', ''))
         if kv_dtype.startswith("rq"):
-            return AttentionCGSupport.NEVER  # RQ → PIECEWISE
-        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE  # TQ → full decode graphs
+            # RQ with fused Clifford kernel → graph-safe
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_clifford_kernel,
+            )
+            if _load_clifford_kernel() is not None:
+                return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport.NEVER  # Python fallback → PIECEWISE
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE  # TQ
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)

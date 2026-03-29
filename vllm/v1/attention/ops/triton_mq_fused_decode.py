@@ -498,37 +498,87 @@ def _load_cuda_kernel():
         return None
 
 
+_clifford_kernel = None
+_clifford_kernel_tried = False
+
+
+def _load_clifford_kernel():
+    """JIT compile the fused Clifford sandwich kernel."""
+    global _clifford_kernel, _clifford_kernel_tried
+    if _clifford_kernel_tried:
+        return _clifford_kernel
+    _clifford_kernel_tried = True
+
+    import os
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "rotorquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/rq_build"
+    src_file = os.path.join(src_dir, "clifford_sandwich.cu")
+    if not os.path.exists(src_file):
+        logger.warning("Clifford sandwich: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _clifford_kernel = load(
+            name="clifford_sandwich",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+            ],
+            verbose=False,
+        )
+        logger.info("Clifford sandwich CUDA kernel compiled and loaded")
+        return _clifford_kernel
+    except Exception as e:
+        logger.warning("Clifford sandwich CUDA kernel FAILED: %s", e)
+        return None
+
+
 def _rq_rotate_forward(x, rotors):
-    """RQ forward rotation: Clifford rotor sandwich.
-
-    Must be called OUTSIDE CUDA Graph capture (uses Python control flow).
-    """
-    # Import at module level would break non-RQ users. Cache after first call.
-    global _rq_clifford
-    if "_rq_clifford" not in globals() or _rq_clifford is None:
-        from vllm.multiquant.rotorquant import clifford as _mod
-        _rq_clifford = _mod
-    c = _rq_clifford
+    """RQ forward rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
-    mv = c.embed_vectors_as_multivectors(x)
-    mv_rot = c.rotor_sandwich(rotors, mv)
-    return c.extract_vectors_from_multivectors(mv_rot, D)
-
-_rq_clifford = None
+    kernel = _load_clifford_kernel()
+    if kernel is not None:
+        out = torch.empty_like(x)
+        kernel.clifford_sandwich_forward(x.float().contiguous(),
+                                         rotors.float().contiguous(),
+                                         out, D)
+        return out
+    # Python fallback (~70 kernel launches, not graph-safe)
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors,
+    )
+    mv = embed_vectors_as_multivectors(x)
+    mv_rot = rotor_sandwich(rotors, mv)
+    return extract_vectors_from_multivectors(mv_rot, D)
 
 
 def _rq_rotate_inverse(x, rotors):
-    """RQ inverse rotation: reverse rotor sandwich."""
-    global _rq_clifford
-    if _rq_clifford is None:
-        from vllm.multiquant.rotorquant import clifford as _mod
-        _rq_clifford = _mod
-    c = _rq_clifford
+    """RQ inverse rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
-    mv = c.embed_vectors_as_multivectors(x)
-    rotor_rev = c.reverse(rotors)
-    mv_recon = c.rotor_sandwich(rotor_rev, mv)
-    return c.extract_vectors_from_multivectors(mv_recon, D)
+    kernel = _load_clifford_kernel()
+    if kernel is not None:
+        out = torch.empty_like(x)
+        kernel.clifford_sandwich_inverse(x.float().contiguous(),
+                                          rotors.float().contiguous(),
+                                          out, D)
+        return out
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors, reverse,
+    )
+    mv = embed_vectors_as_multivectors(x)
+    rotor_rev = reverse(rotors)
+    mv_recon = rotor_sandwich(rotor_rev, mv)
+    return extract_vectors_from_multivectors(mv_recon, D)
 
 
 def mq_fused_decode_attention(
