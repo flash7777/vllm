@@ -62,7 +62,8 @@ print(f'  mem: {a:.1f} GiB (peak {p:.1f} GiB)')
 echo "MultiQuant KV Bench — Model: $MODEL"
 echo "════════════════════════════════════════"
 
-for KV in tq3 tq4 rq3 rq4 rq2; do
+# Baselines first, then MultiQuant variants
+for KV in auto fp8 tq3 tq4 rq3 rq4 rq2; do
     test_kv "$KV"
 done
 
@@ -74,7 +75,7 @@ for r in "${RESULTS[@]}"; do
     printf "  %-6s %s\n" "$(echo "$r" | cut -d: -f1):" "$(echo "$r" | cut -d: -f2-)"
 done
 echo ""
-echo "  FP8 Baseline: 37-40 tok/s"
+echo "  auto=BF16 KV, fp8=FP8 KV (baselines)"
 echo "════════════════════════════════════════"
 
 podman stop mq-serve 2>/dev/null || true
