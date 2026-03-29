@@ -79,8 +79,24 @@ print(f'{a:.1f}/{p:.1f} GiB')
 
     if [ "$TOKS" -gt 0 ]; then
         local TPS=$(python3 -c "print(f'{$TOKS / ($MS / 1000):.1f}')")
-        echo "  → $LABEL: $TOKS tok / ${MS}ms = $TPS tok/s  [mem: $MEM]"
-        RESULTS+=("$LABEL: $TPS tok/s  mem=$MEM")
+
+        # Math accuracy test (5 questions)
+        local MATH_OK=0
+        local MATH_TOTAL=5
+        for pair in "7*8:56" "123+456:579" "1000-237:763" "144/12:12" "15*15:225"; do
+            local Q=$(echo "$pair" | cut -d: -f1)
+            local A=$(echo "$pair" | cut -d: -f2)
+            local RESP_MATH=$(curl -s http://localhost:8011/v1/completions -H "Content-Type: application/json" \
+                -d "{\"model\":\"glm-4.7-flash\",\"prompt\":\"Calculate: $Q = \",\"max_tokens\":8,\"temperature\":0}" 2>/dev/null)
+            local ANS=$(echo "$RESP_MATH" | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['text'])" 2>/dev/null || echo "")
+            if echo "$ANS" | grep -q "$A"; then
+                MATH_OK=$((MATH_OK + 1))
+            fi
+        done
+        local MATH_PCT=$((MATH_OK * 100 / MATH_TOTAL))
+
+        echo "  → $LABEL: $TPS tok/s  math=$MATH_OK/$MATH_TOTAL (${MATH_PCT}%)  [mem: $MEM]"
+        RESULTS+=("$LABEL: $TPS tok/s  math=${MATH_PCT}%  mem=$MEM")
     else
         echo "  → $LABEL: FEHLER"
         RESULTS+=("$LABEL: FEHLER")
