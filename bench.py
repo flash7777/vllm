@@ -48,7 +48,7 @@ def chat(url, model, prompt, max_tokens=200, temperature=0):
         headers={"Content-Type": "application/json"},
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         body = json.loads(resp.read())
     elapsed = time.time() - t0
     msg = body["choices"][0]["message"]
