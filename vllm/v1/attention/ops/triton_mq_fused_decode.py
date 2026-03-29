@@ -644,10 +644,8 @@ def mq_fused_decode_attention(
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
     if is_rq:
-        # RQ: Clifford inverse rotation on centroid accumulator
         v_mse = _rq_rotate_inverse(c_flat, Pi)
     else:
-        # TQ: dense matrix multiply
         v_mse = c_flat @ Pi
     output = v_mse + correction * (s_flat @ S)
 

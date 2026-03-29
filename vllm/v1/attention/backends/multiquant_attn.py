@@ -106,13 +106,18 @@ class MultiQuantAttentionBackend(AttentionBackend):
 # ============================================================
 
 class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
-    # TODO: UNIFORM_SINGLE_TOKEN_DECODE crashes with StreamCaptureInvalidated.
-    # Root cause: something in mq_fused_decode_attention is not graph-safe
-    # (possibly torch.zeros allocation or .contiguous() during capture).
-    # CUDA kernel itself is 0.1ms (6700 tok/s isolated). Bottleneck is
-    # PIECEWISE overhead (~20ms/step Python dispatch).
     from vllm.v1.attention.backend import AttentionCGSupport
+    # TQ: CUDA kernel is graph-safe → full decode graphs
+    # RQ: Clifford rotation has Python control flow → PIECEWISE only
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        from vllm.v1.attention.backend import AttentionCGSupport
+        kv_dtype = getattr(kv_cache_spec, 'dtype', '')
+        if isinstance(kv_dtype, str) and kv_dtype.startswith("rq"):
+            return AttentionCGSupport.NEVER  # RQ → PIECEWISE
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE  # TQ → full decode graphs
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
