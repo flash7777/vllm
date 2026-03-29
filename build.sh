@@ -14,15 +14,15 @@ IMAGE="vllm-multiquant"
 BASE="nvcr.io/nvidia/vllm:26.02-py3"
 ARCHS="12.0a;12.1a"
 JOBS=16
-EXTRA=""
+EXTRA="--no-cache"  # Default: fresh git clone (ccache handles C++ speed)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --rtx)       ARCHS="12.0a"; shift ;;
-        --jobs)      JOBS="$2"; shift 2 ;;
-        --no-cache)  EXTRA="--no-cache"; shift ;;
-        --tag)       IMAGE="$2"; shift 2 ;;
-        *)           echo "Unknown: $1"; exit 1 ;;
+        --rtx)              ARCHS="12.0a"; shift ;;
+        --jobs)             JOBS="$2"; shift 2 ;;
+        --use-layer-cache)  EXTRA=""; shift ;;
+        --tag)              IMAGE="$2"; shift 2 ;;
+        *)                  echo "Unknown: $1"; exit 1 ;;
     esac
 done
 
