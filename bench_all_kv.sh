@@ -33,55 +33,30 @@ test_kv() {
         sleep 5
     done
 
-    # Warmup
-    curl -s http://localhost:8011/v1/completions -H "Content-Type: application/json" \
-        -d '{"model":"glm-4.7-flash","prompt":"hi","max_tokens":5}' > /dev/null 2>&1
-    sleep 1
-
-    # Bench: 100 tokens
-    local START=$(date +%s%N)
-    local RESP=$(curl -s http://localhost:8011/v1/completions -H "Content-Type: application/json" \
-        -d '{"model":"glm-4.7-flash","prompt":"Explain attention in transformers in detail:\n\n","max_tokens":100,"temperature":0}')
-    local END=$(date +%s%N)
-    local TOKS=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['usage']['completion_tokens'])" 2>/dev/null || echo 0)
-    local MS=$(( (END - START) / 1000000 ))
+    # Run bench.py (perf + math + optional context)
+    echo "  Benchmarking..."
+    python3 "$(dirname "$0")/bench.py" \
+        --url http://localhost:8011 \
+        --model glm-4.7-flash \
+        --label "$KV" \
+        --perf-rounds 3 \
+        --math-count 10 2>&1 | tee /tmp/bench_${KV}.log | grep -E "^\s+(short|medium|long|Math):"
 
     # Memory
-    local MEM=""
     local CONTAINER=$(podman ps --filter "name=mq-serve" --format "{{.Names}}" | head -1)
     if [ -n "$CONTAINER" ]; then
-        MEM=$(podman exec "$CONTAINER" python3 -c "
+        podman exec "$CONTAINER" python3 -c "
 import torch
 a=torch.cuda.memory_allocated()/1024**3
 p=torch.cuda.max_memory_allocated()/1024**3
-print(f'{a:.1f}/{p:.1f} GiB')
-" 2>/dev/null || echo "?")
+print(f'  mem: {a:.1f} GiB (peak {p:.1f} GiB)')
+" 2>/dev/null
     fi
 
-    if [ "$TOKS" -gt 0 ]; then
-        local TPS=$(python3 -c "print(f'{$TOKS / ($MS / 1000):.1f}')")
-
-        # Math accuracy test (5 questions)
-        local MATH_OK=0
-        local MATH_TOTAL=5
-        for pair in "7*8:56" "123+456:579" "1000-237:763" "144/12:12" "15*15:225"; do
-            local Q=$(echo "$pair" | cut -d: -f1)
-            local A=$(echo "$pair" | cut -d: -f2)
-            local RESP_MATH=$(curl -s http://localhost:8011/v1/completions -H "Content-Type: application/json" \
-                -d "{\"model\":\"glm-4.7-flash\",\"prompt\":\"Calculate: $Q = \",\"max_tokens\":8,\"temperature\":0}" 2>/dev/null)
-            local ANS=$(echo "$RESP_MATH" | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['text'])" 2>/dev/null || echo "")
-            if echo "$ANS" | grep -q "$A"; then
-                MATH_OK=$((MATH_OK + 1))
-            fi
-        done
-        local MATH_PCT=$((MATH_OK * 100 / MATH_TOTAL))
-
-        echo "  → $KV: $TPS tok/s  math=$MATH_OK/$MATH_TOTAL (${MATH_PCT}%)  [mem: $MEM]"
-        RESULTS+=("$KV: $TPS tok/s  math=${MATH_PCT}%  mem=$MEM")
-    else
-        echo "  → $KV: FEHLER"
-        RESULTS+=("$KV: FEHLER")
-    fi
+    # Extract summary for results table
+    local TPS=$(grep "short" /tmp/bench_${KV}.log 2>/dev/null | awk '{print $2}' | head -1)
+    local MATH=$(grep "Math:" /tmp/bench_${KV}.log 2>/dev/null | head -1 | sed 's/.*Math: //')
+    RESULTS+=("$KV: short=${TPS:-?} tok/s  $MATH")
 }
 
 echo "MultiQuant KV Bench — Model: $MODEL"

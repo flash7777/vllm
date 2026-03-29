@@ -114,8 +114,10 @@ class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
         from vllm.v1.attention.backend import AttentionCGSupport
-        kv_dtype = getattr(kv_cache_spec, 'dtype', '')
-        if isinstance(kv_dtype, str) and kv_dtype.startswith("rq"):
+        # kv_cache_spec.dtype is torch.uint8 (packed), not the string "rq3".
+        # Get the actual KV dtype string from cache config.
+        kv_dtype = str(getattr(vllm_config.cache_config, 'cache_dtype', ''))
+        if kv_dtype.startswith("rq"):
             return AttentionCGSupport.NEVER  # RQ → PIECEWISE
         return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE  # TQ → full decode graphs
 
