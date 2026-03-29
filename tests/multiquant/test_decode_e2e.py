@@ -158,6 +158,83 @@ class TestRQDecode:
         cos = F.cosine_similarity(x, x_back, dim=-1).mean()
         assert cos > 0.99, f"RQ roundtrip failed: cos={cos:.4f}"
 
+    @pytest.mark.parametrize("D", [128, 129, 256, 512])
+    def test_clifford_cuda_kernel_vs_python(self, D):
+        """Fused CUDA Clifford sandwich must match Python reference."""
+        from vllm.multiquant.rotorquant.quantizer import generate_rotors
+        from vllm.multiquant.rotorquant.clifford import (
+            embed_vectors_as_multivectors,
+            extract_vectors_from_multivectors,
+            rotor_sandwich, reverse,
+        )
+
+        rotors = generate_rotors(D, seed=42).to("cuda").float()
+        torch.manual_seed(42)
+        x = torch.randn(8, D, device="cuda")
+
+        # Python reference: forward
+        mv = embed_vectors_as_multivectors(x)
+        mv_rot = rotor_sandwich(rotors, mv)
+        ref_fwd = extract_vectors_from_multivectors(mv_rot, D)
+
+        # Python reference: inverse
+        rotor_rev = reverse(rotors)
+        mv_inv = rotor_sandwich(rotor_rev, embed_vectors_as_multivectors(x))
+        ref_inv = extract_vectors_from_multivectors(mv_inv, D)
+
+        # CUDA kernel
+        try:
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_clifford_kernel,
+            )
+            kernel = _load_clifford_kernel()
+        except Exception:
+            kernel = None
+        if kernel is None:
+            pytest.skip("Clifford CUDA kernel not available")
+
+        cuda_fwd = torch.empty_like(x)
+        kernel.clifford_sandwich_forward(
+            x.float().contiguous(), rotors.contiguous(), cuda_fwd, D)
+
+        cuda_inv = torch.empty_like(x)
+        kernel.clifford_sandwich_inverse(
+            x.float().contiguous(), rotors.contiguous(), cuda_inv, D)
+
+        # Compare
+        cos_fwd = F.cosine_similarity(ref_fwd, cuda_fwd, dim=-1).mean()
+        cos_inv = F.cosine_similarity(ref_inv, cuda_inv, dim=-1).mean()
+        assert cos_fwd > 0.999, f"Forward D={D}: cos={cos_fwd:.6f}"
+        assert cos_inv > 0.999, f"Inverse D={D}: cos={cos_inv:.6f}"
+
+    def test_clifford_cuda_roundtrip(self):
+        """CUDA forward → CUDA inverse ≈ identity."""
+        D = 128
+        from vllm.multiquant.rotorquant.quantizer import generate_rotors
+        rotors = generate_rotors(D, seed=42).to("cuda").float()
+        torch.manual_seed(42)
+        x = torch.randn(16, D, device="cuda")
+
+        try:
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_clifford_kernel,
+            )
+            kernel = _load_clifford_kernel()
+        except Exception:
+            kernel = None
+        if kernel is None:
+            pytest.skip("Clifford CUDA kernel not available")
+
+        fwd = torch.empty_like(x)
+        kernel.clifford_sandwich_forward(
+            x.float().contiguous(), rotors.contiguous(), fwd, D)
+        back = torch.empty_like(x)
+        kernel.clifford_sandwich_inverse(
+            fwd.float().contiguous(), rotors.contiguous(), back, D)
+
+        cos = F.cosine_similarity(x, back, dim=-1).mean()
+        assert cos > 0.999, f"CUDA roundtrip: cos={cos:.6f}"
+
     def test_rq_compressed_score(self):
         """RQ compressed score ≈ real Q·K score."""
         D = 128
