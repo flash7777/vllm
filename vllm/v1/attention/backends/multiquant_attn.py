@@ -169,33 +169,32 @@ class MultiQuantImpl:
         pass
 
     @staticmethod
-    def _recover_head_dim(packed_size: int, kv_cache_dtype: str) -> int:
-        """Recover real head_dim from packed_size (uint8 bytes).
+    def _recover_head_dim(head_size: int, kv_cache_dtype: str) -> int:
+        """Recover real head_dim from head_size parameter.
 
-        The KV-cache Spec passes packed_size as head_size. We need the
-        real dimension D to index the rotation matrix correctly.
-        packed = ceil(D * mse_bits / 8) + ceil(D / 8) + 4
+        vLLM passes EITHER the real head_dim (256) OR the packed_size (100)
+        depending on the code path. Check if head_size is already a valid D
+        (i.e., its packed_size != head_size), else reverse-map from packed.
         """
-        import math
         from vllm.multiquant.registry import get_kv_quantizer_config
-        # Common head dims to check
+        # Check if head_size IS already the real D
+        try:
+            cfg = get_kv_quantizer_config(kv_cache_dtype, head_size)
+            if cfg.key_packed_size != head_size:
+                # head_size is real D (packed would be different)
+                return head_size
+        except Exception:
+            pass
+        # head_size is packed_size — reverse map to real D
         for d in [64, 96, 128, 192, 256, 512]:
             try:
                 cfg = get_kv_quantizer_config(kv_cache_dtype, d)
-                if cfg.key_packed_size == packed_size:
+                if cfg.key_packed_size == head_size:
                     return d
             except Exception:
                 continue
-        # Brute force search
-        for d in range(32, 1025):
-            try:
-                cfg = get_kv_quantizer_config(kv_cache_dtype, d)
-                if cfg.key_packed_size == packed_size:
-                    return d
-            except Exception:
-                continue
-        # Fallback: assume head_size IS the real D (non-MQ path)
-        return packed_size
+        # Fallback
+        return head_size
 
     def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
                  alibi_slopes=None, sliding_window=None, kv_cache_dtype="tq3",
