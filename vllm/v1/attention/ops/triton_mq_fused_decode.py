@@ -492,28 +492,36 @@ def _load_cuda_kernel():
 
 
 def _rq_rotate_forward(x, rotors):
-    """RQ forward rotation: Clifford rotor sandwich."""
-    from vllm.multiquant.rotorquant.clifford import (
-        embed_vectors_as_multivectors, rotor_sandwich,
-        extract_vectors_from_multivectors,
-    )
+    """RQ forward rotation: Clifford rotor sandwich.
+
+    Must be called OUTSIDE CUDA Graph capture (uses Python control flow).
+    """
+    # Import at module level would break non-RQ users. Cache after first call.
+    global _rq_clifford
+    if "_rq_clifford" not in globals() or _rq_clifford is None:
+        from vllm.multiquant.rotorquant import clifford as _mod
+        _rq_clifford = _mod
+    c = _rq_clifford
     D = x.shape[-1]
-    mv = embed_vectors_as_multivectors(x)
-    mv_rot = rotor_sandwich(rotors, mv)
-    return extract_vectors_from_multivectors(mv_rot, D)
+    mv = c.embed_vectors_as_multivectors(x)
+    mv_rot = c.rotor_sandwich(rotors, mv)
+    return c.extract_vectors_from_multivectors(mv_rot, D)
+
+_rq_clifford = None
 
 
 def _rq_rotate_inverse(x, rotors):
     """RQ inverse rotation: reverse rotor sandwich."""
-    from vllm.multiquant.rotorquant.clifford import (
-        embed_vectors_as_multivectors, rotor_sandwich,
-        extract_vectors_from_multivectors, reverse,
-    )
+    global _rq_clifford
+    if _rq_clifford is None:
+        from vllm.multiquant.rotorquant import clifford as _mod
+        _rq_clifford = _mod
+    c = _rq_clifford
     D = x.shape[-1]
-    mv = embed_vectors_as_multivectors(x)
-    rotor_rev = reverse(rotors)
-    mv_recon = rotor_sandwich(rotor_rev, mv)
-    return extract_vectors_from_multivectors(mv_recon, D)
+    mv = c.embed_vectors_as_multivectors(x)
+    rotor_rev = c.reverse(rotors)
+    mv_recon = c.rotor_sandwich(rotor_rev, mv)
+    return c.extract_vectors_from_multivectors(mv_recon, D)
 
 
 def mq_fused_decode_attention(
