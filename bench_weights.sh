@@ -43,10 +43,20 @@ test_variant() {
             echo "ready (${i}x5s)"
             break
         fi
-        if [ $i -gt 15 ] && podman logs mq-serve 2>&1 | tail -3 | grep -q "RuntimeError"; then
-            echo "CRASHED"
-            podman logs mq-serve 2>&1 | grep "Error:" | tail -1
-            RESULTS+=("$LABEL: CRASHED")
+        if [ $i -gt 15 ] && podman logs mq-serve 2>&1 | tail -5 | grep -q "RuntimeError"; then
+            if podman logs mq-serve 2>&1 | grep -q "out of memory\|OOM\|less than desired.*memory"; then
+                echo "OOM"
+                RESULTS+=("$LABEL: OOM")
+            else
+                echo "CRASHED"
+                podman logs mq-serve 2>&1 | grep "Error:" | tail -1
+                RESULTS+=("$LABEL: CRASHED")
+            fi
+            return
+        fi
+        if [ $i -eq 120 ]; then
+            echo "TIMEOUT"
+            RESULTS+=("$LABEL: TIMEOUT")
             return
         fi
         sleep 5
