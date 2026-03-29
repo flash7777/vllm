@@ -20,9 +20,14 @@ test_variant() {
     podman rm mq-serve 2>/dev/null || true
     sleep 2
 
+    local MTP=${4:-false}
+
     local ARGS=(--model "$MODEL" --kv "$KV" --max-model-len "$MAX_LEN")
     if [ -n "$WEIGHTS" ]; then
         ARGS+=(--weights "$WEIGHTS")
+    fi
+    if [ "$MTP" = "true" ]; then
+        ARGS+=(--mtp)
     fi
     ./start.multiquant "${ARGS[@]}"
 
@@ -89,6 +94,11 @@ test_variant "BF16→Archer RQ3"  "GLM-4.7-Flash"  "rq3"
 
 # FP8 model + Archer (FP8→compressed, double quant)
 test_variant "FP8→Archer TQ3"   "GLM-4.7-Flash-FP8"  "tq3"
+
+# MTP variants (GLM-4.7 supports MTP via num_nextn_predict_layers)
+test_variant "INT4+MTP"         "GLM-4.7-Flash-int4-AutoRound"  ""    "true"
+test_variant "FP8+MTP"          "GLM-4.7-Flash-FP8"             ""    "true"
+test_variant "BF16→TQ3+MTP"    "GLM-4.7-Flash"                 "tq3" "true"
 
 echo ""
 echo "════════════════════════════════════════"
