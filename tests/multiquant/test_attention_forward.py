@@ -80,6 +80,21 @@ def _make_metadata(seq_lens, block_table, slot_mapping,
     )
 
 
+# ── 0. Init Smoke Tests ──────────────────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestImplInit:
+    """MultiQuantImpl.__init__ must not crash for any KV dtype."""
+
+    @pytest.mark.parametrize("dtype", ["tq3", "tq4", "rq2", "rq3", "rq4"])
+    def test_init_all_dtypes(self, dtype):
+        """_is_rq must be set before pre-load block references it."""
+        impl, layer = _make_impl(D=128, kv_cache_dtype=dtype)
+        assert impl._is_rq == dtype.startswith("rq")
+        assert impl._decode_fn is not None
+        assert impl._mse_bits > 0
+
+
 # ── 1. KV Cache Update (Pack + Write) ────────────────────────────────
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
