@@ -261,5 +261,13 @@ class Conv3dLayer(ConvLayerBase):
             is_torch_equal("2.9.0") or is_torch_equal("2.9.1")
             or torch.cuda.get_device_capability()[0] >= 12
         ):
+            if not getattr(self, '_logged_mulmat', False):
+                import logging
+                logging.getLogger("vllm").info(
+                    "Conv3D: using matmul fallback (SM%d%d / PyTorch %s)",
+                    *torch.cuda.get_device_capability(),
+                    torch.__version__[:8],
+                )
+                self._logged_mulmat = True
             return self._forward_mulmat(x)
         return self._forward_conv(x)
