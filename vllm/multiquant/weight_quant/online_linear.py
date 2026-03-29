@@ -254,8 +254,8 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
                 )
                 if result is not None:
                     return result
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Archer cuda_decompress fallback: %s", e)
 
         # Try CUDA unpack kernel (eliminates Python bit-loops)
         # Only for dimensions that have been tested (128-2048)
@@ -269,7 +269,8 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
             if result is not None:
                 idx, signs, row_norms, res_norms = result
                 idx = idx.long()
-        except Exception:
+        except Exception as e:
+            logger.debug("Archer cuda_unpack fallback: %s", e)
             result = None
 
         if result is None:

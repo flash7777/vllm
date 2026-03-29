@@ -378,7 +378,8 @@ class MultiQuantImpl:
                 try:
                     from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
                     k_result = cuda_unpack(k_packed.contiguous(), D, self._mse_bits)
-                except Exception:
+                except Exception as e:
+                    logger.debug("K cuda_unpack fallback: %s", e)
                     k_result = None
 
                 if k_result is not None:
@@ -430,7 +431,8 @@ class MultiQuantImpl:
                     # V unpack
                     try:
                         v_result = cuda_unpack(v_packed.contiguous(), D, self._mse_bits)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("V cuda_unpack fallback: %s", e)
                         v_result = None
 
                     if v_result is not None:

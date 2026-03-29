@@ -451,6 +451,10 @@ def _mq_fused_decode_kernel_v2(
 
 _cuda_kernel = None
 _cuda_kernel_tried = False
+_decode_path_logged = False
+
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 
 def _load_cuda_kernel():
@@ -469,6 +473,7 @@ def _load_cuda_kernel():
         src_dir = "/opt/tq_build"
     src_file = os.path.join(src_dir, "tq_compressed_attention.cu")
     if not os.path.exists(src_file):
+        logger.warning("TQ fused decode: source not found at %s", src_file)
         return None
 
     try:
@@ -486,8 +491,10 @@ def _load_cuda_kernel():
             ],
             verbose=False,
         )
+        logger.info("TQ fused decode CUDA kernel compiled and loaded")
         return _cuda_kernel
-    except Exception:
+    except Exception as e:
+        logger.warning("TQ fused decode CUDA kernel FAILED: %s", e)
         return None
 
 
@@ -589,13 +596,19 @@ def mq_fused_decode_attention(
             )
             cuda_ok = True
         except Exception as e:
-            import logging
-            logging.getLogger("vllm").warning("CUDA fused decode failed: %s", e)
+            logger.warning("CUDA fused decode call failed: %s", e)
+
+    global _decode_path_logged
+    if not _decode_path_logged:
+        if cuda_ok:
+            logger.info("MQ decode: using CUDA fused kernel")
+        else:
+            logger.warning("MQ decode: CUDA kernel unavailable, using Triton fallback (slower)")
+        _decode_path_logged = True
 
     if not cuda_ok:
         # WARNING: Triton fallback invalidates CUDA Graphs!
         # Only safe outside graph capture.
-        # Triton fallback (slower, not CUDA Graph safe)
         packed_size = kv_cache.shape[-1]
         mse_bytes = (D * mse_bits + 7) // 8
         qjl_bytes = (D + 7) // 8
