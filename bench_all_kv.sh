@@ -11,8 +11,19 @@ test_kv() {
     local KV=$1
     echo ""
     echo "══════════ $KV ══════════"
+
+    # Stop any running serve containers
     podman stop mq-serve 2>/dev/null || true
     podman rm mq-serve 2>/dev/null || true
+
+    # Check for competing GPU processes
+    local GPU_PROCS=$(nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader 2>/dev/null | grep -v "^$" | wc -l)
+    if [ "$GPU_PROCS" -gt 0 ]; then
+        echo "  WARNING: $GPU_PROCS GPU process(es) still running:"
+        nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/    /'
+        echo "  Waiting 10s for cleanup..."
+        sleep 10
+    fi
     sleep 2
 
     ./start.multiquant --model "$MODEL" --kv "$KV"

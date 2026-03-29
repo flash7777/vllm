@@ -5,7 +5,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MAX_LEN=40000
 KV=tq3
 RESULTS=()
 
@@ -18,6 +17,15 @@ test_variant() {
     echo "══════════ $LABEL ══════════"
     podman stop mq-serve 2>/dev/null || true
     podman rm mq-serve 2>/dev/null || true
+
+    # Check for competing GPU processes
+    local GPU_PROCS=$(nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader 2>/dev/null | grep -v "^$" | wc -l)
+    if [ "$GPU_PROCS" -gt 0 ]; then
+        echo "  WARNING: $GPU_PROCS GPU process(es) still running:"
+        nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/    /'
+        echo "  Waiting 10s for cleanup..."
+        sleep 10
+    fi
     sleep 2
 
     local MTP=${4:-false}
@@ -28,7 +36,7 @@ test_variant() {
         KV_USE="$WEIGHTS"  # Archer rq3 → KV rq3
     fi
 
-    local ARGS=(--model "$MODEL" --kv "$KV_USE" --max-model-len "$MAX_LEN")
+    local ARGS=(--model "$MODEL" --kv "$KV_USE")
     if [ -n "$WEIGHTS" ]; then
         ARGS+=(--weights "$WEIGHTS")
     fi
