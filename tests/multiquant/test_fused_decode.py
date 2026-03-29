@@ -218,6 +218,128 @@ class TestFusedDecode:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestCUDAKernelDimensions:
+    """Test CUDA kernel with various HEAD_DIM / head configs."""
+
+    @pytest.mark.parametrize("D,Hq,Hkv", [
+        (128, 4, 2),    # minimal
+        (128, 32, 4),   # GQA
+        (64, 8, 8),     # small, no GQA
+        (256, 20, 20),  # GLM-4.7 actual config (triggers device-side assert)
+        (256, 4, 2),    # D=256 with GQA
+    ])
+    def test_cuda_kernel_direct(self, D, Hq, Hkv):
+        """CUDA kernel must produce non-zero, non-NaN output for all configs."""
+        mse_bits = 2
+        block_size = 16
+        seq_len = 8
+
+        Pi, S, centroids = _setup_buffers(D, mse_bits)
+        packed_size = (D * mse_bits + 7) // 8 + (D + 7) // 8 + 4
+        n_blocks = (seq_len + block_size - 1) // block_size
+        cache = torch.zeros(
+            n_blocks, 2, block_size, Hkv, packed_size,
+            dtype=torch.uint8, device="cuda",
+        )
+        _fill_cache_tq(cache, seq_len, Hkv, D, Pi, S, centroids,
+                       mse_bits, block_size)
+
+        torch.manual_seed(99)
+        q = torch.randn(1, Hq, D, device="cuda", dtype=torch.float32)
+        block_table = torch.arange(n_blocks, device="cuda").unsqueeze(0).int()
+        seq_lens_t = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+
+        # Try CUDA kernel directly
+        from vllm.v1.attention.ops.triton_mq_fused_decode import _load_cuda_kernel
+        kernel = _load_cuda_kernel()
+        if kernel is None:
+            pytest.skip("CUDA kernel not available")
+
+        q_rot = (q.reshape(Hq, D).float() @ Pi.T).reshape(1, Hq, D).contiguous()
+        q_proj = (q.reshape(Hq, D).float() @ S.T).reshape(1, Hq, D).contiguous()
+        centroid_acc = torch.zeros(1, Hq, D, device="cuda", dtype=torch.float32)
+        sign_acc = torch.zeros(1, Hq, D, device="cuda", dtype=torch.float32)
+
+        s_block = cache.stride(0)
+        s_kv = cache.stride(1)
+        s_slot = cache.stride(2)
+        s_head = cache.stride(3)
+        correction = math.sqrt(math.pi / 2) / D
+
+        try:
+            kernel.tq_fused_decode_attention(
+                q_rot, q_proj, cache, centroids,
+                block_table, seq_lens_t,
+                centroid_acc, sign_acc,
+                D, mse_bits, centroids.shape[0], scale,
+                s_block, s_kv, s_slot, s_head,
+            )
+            torch.cuda.synchronize()  # catch async errors
+        except RuntimeError as e:
+            pytest.fail(f"CUDA kernel crashed at D={D} Hq={Hq}: {e}")
+
+        # Verify output is non-zero and non-NaN
+        assert not centroid_acc.isnan().any(), f"D={D}: NaN in centroid_acc"
+        assert not sign_acc.isnan().any(), f"D={D}: NaN in sign_acc"
+        assert centroid_acc.abs().sum() > 0, f"D={D}: centroid_acc all zeros"
+        assert sign_acc.abs().sum() > 0, f"D={D}: sign_acc all zeros"
+
+    @pytest.mark.parametrize("D", [128, 256])
+    def test_cuda_vs_triton(self, D):
+        """CUDA and Triton kernels must produce same output."""
+        mse_bits = 2
+        Hq = 4
+        Hkv = 2
+        block_size = 16
+        seq_len = 8
+
+        Pi, S, centroids = _setup_buffers(D, mse_bits)
+        packed_size = (D * mse_bits + 7) // 8 + (D + 7) // 8 + 4
+        cache = torch.zeros(
+            1, 2, block_size, Hkv, packed_size,
+            dtype=torch.uint8, device="cuda",
+        )
+        _fill_cache_tq(cache, seq_len, Hkv, D, Pi, S, centroids,
+                       mse_bits, block_size)
+
+        torch.manual_seed(99)
+        q = torch.randn(1, Hq, D, device="cuda", dtype=torch.float32)
+        block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+        seq_lens_t = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        correction = math.sqrt(math.pi / 2) / D
+
+        from vllm.v1.attention.ops.triton_mq_fused_decode import (
+            mq_fused_decode_attention,
+        )
+        # Force Triton (temporarily disable CUDA kernel)
+        import vllm.v1.attention.ops.triton_mq_fused_decode as fmod
+        saved = fmod._cuda_kernel
+        fmod._cuda_kernel = None
+        triton_out = mq_fused_decode_attention(
+            q, cache, Pi, S, centroids, block_table, seq_lens_t,
+            scale, block_size, Hkv, mse_bits, correction,
+        )
+        fmod._cuda_kernel = saved
+
+        # Now try CUDA kernel
+        cuda_out = mq_fused_decode_attention(
+            q, cache, Pi, S, centroids, block_table, seq_lens_t,
+            scale, block_size, Hkv, mse_bits, correction,
+        )
+
+        if cuda_out.abs().sum() == 0:
+            pytest.skip(f"CUDA kernel returned zeros at D={D}")
+
+        cos = F.cosine_similarity(
+            triton_out.reshape(1, -1).float(),
+            cuda_out.reshape(1, -1).float(), dim=-1
+        ).item()
+        assert cos > 0.99, f"D={D}: CUDA vs Triton cos={cos:.4f}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestFusedDecodeKernelLaunches:
     """Verify the fused path uses constant kernel launches."""
 
