@@ -657,6 +657,12 @@ def mq_fused_decode_attention(
     s_slot = kv_cache.stride(2)
     s_head = kv_cache.stride(3)
 
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] strides: block=%d kv=%d slot=%d head=%d ps=%d",
+                    s_block, s_kv, s_slot, s_head, kv_cache.shape[-1])
+        logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
+                    D, Hq, num_kv_heads, mse_bits, n_centroids)
+
     # 3. Try CUDA kernel first (CUDA Graph compatible), fallback to Triton
     cuda_ok = False
     kernel = _load_cuda_kernel()
@@ -736,7 +742,10 @@ def mq_fused_decode_attention(
     if os.environ.get("MQ_DEBUG"):
         logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
                     centroid_acc.norm(), sign_acc.norm())
-        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
+        logger.info("[MQ_DEBUG] v_mse norm=%.4f, qjl norm=%.4f",
+                    out_buf.norm(), buf["q_proj"].norm())
+        logger.info("[MQ_DEBUG] final output norm=%.4f, var=%.6f",
                     out_buf.norm(), out_buf.var())
+        logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
 
     return out_buf.reshape(B, Hq, D)
