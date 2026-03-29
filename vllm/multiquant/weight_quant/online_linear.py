@@ -26,6 +26,130 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# ── Custom Op for torch.compile compatibility ─────────────────────
+# Dynamo can't trace _decompress (Python control flow, CUDA kernel
+# try/except, lazy imports). Register as custom op with fake_impl.
+
+def _archer_apply_impl(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    rotation: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    in_features: int,
+    mse_bits: int,
+    is_rq: bool,
+) -> torch.Tensor:
+    """Real impl: decompress packed uint8 → F.linear."""
+    out_features = packed_weight.shape[0]
+    device = packed_weight.device
+
+    # Try CUDA full decompress (TQ only, D≤256)
+    if in_features <= 256 and not is_rq:
+        try:
+            from vllm.multiquant.weight_quant.archer_ops import cuda_decompress
+            result = cuda_decompress(
+                packed_weight, rotation, S, centroids, in_features,
+                out_dtype=torch.bfloat16,
+            )
+            if result is not None:
+                return F.linear(x, result.to(x.dtype))
+        except Exception:
+            pass
+
+    # Try CUDA unpack
+    result = None
+    try:
+        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+        result = cuda_unpack(packed_weight, in_features, mse_bits)
+        if result is not None:
+            idx, signs, row_norms, res_norms = result
+            idx = idx.long()
+    except Exception:
+        result = None
+
+    if result is None:
+        # Python fallback
+        mse_bytes = math.ceil(in_features * mse_bits / 8)
+        qjl_bytes = math.ceil(in_features / 8)
+        mask = (1 << mse_bits) - 1
+        idx = torch.zeros(out_features, in_features,
+                          dtype=torch.long, device=device)
+        for j in range(in_features):
+            bo = j * mse_bits
+            bi = bo // 8
+            bs = bo % 8
+            bv = packed_weight[:, bi].long() >> bs
+            spill = bs + mse_bits - 8
+            if spill > 0 and bi + 1 < mse_bytes:
+                bv = bv | (packed_weight[:, bi + 1].long() << (mse_bits - spill))
+            idx[:, j] = bv & mask
+        signs = torch.zeros(out_features, in_features,
+                            dtype=torch.float32, device=device)
+        for b in range(qjl_bytes):
+            bv = packed_weight[:, mse_bytes + b].long()
+            for k in range(8):
+                j = b * 8 + k
+                if j >= in_features:
+                    break
+                signs[:, j] = torch.where(
+                    ((bv >> k) & 1).bool(),
+                    torch.ones(out_features, device=device),
+                    -torch.ones(out_features, device=device),
+                )
+        no = mse_bytes + qjl_bytes
+        row_norms = packed_weight[:, no:no + 2].contiguous().view(
+            torch.float16).float().squeeze(-1)
+        res_norms = packed_weight[:, no + 2:no + 4].contiguous().view(
+            torch.float16).float().squeeze(-1)
+
+    c_vals = centroids[idx]
+    if is_rq:
+        from vllm.multiquant.rotorquant.clifford import (
+            embed_vectors_as_multivectors,
+            extract_vectors_from_multivectors,
+            reverse, rotor_sandwich,
+        )
+        mv_q = embed_vectors_as_multivectors(c_vals)
+        rotor_rev = reverse(rotation)
+        mv_recon = rotor_sandwich(rotor_rev, mv_q)
+        W_mse = extract_vectors_from_multivectors(mv_recon, in_features)
+    else:
+        W_mse = c_vals @ rotation
+
+    correction = math.sqrt(math.pi / 2) / in_features
+    W_qjl = correction * res_norms.unsqueeze(-1) * (signs @ S)
+    W = (row_norms.unsqueeze(-1) * (W_mse + W_qjl)).to(x.dtype).contiguous()
+    return F.linear(x, W)
+
+
+def _archer_apply_fake(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    rotation: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    in_features: int,
+    mse_bits: int,
+    is_rq: bool,
+) -> torch.Tensor:
+    """Fake impl for torch.compile graph tracing."""
+    return torch.empty(x.shape[0], packed_weight.shape[0],
+                       dtype=x.dtype, device=x.device)
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+    direct_register_custom_op(
+        op_name="archer_apply",
+        op_func=_archer_apply_impl,
+        fake_impl=_archer_apply_fake,
+    )
+    _archer_op = torch.ops.vllm.archer_apply
+except Exception:
+    # Fallback if registration fails (e.g. missing vllm.utils)
+    _archer_op = _archer_apply_impl
+
 
 class ArcherOnlineLinearMethod(QuantizeMethodBase):
     """BF16/FP8 → MultiQuant packed, quantized per-layer on arrival.
@@ -224,12 +348,17 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if torch.compiler.is_dynamo_compiling():
-            # Tracing: use weight as-is (packed uint8 or original)
-            return F.linear(x, layer.weight, bias)
         if getattr(layer, "_archer_packed", False):
-            W = self._decompress(layer).to(x.dtype).contiguous()
-            return F.linear(x, W, bias)
+            out = _archer_op(
+                x, layer.weight.data,
+                layer._archer_rotation, layer._archer_S,
+                layer._archer_centroids,
+                layer._archer_in_features, layer._archer_mse_bits,
+                layer._archer_method == "rq",
+            )
+            if bias is not None:
+                out = out + bias
+            return out
         return F.linear(x, layer.weight, bias)
 
     def _decompress(self, layer: nn.Module) -> torch.Tensor:
