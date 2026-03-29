@@ -176,6 +176,10 @@ class MultiQuantImpl:
         self._mse_bytes = (head_size * self._mse_bits + 7) // 8
         self._qjl_bytes = (head_size + 7) // 8
 
+        self._mask = (1 << self._mse_bits) - 1
+        self._correction = math.sqrt(math.pi / 2) / head_size
+        self._is_rq = kv_cache_dtype.startswith("rq")
+
         # Pre-load decode kernel at init (not in forward — graph-safe)
         from vllm.v1.attention.ops.triton_mq_fused_decode import (
             mq_fused_decode_attention, _load_cuda_kernel,
@@ -185,14 +189,7 @@ class MultiQuantImpl:
 
         # Pre-load Clifford module for RQ (avoids import during graph capture)
         if self._is_rq:
-            from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                _rq_rotate_forward,
-            )
-            # Trigger the lazy import once
             import vllm.multiquant.rotorquant.clifford  # noqa: F401
-        self._mask = (1 << self._mse_bits) - 1
-        self._correction = math.sqrt(math.pi / 2) / head_size
-        self._is_rq = kv_cache_dtype.startswith("rq")
 
     def _rotate_forward(self, x, Pi):
         """Forward rotation: TQ = x @ Pi.T, RQ = rotor sandwich."""
