@@ -5,7 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL="${1:-GLM-4.7-Flash-int4-AutoRound}"
-MAX_LEN=40000
 RESULTS=()
 
 test_kv() {
