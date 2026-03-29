@@ -491,10 +491,35 @@ def _load_cuda_kernel():
         return None
 
 
+def _rq_rotate_forward(x, rotors):
+    """RQ forward rotation: Clifford rotor sandwich."""
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors,
+    )
+    D = x.shape[-1]
+    mv = embed_vectors_as_multivectors(x)
+    mv_rot = rotor_sandwich(rotors, mv)
+    return extract_vectors_from_multivectors(mv_rot, D)
+
+
+def _rq_rotate_inverse(x, rotors):
+    """RQ inverse rotation: reverse rotor sandwich."""
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors, reverse,
+    )
+    D = x.shape[-1]
+    mv = embed_vectors_as_multivectors(x)
+    rotor_rev = reverse(rotors)
+    mv_recon = rotor_sandwich(rotor_rev, mv)
+    return extract_vectors_from_multivectors(mv_recon, D)
+
+
 def mq_fused_decode_attention(
     q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
     kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
-    Pi: torch.Tensor,          # [D, D] float32 (TQ rotation matrix)
+    Pi: torch.Tensor,          # [D, D] float32 (TQ) or [n_groups, 8] (RQ rotors)
     S: torch.Tensor,           # [D, D] float32 (QJL projection matrix)
     centroids: torch.Tensor,   # [n_centroids] float32
     block_table: torch.Tensor, # [B, max_blocks] int32
@@ -504,16 +529,24 @@ def mq_fused_decode_attention(
     num_kv_heads: int,
     mse_bits: int,
     correction: float,         # sqrt(pi/2) / D
+    is_rq: bool = False,       # True for RotorQuant (Clifford rotation)
 ) -> torch.Tensor:
-    """Fused TQ decode: 2 pre-GEMMs + 1 CUDA/Triton + 2 post-GEMMs = 5 launches."""
+    """Fused MQ decode: 2 pre-rotations + 1 CUDA kernel + 2 post-rotations.
+
+    Works for both TQ (dense Pi matrix) and RQ (Clifford rotors).
+    The CUDA kernel is identical — only pre/post rotation differs.
+    """
     B, Hq, D = q.shape
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # 1. Pre-rotate + pre-project query (2 batched GEMMs via cuBLAS)
+    # 1. Pre-rotate + pre-project query
     q_flat = q.reshape(B * Hq, D).float()
-    q_rot = (q_flat @ Pi.T).contiguous()    # [B*Hq, D]
-    q_proj = (q_flat @ S.T).contiguous()    # [B*Hq, D]
+    if is_rq:
+        q_rot = _rq_rotate_forward(q_flat, Pi).contiguous()
+    else:
+        q_rot = (q_flat @ Pi.T).contiguous()
+    q_proj = (q_flat @ S.T).contiguous()    # QJL projection (same for TQ/RQ)
 
     # Reshape for kernel: [B, Hq, D]
     q_rot_3d = q_rot.reshape(B, Hq, D)
@@ -586,9 +619,15 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # 4. Post-loop V reconstruction (2 batched GEMMs via cuBLAS)
+    # 4. Post-loop V reconstruction
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
-    output = c_flat @ Pi + correction * (s_flat @ S)
+    if is_rq:
+        # RQ: Clifford inverse rotation on centroid accumulator
+        v_mse = _rq_rotate_inverse(c_flat, Pi)
+    else:
+        # TQ: dense matrix multiply
+        v_mse = c_flat @ Pi
+    output = v_mse + correction * (s_flat @ S)
 
     return output.reshape(B, Hq, D)

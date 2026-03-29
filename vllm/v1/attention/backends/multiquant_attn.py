@@ -177,13 +177,11 @@ class MultiQuantImpl:
         self._qjl_bytes = (head_size + 7) // 8
 
         # Pre-load decode kernel at init (not in forward — graph-safe)
-        self._decode_fn = None
-        if not kv_cache_dtype.startswith("rq"):
-            from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                mq_fused_decode_attention, _load_cuda_kernel,
-            )
-            _load_cuda_kernel()  # JIT compile now, not during graph capture
-            self._decode_fn = mq_fused_decode_attention
+        from vllm.v1.attention.ops.triton_mq_fused_decode import (
+            mq_fused_decode_attention, _load_cuda_kernel,
+        )
+        _load_cuda_kernel()  # JIT compile now, not during graph capture
+        self._decode_fn = mq_fused_decode_attention
         self._mask = (1 << self._mse_bits) - 1
         self._correction = math.sqrt(math.pi / 2) / head_size
         self._is_rq = kv_cache_dtype.startswith("rq")
@@ -335,7 +333,7 @@ class MultiQuantImpl:
 
     def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
                         attn_metadata, num_decode, block_size, D, device):
-        """Decode: CUDA fused kernel. Linear CUDA-only path, graph-safe."""
+        """Decode: CUDA fused kernel. Works for TQ and RQ."""
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
         decode_out = self._decode_fn(
             q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
@@ -346,6 +344,7 @@ class MultiQuantImpl:
             num_kv_heads=self.num_kv_heads,
             mse_bits=self._mse_bits,
             correction=self._correction,
+            is_rq=self._is_rq,
         )
         output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
 
