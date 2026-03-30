@@ -157,9 +157,24 @@ def math_test(url, model, n=50):
         b = random.randint(10, 999)
         op = random.choice(["+", "-", "*"])
         expected = eval(f"{a}{op}{b}")
-        prompt = f"Berechne: {a} {op} {b} = ? Antworte NUR mit der Zahl, nichts anderes."
 
-        content, _, _ = chat(url, model, prompt, max_tokens=500, temperature=0)
+        # Use completions API (not chat) to avoid thinking/reasoning overhead.
+        # Chat API triggers <think> on reasoning models → answer never arrives.
+        prompt = f"{a} {op} {b} = "
+        data = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 15,
+            "temperature": 0,
+        }).encode()
+        req = urllib.request.Request(
+            f"{url}/v1/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+        content = body["choices"][0]["text"]
         import re as _re
         nums = [int(x) for x in _re.findall(r'-?\d+', content)]
         operands = {a, b}
