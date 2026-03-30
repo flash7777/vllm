@@ -615,6 +615,8 @@ def mq_fused_decode_attention(
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+            "v_mse": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "qjl_corr": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
         }
     buf = _decode_buffers[buf_key]
 
@@ -721,33 +723,23 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # 4. Post-loop V reconstruction (reuse q_rot buffer for output)
+    # 4. Post-loop V reconstruction (separate buffers — no aliasing!)
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
-    out_buf = buf["q_rot"]  # reuse pre-allocated buffer
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] PRE-GEMV: c_flat shape=%s norm=%.4f, Pi shape=%s norm=%.4f, out_buf shape=%s",
-                    c_flat.shape, c_flat.norm(), Pi.shape, Pi.norm(), out_buf.shape)
-        logger.info("[MQ_DEBUG] c_flat dtype=%s, Pi dtype=%s, out_buf dtype=%s",
-                    c_flat.dtype, Pi.dtype, out_buf.dtype)
+    v_mse = buf["v_mse"]
+    qjl_corr = buf["qjl_corr"]
     if is_rq:
-        _rq_rotate_inverse(c_flat, Pi, out=out_buf)
+        _rq_rotate_inverse(c_flat, Pi, out=v_mse)
     else:
-        torch.mm(c_flat, Pi, out=out_buf)
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] POST-GEMV: out_buf norm=%.4f", out_buf.norm())
-    # out_buf now contains v_mse; add QJL correction in-place
-    # sign_correction = correction * (s_flat @ S)
-    torch.mm(s_flat, S, out=buf["q_proj"])  # reuse q_proj buffer
-    out_buf.add_(buf["q_proj"], alpha=correction)
+        torch.mm(c_flat, Pi, out=v_mse)
+    torch.mm(s_flat, S, out=qjl_corr)
+    v_mse.add_(qjl_corr, alpha=correction)
 
     if os.environ.get("MQ_DEBUG"):
         logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
                     centroid_acc.norm(), sign_acc.norm())
-        logger.info("[MQ_DEBUG] v_mse norm=%.4f, qjl norm=%.4f",
-                    out_buf.norm(), buf["q_proj"].norm())
-        logger.info("[MQ_DEBUG] final output norm=%.4f, var=%.6f",
-                    out_buf.norm(), out_buf.var())
+        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
+                    v_mse.norm(), v_mse.var())
         logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
 
-    return out_buf.reshape(B, Hq, D)
+    return v_mse.reshape(B, Hq, D)
