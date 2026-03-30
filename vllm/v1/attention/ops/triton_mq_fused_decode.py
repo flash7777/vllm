@@ -552,6 +552,10 @@ def _rq_rotate_forward(x, rotors, out=None):
         kernel.clifford_sandwich_forward(x.float(), rotors.float(), out, D)
         return out
     # Python fallback (~70 kernel launches, not graph-safe)
+    global _rq_fallback_logged
+    if not _rq_fallback_logged:
+        logger.warning("RQ rotation: using Python fallback (Clifford CUDA kernel unavailable)")
+        _rq_fallback_logged = True
     from vllm.multiquant.rotorquant.clifford import (
         embed_vectors_as_multivectors, rotor_sandwich,
         extract_vectors_from_multivectors,
@@ -559,6 +563,8 @@ def _rq_rotate_forward(x, rotors, out=None):
     mv = embed_vectors_as_multivectors(x)
     mv_rot = rotor_sandwich(rotors, mv)
     return extract_vectors_from_multivectors(mv_rot, D)
+
+_rq_fallback_logged = False
 
 
 def _rq_rotate_inverse(x, rotors, out=None):
