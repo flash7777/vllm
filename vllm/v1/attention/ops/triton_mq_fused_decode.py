@@ -748,4 +748,7 @@ def mq_fused_decode_attention(
                     v_mse.norm(), v_mse.var())
         logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
 
-    return v_mse.reshape(B, Hq, D)
+    # .clone() prevents race condition: v_mse is a pre-allocated buffer
+    # that gets overwritten on the next decode step. Without clone, vLLM's
+    # async copy (output[:] = decode_out) may read stale data.
+    return v_mse.reshape(B, Hq, D).clone()
