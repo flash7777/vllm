@@ -226,12 +226,21 @@ class MultiQuantImpl:
         from vllm.v1.attention.ops.triton_mq_fused_decode import (
             mq_fused_decode_attention, _load_cuda_kernel,
         )
-        _load_cuda_kernel()  # JIT compile now, not during graph capture
+        cuda_kernel = _load_cuda_kernel()
         self._decode_fn = mq_fused_decode_attention
 
         # Pre-load Clifford module for RQ (avoids import during graph capture)
         if self._is_rq:
             import vllm.multiquant.rotorquant.clifford  # noqa: F401
+
+        logger.info(
+            "MultiQuant attention: D=%d (from spec %d), %s KV, "
+            "decode=%s, %s",
+            self.head_size, head_size,
+            self.kv_cache_dtype,
+            "CUDA" if cuda_kernel else "Triton",
+            "RQ Clifford" if self._is_rq else "TQ rotation",
+        )
 
     def _rotate_forward(self, x, Pi):
         """Forward rotation: TQ = x @ Pi.T, RQ = rotor sandwich."""
