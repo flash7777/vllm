@@ -618,6 +618,9 @@ def mq_fused_decode_attention(
             "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
+            # RQ/Triton path needs centroid_acc + sign_acc for post-GEMV
+            "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+            "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
         }
     buf = _decode_buffers[buf_key]
 
@@ -656,11 +659,12 @@ def mq_fused_decode_attention(
         logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
                     D, Hq, num_kv_heads, mse_bits, n_centroids)
 
-    # 3. Try CUDA kernel (full V decompression, CUDA Graph compatible)
+    # 3. Try CUDA kernel (full V decompression for TQ, CUDA Graph compatible)
+    #    RQ cannot use the CUDA kernel because Pi is [n_groups, 8] not [D, D]
     cuda_ok = False
     kernel = _load_cuda_kernel()
     output = buf["output"]
-    if kernel is not None:
+    if kernel is not None and not is_rq:
         try:
             kernel.tq_fused_decode_attention(
                 q_rot_3d,
@@ -688,8 +692,11 @@ def mq_fused_decode_attention(
         _decode_path_logged = True
 
     if not cuda_ok:
-        # WARNING: Triton fallback invalidates CUDA Graphs!
-        # Only safe outside graph capture.
+        # Triton fallback: outputs centroid_acc + sign_acc (needs post-GEMV)
+        centroid_acc = buf["centroid_acc"]
+        sign_acc = buf["sign_acc"]
+        centroid_acc.zero_()
+        sign_acc.zero_()
         packed_size = kv_cache.shape[-1]
         mse_bytes = (D * mse_bits + 7) // 8
         qjl_bytes = (D + 7) // 8
@@ -721,6 +728,18 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # CUDA kernel does full V decompression — output is ready
-    # .clone() prevents race condition with pre-allocated buffer
-    return output.clone()
+    if cuda_ok:
+        # CUDA kernel does full V decompression — output is ready
+        return output.clone()
+
+    # Triton fallback: post-loop GEMV to reconstruct V from centroid_acc/sign_acc
+    c_flat = centroid_acc.reshape(B * Hq, D)
+    s_flat = sign_acc.reshape(B * Hq, D)
+    v_out = buf["output"]
+    if is_rq:
+        _rq_rotate_inverse(c_flat, Pi, out=v_out.reshape(B * Hq, D))
+    else:
+        torch.mm(c_flat, Pi, out=v_out.reshape(B * Hq, D))
+    qjl_corr = torch.mm(s_flat, S)
+    v_out.reshape(B * Hq, D).add_(qjl_corr, alpha=correction)
+    return v_out.clone()
