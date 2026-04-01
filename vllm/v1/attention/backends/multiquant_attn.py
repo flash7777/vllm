@@ -222,6 +222,15 @@ class MultiQuantImpl:
         self._correction = math.sqrt(math.pi / 2) / real_head_dim
         self._is_rq = kv_cache_dtype.startswith("rq")
 
+        # Pre-allocate shift constants for _torch_pack (graph-safe bitpacking)
+        if self._mse_bits == 1:
+            self._shifts_mse = torch.arange(8, device="cuda")
+        elif self._mse_bits == 2:
+            self._shifts_mse = torch.tensor([0, 2, 4, 6], device="cuda")
+        else:
+            self._shifts_mse = None
+        self._shifts_sign = torch.arange(8, device="cuda")
+
         # Pre-load decode kernel at init (not in forward — graph-safe)
         from vllm.v1.attention.ops.triton_mq_fused_decode import (
             mq_fused_decode_attention, _load_cuda_kernel,
@@ -274,6 +283,43 @@ class MultiQuantImpl:
             return extract_vectors_from_multivectors(mv_recon, D)
         return x @ Pi
 
+    def _torch_pack(self, vecs, Pi, S, centroids, D, device):
+        """Graph-safe TQ/RQ packing — pure PyTorch tensor ops."""
+        x = vecs.float()
+        vn = x.norm(dim=-1)
+        xh = x / (vn.unsqueeze(-1) + 1e-8)
+        rot = self._rotate_forward(xh, Pi)
+        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1)
+        xm = self._rotate_inverse(centroids[idx], Pi)
+        r = xh - xm
+        rn = r.norm(dim=-1)
+        sign_bits = (r @ S.T >= 0).to(torch.uint8)
+        N = vecs.shape[0]
+        mse_bits = self._mse_bits
+        mse_bytes = self._mse_bytes
+        qjl_bytes = self._qjl_bytes
+        if mse_bits == 1:
+            idx_g = idx[:, :mse_bytes * 8].reshape(N, mse_bytes, 8)
+            mse_packed = (idx_g.to(torch.uint8) << self._shifts_sign
+                          ).sum(dim=-1).to(torch.uint8)
+        elif mse_bits == 2:
+            idx_g = idx[:, :mse_bytes * 4].reshape(N, mse_bytes, 4)
+            mse_packed = (idx_g.to(torch.uint8) << self._shifts_mse
+                          ).sum(dim=-1).to(torch.uint8)
+        else:
+            mse_packed = torch.zeros(N, mse_bytes, dtype=torch.uint8, device=device)
+            for j in range(D):
+                bo = j * mse_bits; bi = bo // 8; bs = bo % 8
+                val = idx[:, j].to(torch.uint8) & self._mask
+                mse_packed[:, bi] |= (val << bs) & 0xFF
+                if bs + mse_bits > 8 and bi + 1 < mse_bytes:
+                    mse_packed[:, bi + 1] |= (val >> (8 - bs)) & 0xFF
+        sign_g = sign_bits[:, :qjl_bytes * 8].reshape(N, qjl_bytes, 8)
+        sign_packed = (sign_g << self._shifts_sign).sum(dim=-1).to(torch.uint8)
+        vn_u8 = vn.to(torch.float16).view(torch.uint8).reshape(N, 2)
+        rn_u8 = rn.to(torch.float16).view(torch.uint8).reshape(N, 2)
+        return torch.cat([mse_packed, sign_packed, vn_u8, rn_u8], dim=-1)
+
     @torch.compiler.disable
     @torch.no_grad()
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
@@ -284,14 +330,6 @@ class MultiQuantImpl:
         the tensor shapes.
         """
         if self.kv_sharing_target_layer_name is not None:
-            return
-
-        # Skip during CUDA Graph capture — pack_vectors_batched has Python
-        # loops that are not capture-safe. The real update happens on replay.
-        if torch.cuda.is_current_stream_capturing():
-            import os
-            if os.environ.get("MQ_DEBUG"):
-                logger.warning("[MQ_KV] SKIPPED — stream capturing!")
             return
 
         import os
@@ -307,11 +345,15 @@ class MultiQuantImpl:
 
         num_tokens, num_heads = key.shape[0], key.shape[1]
 
+        # Skip during CUDA Graph capture — pack allocates tensors (not capture-safe).
+        # KV update runs as custom op outside graph — called eagerly during replay.
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         # Vectorized pack: all tokens × all heads in one batch
-        # key/value: (num_tokens, num_heads, D) → flat (N, D)
-        k_flat = key.reshape(-1, D)  # (num_tokens * num_heads, D)
+        k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
-        k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)  # (N, packed)
+        k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)
         v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
         k_packed = k_packed.reshape(num_tokens, num_heads, -1)
         v_packed = v_packed.reshape(num_tokens, num_heads, -1)
