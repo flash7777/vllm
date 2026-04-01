@@ -404,14 +404,20 @@ class MultiQuantImpl:
 
     def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
                         attn_metadata, num_decode, block_size, D, device):
-        """Decode: Python loop with full V decompression (debug/reference)."""
+        """Decode: CUDA fused kernel."""
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
-        self._decode_python_loop(
-            dq, kv_cache, Pi, S, centroids,
-            attn_metadata.seq_lens[:num_decode],
-            attn_metadata.block_table[:num_decode],
-            block_size, D, device, output,
+        decode_out = self._decode_fn(
+            q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
+            centroids=centroids,
+            block_table=attn_metadata.block_table[:num_decode],
+            seq_lens=attn_metadata.seq_lens[:num_decode],
+            scale=self.scale, block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            mse_bits=self._mse_bits,
+            correction=self._correction,
+            is_rq=self._is_rq,
         )
+        output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
 
     # --- Helpers ---
 

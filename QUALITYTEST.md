@@ -48,12 +48,29 @@
 - Ursache: `is_current_stream_capturing()` Guard → `return` → KV nicht geschrieben
 - Oder: Python-Ops im forward-Pfad nicht capture-safe
 
-## Offene Fragen
+## Stufe G: Live Serve (enforce-eager, BF16 + TQ4)
 
-1. **enforce-eager Test zeigte Müll** — warum, wenn A-E alle bestehen?
-   - Möglichkeit: der Container hatte gemischten Code (gemountete + Image-Dateien)
-   - Möglichkeit: vLLM enforce-eager nutzt trotzdem torch.compile
-   - **Muss nochmal sauber getestet werden**
+**PASS** — Math korrekt, Text korrekt!
+
+```
+3+4= → 7 ✓
+7+8= → 15 ✓
+9*6= → 54 ✓
+100+23= → 123 ✓
+664+124= → 788 ✓
+Mozart → "Wolfgang Amadeus Mozart war ein berühmter österreichischer
+          Komponist der Klassik, und gilt als einer der bedeutendsten
+          Musiker der Weltgeschichte." ✓
+```
+
+**Root Cause der früheren Fehler:** `_forward_decode` war auf `_decode_python_loop`
+umgestellt (Debug-Versuch). Der Python Loop crasht bei D=256 (device-side assert).
+Der fused CUDA Kernel funktioniert korrekt.
+
+## Offene Punkte
+
+1. **CUDA Graphs** — enforce-eager funktioniert, aber CUDA Graph Capture scheitert
+   weil `is_current_stream_capturing()` Guard den KV Write blockiert
 
 2. **CUDA Graph**: der Guard verhindert KV-Write bei Capture
    - Lösung: graph-safe KV Pack (PyTorch tensor ops oder pre-compiled CUDA)
