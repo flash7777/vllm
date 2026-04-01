@@ -133,7 +133,14 @@ __global__ void rq_fused_decode_kernel(
         __shared__ float s_score;
         if (tid == 0) {
             float term1 = 0.0f;
-            if constexpr (MSE_BITS == 2) {
+            if constexpr (MSE_BITS == 1) {
+                for (int b = 0; b < MSE_BYTES; b++) {
+                    uint8_t bv = k_packed[b];
+                    for (int k = 0; k < 8 && (b*8+k) < D; k++) {
+                        term1 += s_q_rot[b*8+k] * s_centroids[(bv >> k) & 1];
+                    }
+                }
+            } else if constexpr (MSE_BITS == 2) {
                 for (int b = 0; b < MSE_BYTES; b++) {
                     uint8_t bv = k_packed[b];
                     for (int k = 0; k < 4 && (b*4+k) < D; k++) {
@@ -179,7 +186,9 @@ __global__ void rq_fused_decode_kernel(
                        + bo * stride_slot + kv_head * stride_head;
             const uint8_t* vp = kv_cache + v_base;
             int v_idx;
-            if constexpr (MSE_BITS == 2) {
+            if constexpr (MSE_BITS == 1) {
+                v_idx = (vp[tid/8] >> (tid%8)) & 1;
+            } else if constexpr (MSE_BITS == 2) {
                 v_idx = (vp[tid/4] >> ((tid%4)*2)) & MASK;
             } else {
                 int boff = tid * MSE_BITS; int byi = boff/8; int bsi = boff%8;
@@ -266,11 +275,20 @@ void rq_fused_decode_attention(
             max_blocks, attn_scale, correction, \
             stride_block, stride_kv, stride_slot, stride_head);
 
-    if (head_dim == 128 && mse_bits == 2) { LAUNCH(128, 2, 4); }
+    // HEAD_DIM=64
+    if (head_dim == 64 && mse_bits == 1) { LAUNCH(64, 1, 2); }
+    else if (head_dim == 64 && mse_bits == 2) { LAUNCH(64, 2, 4); }
+    else if (head_dim == 64 && mse_bits == 3) { LAUNCH(64, 3, 8); }
+    // HEAD_DIM=128
+    else if (head_dim == 128 && mse_bits == 1) { LAUNCH(128, 1, 2); }
+    else if (head_dim == 128 && mse_bits == 2) { LAUNCH(128, 2, 4); }
     else if (head_dim == 128 && mse_bits == 3) { LAUNCH(128, 3, 8); }
+    // HEAD_DIM=256
+    else if (head_dim == 256 && mse_bits == 1) { LAUNCH(256, 1, 2); }
     else if (head_dim == 256 && mse_bits == 2) { LAUNCH(256, 2, 4); }
     else if (head_dim == 256 && mse_bits == 3) { LAUNCH(256, 3, 8); }
-    else { TORCH_CHECK(false, "RQ fused decode: unsupported config"); }
+    else { TORCH_CHECK(false, "RQ fused decode: unsupported config head_dim=",
+                        head_dim, " mse_bits=", mse_bits); }
     #undef LAUNCH
 }
 
