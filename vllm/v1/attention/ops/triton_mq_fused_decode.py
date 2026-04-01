@@ -542,6 +542,49 @@ def _load_clifford_kernel():
         return None
 
 
+_rq_decode_kernel = None
+_rq_decode_kernel_tried = False
+
+
+def _load_rq_decode_kernel():
+    """JIT compile the RQ fused decode kernel (Clifford V decompression)."""
+    global _rq_decode_kernel, _rq_decode_kernel_tried
+    if _rq_decode_kernel_tried:
+        return _rq_decode_kernel
+    _rq_decode_kernel_tried = True
+
+    import os
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "rotorquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/rq_build"
+    src_file = os.path.join(src_dir, "rq_compressed_attention.cu")
+    if not os.path.exists(src_file):
+        logger.warning("RQ fused decode: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _rq_decode_kernel = load(
+            name="rq_fused_decode",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+            ],
+            verbose=False,
+        )
+        logger.info("RQ fused decode CUDA kernel compiled and loaded")
+        return _rq_decode_kernel
+    except Exception as e:
+        logger.warning("RQ fused decode CUDA kernel FAILED: %s", e)
+        return None
+
+
 def _rq_rotate_forward(x, rotors, out=None):
     """RQ forward rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
