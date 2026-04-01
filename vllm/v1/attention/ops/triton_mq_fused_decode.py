@@ -666,7 +666,7 @@ def mq_fused_decode_attention(
         logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
                     D, Hq, num_kv_heads, mse_bits, n_centroids)
 
-    # 3. Try CUDA kernel first (CUDA Graph compatible), fallback to Triton
+    # 3. Try CUDA kernel (graph-safe), fallback to Triton
     cuda_ok = False
     kernel = _load_cuda_kernel()
     if kernel is not None:

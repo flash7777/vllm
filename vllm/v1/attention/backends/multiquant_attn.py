@@ -332,10 +332,6 @@ class MultiQuantImpl:
         if self.kv_sharing_target_layer_name is not None:
             return
 
-        # Must be FIRST — no ops before this during graph capture
-        if torch.cuda.is_current_stream_capturing():
-            return
-
         import os
         if os.environ.get("MQ_DEBUG"):
             logger.info("[MQ_KV] WRITE slots=%s key=%s val=%s",
@@ -349,11 +345,15 @@ class MultiQuantImpl:
 
         num_tokens, num_heads = key.shape[0], key.shape[1]
 
-        # Vectorized pack: all tokens × all heads in one batch
+        # Pack K/V: graph-safe _torch_pack or Python fallback
         k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
-        k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)
-        v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
+        if torch.cuda.is_current_stream_capturing():
+            k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
+            v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)
+        else:
+            k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)
+            v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
         k_packed = k_packed.reshape(num_tokens, num_heads, -1)
         v_packed = v_packed.reshape(num_tokens, num_heads, -1)
 
