@@ -215,11 +215,11 @@ class MultiQuantImpl:
         self._tq_config = get_kv_quantizer_config(kv_cache_dtype, real_head_dim)
         self._packed_size = self._tq_config.key_packed_size
         self._mse_bits = self._tq_config.mse_bits
-        self._mse_bytes = (head_size * self._mse_bits + 7) // 8
-        self._qjl_bytes = (head_size + 7) // 8
+        self._mse_bytes = (real_head_dim * self._mse_bits + 7) // 8
+        self._qjl_bytes = (real_head_dim + 7) // 8
 
         self._mask = (1 << self._mse_bits) - 1
-        self._correction = math.sqrt(math.pi / 2) / head_size
+        self._correction = math.sqrt(math.pi / 2) / real_head_dim
         self._is_rq = kv_cache_dtype.startswith("rq")
 
         # Pre-load decode kernel at init (not in forward — graph-safe)
@@ -284,7 +284,15 @@ class MultiQuantImpl:
         # Skip during CUDA Graph capture — pack_vectors_batched has Python
         # loops that are not capture-safe. The real update happens on replay.
         if torch.cuda.is_current_stream_capturing():
+            import os
+            if os.environ.get("MQ_DEBUG"):
+                logger.warning("[MQ_KV] SKIPPED — stream capturing!")
             return
+
+        import os
+        if os.environ.get("MQ_DEBUG"):
+            logger.info("[MQ_KV] WRITE slots=%s key=%s val=%s",
+                        slot_mapping.tolist()[:4], key.shape, value.shape)
 
         D = self.head_size
         device = key.device
@@ -346,6 +354,13 @@ class MultiQuantImpl:
         num_prefill = attn_metadata.num_prefill_tokens
         num_decode = attn_metadata.num_decode_tokens
 
+        import os
+        if os.environ.get("MQ_DEBUG"):
+            sl = attn_metadata.seq_lens[:max(1,num_decode)].tolist() if num_decode > 0 else []
+            cache_nz = kv_cache.any(dim=-1).sum().item()
+            logger.info("[MQ_FWD] pf=%d dc=%d sl=%s cache_nz=%d",
+                        num_prefill, num_decode, sl[:4], cache_nz)
+
         if num_prefill > 0:
             self._forward_prefill(
                 query, key, value, output, Pi, S, centroids,
@@ -389,20 +404,14 @@ class MultiQuantImpl:
 
     def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
                         attn_metadata, num_decode, block_size, D, device):
-        """Decode: CUDA fused kernel. Works for TQ and RQ."""
+        """Decode: Python loop with full V decompression (debug/reference)."""
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
-        decode_out = self._decode_fn(
-            q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
-            centroids=centroids,
-            block_table=attn_metadata.block_table[:num_decode],
-            seq_lens=attn_metadata.seq_lens[:num_decode],
-            scale=self.scale, block_size=block_size,
-            num_kv_heads=self.num_kv_heads,
-            mse_bits=self._mse_bits,
-            correction=self._correction,
-            is_rq=self._is_rq,
+        self._decode_python_loop(
+            dq, kv_cache, Pi, S, centroids,
+            attn_metadata.seq_lens[:num_decode],
+            attn_metadata.block_table[:num_decode],
+            block_size, D, device, output,
         )
-        output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
 
     # --- Helpers ---
 

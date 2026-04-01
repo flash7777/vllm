@@ -610,19 +610,14 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Pre-allocated buffers for CUDA Graph compatibility + performance.
-    # Previous centroid_acc=0 bug was caused by head_dim=packed_size mismatch,
-    # now fixed by _recover_head_dim().
+    # Pre-allocated buffers for CUDA Graph compatibility
     global _decode_buffers
     buf_key = (B, Hq, D, device)
     if buf_key not in _decode_buffers:
         _decode_buffers[buf_key] = {
             "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
-            "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
-            "v_mse": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "qjl_corr": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
         }
     buf = _decode_buffers[buf_key]
 
@@ -637,11 +632,6 @@ def mq_fused_decode_attention(
 
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
-
-    centroid_acc = buf["centroid_acc"]
-    sign_acc = buf["sign_acc"]
-    centroid_acc.zero_()
-    sign_acc.zero_()
 
     # Debug logging (MQ_DEBUG=1)
     import os
@@ -666,20 +656,22 @@ def mq_fused_decode_attention(
         logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
                     D, Hq, num_kv_heads, mse_bits, n_centroids)
 
-    # 3. Try CUDA kernel first (CUDA Graph compatible), fallback to Triton
+    # 3. Try CUDA kernel (full V decompression, CUDA Graph compatible)
     cuda_ok = False
     kernel = _load_cuda_kernel()
+    output = buf["output"]
     if kernel is not None:
         try:
             kernel.tq_fused_decode_attention(
                 q_rot_3d,
                 q_proj_3d,
                 kv_cache,
+                Pi.float().contiguous(),
+                S.float().contiguous(),
                 centroids,
                 block_table.int(),
                 seq_lens.int(),
-                centroid_acc,
-                sign_acc,
+                output,
                 D, mse_bits, n_centroids, scale,
                 s_block, s_kv, s_slot, s_head,
             )
@@ -729,26 +721,6 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # 4. Post-loop V reconstruction (separate buffers — no aliasing!)
-    c_flat = centroid_acc.reshape(B * Hq, D)
-    s_flat = sign_acc.reshape(B * Hq, D)
-    v_mse = buf["v_mse"]
-    qjl_corr = buf["qjl_corr"]
-    if is_rq:
-        _rq_rotate_inverse(c_flat, Pi, out=v_mse)
-    else:
-        torch.mm(c_flat, Pi, out=v_mse)
-    torch.mm(s_flat, S, out=qjl_corr)
-    v_mse.add_(qjl_corr, alpha=correction)
-
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
-                    centroid_acc.norm(), sign_acc.norm())
-        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
-                    v_mse.norm(), v_mse.var())
-        logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
-
-    # .clone() prevents race condition: v_mse is a pre-allocated buffer
-    # that gets overwritten on the next decode step. Without clone, vLLM's
-    # async copy (output[:] = decode_out) may read stale data.
-    return v_mse.reshape(B, Hq, D).clone()
+    # CUDA kernel does full V decompression — output is ready
+    # .clone() prevents race condition with pre-allocated buffer
+    return output.clone()
