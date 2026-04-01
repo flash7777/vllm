@@ -542,49 +542,6 @@ def _load_clifford_kernel():
         return None
 
 
-_rq_decode_kernel = None
-_rq_decode_kernel_tried = False
-
-
-def _load_rq_decode_kernel():
-    """JIT compile the RQ fused decode kernel (Clifford V decompression)."""
-    global _rq_decode_kernel, _rq_decode_kernel_tried
-    if _rq_decode_kernel_tried:
-        return _rq_decode_kernel
-    _rq_decode_kernel_tried = True
-
-    import os
-    src_dir = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..",
-        "kernels", "rotorquant"
-    )
-    if not os.path.exists(src_dir):
-        src_dir = "/opt/rq_build"
-    src_file = os.path.join(src_dir, "rq_compressed_attention.cu")
-    if not os.path.exists(src_file):
-        logger.warning("RQ fused decode: source not found at %s", src_file)
-        return None
-
-    try:
-        from torch.utils.cpp_extension import load
-        _rq_decode_kernel = load(
-            name="rq_fused_decode",
-            sources=[src_file],
-            extra_cuda_cflags=[
-                "-O3", "-std=c++17",
-                "--use_fast_math",
-                "-gencode=arch=compute_120,code=sm_120",
-                "-gencode=arch=compute_121,code=sm_121",
-            ],
-            verbose=False,
-        )
-        logger.info("RQ fused decode CUDA kernel compiled and loaded")
-        return _rq_decode_kernel
-    except Exception as e:
-        logger.warning("RQ fused decode CUDA kernel FAILED: %s", e)
-        return None
-
-
 def _rq_rotate_forward(x, rotors, out=None):
     """RQ forward rotation: fused CUDA kernel or Python fallback."""
     D = x.shape[-1]
@@ -653,17 +610,19 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Pre-allocated buffers for CUDA Graph compatibility
+    # Pre-allocated buffers for CUDA Graph compatibility + performance.
+    # Previous centroid_acc=0 bug was caused by head_dim=packed_size mismatch,
+    # now fixed by _recover_head_dim().
     global _decode_buffers
     buf_key = (B, Hq, D, device)
     if buf_key not in _decode_buffers:
         _decode_buffers[buf_key] = {
             "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
-            # RQ/Triton path needs centroid_acc + sign_acc for post-GEMV
             "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
+            "v_mse": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "qjl_corr": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
         }
     buf = _decode_buffers[buf_key]
 
@@ -678,6 +637,11 @@ def mq_fused_decode_attention(
 
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
+
+    centroid_acc = buf["centroid_acc"]
+    sign_acc = buf["sign_acc"]
+    centroid_acc.zero_()
+    sign_acc.zero_()
 
     # Debug logging (MQ_DEBUG=1)
     import os
@@ -702,23 +666,20 @@ def mq_fused_decode_attention(
         logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
                     D, Hq, num_kv_heads, mse_bits, n_centroids)
 
-    # 3. Try CUDA kernel (full V decompression for TQ, CUDA Graph compatible)
-    #    RQ cannot use the CUDA kernel because Pi is [n_groups, 8] not [D, D]
+    # 3. Try CUDA kernel first (CUDA Graph compatible), fallback to Triton
     cuda_ok = False
     kernel = _load_cuda_kernel()
-    output = buf["output"]
-    if kernel is not None and not is_rq:
+    if kernel is not None:
         try:
             kernel.tq_fused_decode_attention(
                 q_rot_3d,
                 q_proj_3d,
                 kv_cache,
-                Pi.float().contiguous(),
-                S.float().contiguous(),
                 centroids,
                 block_table.int(),
                 seq_lens.int(),
-                output,
+                centroid_acc,
+                sign_acc,
                 D, mse_bits, n_centroids, scale,
                 s_block, s_kv, s_slot, s_head,
             )
@@ -735,11 +696,8 @@ def mq_fused_decode_attention(
         _decode_path_logged = True
 
     if not cuda_ok:
-        # Triton fallback: outputs centroid_acc + sign_acc (needs post-GEMV)
-        centroid_acc = buf["centroid_acc"]
-        sign_acc = buf["sign_acc"]
-        centroid_acc.zero_()
-        sign_acc.zero_()
+        # WARNING: Triton fallback invalidates CUDA Graphs!
+        # Only safe outside graph capture.
         packed_size = kv_cache.shape[-1]
         mse_bytes = (D * mse_bits + 7) // 8
         qjl_bytes = (D + 7) // 8
@@ -771,18 +729,149 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    if cuda_ok:
-        # CUDA kernel does full V decompression — output is ready
-        return output.clone()
-
-    # Triton fallback: post-loop GEMV to reconstruct V from centroid_acc/sign_acc
+    # 4. Post-loop V reconstruction (separate buffers — no aliasing!)
     c_flat = centroid_acc.reshape(B * Hq, D)
     s_flat = sign_acc.reshape(B * Hq, D)
-    v_out = buf["output"]
+    v_mse = buf["v_mse"]
+    qjl_corr = buf["qjl_corr"]
     if is_rq:
-        _rq_rotate_inverse(c_flat, Pi, out=v_out.reshape(B * Hq, D))
+        _rq_rotate_inverse(c_flat, Pi, out=v_mse)
     else:
-        torch.mm(c_flat, Pi, out=v_out.reshape(B * Hq, D))
-    qjl_corr = torch.mm(s_flat, S)
-    v_out.reshape(B * Hq, D).add_(qjl_corr, alpha=correction)
-    return v_out.clone()
+        torch.mm(c_flat, Pi, out=v_mse)
+    torch.mm(s_flat, S, out=qjl_corr)
+    v_mse.add_(qjl_corr, alpha=correction)
+
+    if os.environ.get("MQ_DEBUG"):
+        logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
+                    centroid_acc.norm(), sign_acc.norm())
+        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
+                    v_mse.norm(), v_mse.var())
+        logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
+
+    # .clone() prevents race condition: v_mse is a pre-allocated buffer
+    # that gets overwritten on the next decode step. Without clone, vLLM's
+    # async copy (output[:] = decode_out) may read stale data.
+    return v_mse.reshape(B, Hq, D).clone()
+
+
+# ============================================================
+# RQ (RotorQuant) — Clifford rotation helpers + decode kernel
+# ============================================================
+
+_clifford_kernel = None
+_clifford_kernel_tried = False
+
+
+def _load_clifford_kernel():
+    """JIT compile the fused Clifford sandwich kernel."""
+    global _clifford_kernel, _clifford_kernel_tried
+    if _clifford_kernel_tried:
+        return _clifford_kernel
+    _clifford_kernel_tried = True
+
+    import os
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "rotorquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/rq_build"
+    src_file = os.path.join(src_dir, "clifford_sandwich.cu")
+    if not os.path.exists(src_file):
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _clifford_kernel = load(
+            name="clifford_sandwich",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17", "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+            ],
+            verbose=False,
+        )
+        logger.info("Clifford sandwich CUDA kernel loaded")
+        return _clifford_kernel
+    except Exception as e:
+        logger.warning("Clifford sandwich kernel FAILED: %s", e)
+        return None
+
+
+def _rq_rotate_forward(x, rotors, out=None):
+    """RQ forward rotation: CUDA kernel or Python fallback."""
+    D = x.shape[-1]
+    kernel = _load_clifford_kernel()
+    if kernel is not None:
+        if out is None:
+            out = torch.empty_like(x)
+        kernel.clifford_sandwich_forward(x.float(), rotors.float(), out, D)
+        return out
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors,
+    )
+    mv = embed_vectors_as_multivectors(x)
+    mv_rot = rotor_sandwich(rotors, mv)
+    return extract_vectors_from_multivectors(mv_rot, D)
+
+
+def _rq_rotate_inverse(x, rotors, out=None):
+    """RQ inverse rotation: CUDA kernel or Python fallback."""
+    D = x.shape[-1]
+    kernel = _load_clifford_kernel()
+    if kernel is not None:
+        if out is None:
+            out = torch.empty_like(x)
+        kernel.clifford_sandwich_inverse(x.float(), rotors.float(), out, D)
+        return out
+    from vllm.multiquant.rotorquant.clifford import (
+        embed_vectors_as_multivectors, rotor_sandwich,
+        extract_vectors_from_multivectors, reverse,
+    )
+    mv = embed_vectors_as_multivectors(x)
+    rotor_rev = reverse(rotors)
+    mv_recon = rotor_sandwich(rotor_rev, mv)
+    return extract_vectors_from_multivectors(mv_recon, D)
+
+
+_rq_decode_kernel = None
+_rq_decode_kernel_tried = False
+
+
+def _load_rq_decode_kernel():
+    """JIT compile the RQ fused decode kernel (Clifford V decompression)."""
+    global _rq_decode_kernel, _rq_decode_kernel_tried
+    if _rq_decode_kernel_tried:
+        return _rq_decode_kernel
+    _rq_decode_kernel_tried = True
+
+    import os
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "rotorquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/rq_build"
+    src_file = os.path.join(src_dir, "rq_compressed_attention.cu")
+    if not os.path.exists(src_file):
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _rq_decode_kernel = load(
+            name="rq_fused_decode",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17", "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+            ],
+            verbose=False,
+        )
+        logger.info("RQ fused decode CUDA kernel loaded")
+        return _rq_decode_kernel
+    except Exception as e:
+        logger.warning("RQ fused decode kernel FAILED: %s", e)
+        return None

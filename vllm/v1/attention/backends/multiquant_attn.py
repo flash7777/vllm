@@ -229,9 +229,14 @@ class MultiQuantImpl:
         cuda_kernel = _load_cuda_kernel()
         self._decode_fn = mq_fused_decode_attention
 
-        # Pre-load Clifford module for RQ (avoids import during graph capture)
+        # Pre-load RQ kernels at init (JIT compile before first forward)
         if self._is_rq:
             import vllm.multiquant.rotorquant.clifford  # noqa: F401
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_rq_decode_kernel, _load_clifford_kernel,
+            )
+            _load_rq_decode_kernel()
+            _load_clifford_kernel()
 
         logger.info(
             "MultiQuant attention: D=%d (from spec %d), %s KV, "
