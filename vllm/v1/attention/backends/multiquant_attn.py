@@ -10,6 +10,7 @@ Prefill: naive causal attention on raw K/V
 """
 
 import math
+import os
 import struct
 from dataclasses import dataclass
 from typing import ClassVar, Optional
@@ -332,7 +333,7 @@ class MultiQuantImpl:
         if self.kv_sharing_target_layer_name is not None:
             return
 
-        import os
+        # os imported at module level
         if os.environ.get("MQ_DEBUG"):
             logger.info("[MQ_KV] WRITE slots=%s key=%s val=%s",
                         slot_mapping.tolist()[:4], key.shape, value.shape)
@@ -400,7 +401,7 @@ class MultiQuantImpl:
         num_prefill = attn_metadata.num_prefill_tokens
         num_decode = attn_metadata.num_decode_tokens
 
-        import os
+        # os imported at module level
         if os.environ.get("MQ_DEBUG"):
             sl = attn_metadata.seq_lens[:max(1,num_decode)].tolist() if num_decode > 0 else []
             cache_nz = kv_cache.any(dim=-1).sum().item()

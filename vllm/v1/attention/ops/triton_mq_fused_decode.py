@@ -20,6 +20,7 @@ TQ only (TQ3/TQ4). RQ keeps Python fallback.
 """
 
 import math
+import os
 
 import torch
 
@@ -465,7 +466,7 @@ def _load_cuda_kernel():
         return _cuda_kernel
     _cuda_kernel_tried = True
 
-    import os
+    # os imported at module level
     src_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "..",
         "kernels", "turboquant"
@@ -510,7 +511,7 @@ def _load_clifford_kernel():
         return _clifford_kernel
     _clifford_kernel_tried = True
 
-    import os
+    # os imported at module level
     src_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "..",
         "kernels", "rotorquant"
@@ -644,7 +645,7 @@ def mq_fused_decode_attention(
     sign_acc.zero_()
 
     # Debug logging (MQ_DEBUG=1)
-    import os
+    # os imported at module level
     if os.environ.get("MQ_DEBUG"):
         logger.info("[MQ_DEBUG] q: shape=%s norm=%.4f", q.shape, q.float().norm())
         logger.info("[MQ_DEBUG] cache: shape=%s nonzero_rows=%d",
@@ -769,7 +770,7 @@ def _load_clifford_kernel():
         return _clifford_kernel
     _clifford_kernel_tried = True
 
-    import os
+    # os imported at module level
     src_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "..",
         "kernels", "rotorquant"
@@ -847,7 +848,7 @@ def _load_rq_decode_kernel():
         return _rq_decode_kernel
     _rq_decode_kernel_tried = True
 
-    import os
+    # os imported at module level
     src_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "..",
         "kernels", "rotorquant"
