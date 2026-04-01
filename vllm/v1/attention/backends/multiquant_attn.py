@@ -232,14 +232,11 @@ class MultiQuantImpl:
         # Pre-load RQ kernels at init (JIT compile before first forward)
         if self._is_rq:
             import vllm.multiquant.rotorquant.clifford  # noqa: F401
-            try:
-                from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    _load_rq_decode_kernel, _load_clifford_kernel,
-                )
-                _load_rq_decode_kernel()
-                _load_clifford_kernel()
-            except ImportError:
-                pass  # Image version without RQ kernel loader
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_rq_decode_kernel, _load_clifford_kernel,
+            )
+            _load_rq_decode_kernel()
+            _load_clifford_kernel()
 
         logger.info(
             "MultiQuant attention: D=%d (from spec %d), %s KV, "
@@ -415,20 +412,45 @@ class MultiQuantImpl:
         """Decode: TQ → CUDA fused kernel, RQ → Python loop."""
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
         if self._is_rq:
-            # RQ: use same decode pipeline as TQ but with is_rq=True
-            # This uses Image's Post-GEMV with _rq_rotate_inverse
-            decode_out = self._decode_fn(
-                q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
-                centroids=centroids,
-                block_table=attn_metadata.block_table[:num_decode],
-                seq_lens=attn_metadata.seq_lens[:num_decode],
-                scale=self.scale, block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                mse_bits=self._mse_bits,
-                correction=self._correction,
-                is_rq=True,
+            # RQ: separate CUDA kernel with Clifford V decompression
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_rq_decode_kernel, _rq_rotate_forward,
             )
-            output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
+            rq_kernel = _load_rq_decode_kernel()
+            if rq_kernel is not None:
+                q_flat = dq.reshape(num_decode * self.num_heads, D).float()
+                q_rot = _rq_rotate_forward(q_flat, Pi)
+                q_proj = torch.mm(q_flat, S.T)
+                q_rot_3d = q_rot.reshape(num_decode, self.num_heads, D)
+                q_proj_3d = q_proj.reshape(num_decode, self.num_heads, D)
+                rq_out = torch.empty(
+                    num_decode, self.num_heads, D,
+                    device=device, dtype=torch.float32)
+                s_block = kv_cache.stride(0)
+                s_kv = kv_cache.stride(1)
+                s_slot = kv_cache.stride(2)
+                s_head = kv_cache.stride(3)
+                rq_kernel.rq_fused_decode_attention(
+                    q_rot_3d, q_proj_3d, kv_cache,
+                    Pi.float().contiguous(),
+                    S.float().contiguous(),
+                    centroids,
+                    attn_metadata.block_table[:num_decode].int(),
+                    attn_metadata.seq_lens[:num_decode].int(),
+                    rq_out,
+                    D, self._mse_bits, centroids.shape[0], self.scale,
+                    s_block, s_kv, s_slot, s_head,
+                )
+                output[:num_decode] = rq_out.reshape(
+                    num_decode, -1).to(output.dtype)
+            else:
+                # Fallback: Python loop
+                self._decode_python_loop(
+                    dq, kv_cache, Pi, S, centroids,
+                    attn_metadata.seq_lens[:num_decode],
+                    attn_metadata.block_table[:num_decode],
+                    block_size, D, device, output,
+                )
         else:
             # TQ: CUDA fused kernel with full V decompression via Pi/S GEMV
             decode_out = self._decode_fn(
