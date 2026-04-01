@@ -76,7 +76,11 @@ Der fused CUDA Kernel funktioniert korrekt.
    - Lösung: graph-safe KV Pack (PyTorch tensor ops oder pre-compiled CUDA)
    - Stufe F zeigt dass der Graph-Pfad der Bruchpunkt ist
 
-3. **RQ3/RQ4**: cos ≈ 0 — komplett kaputt (separate Regression)
+3. **RQ3/RQ4**: Unit Test cos=0.89/0.95 aber Serve kaputt
+   - Image Post-GEMV + Clifford: cos=0.10 (zu niedrig, Clifford nicht-linear)
+   - Neuer RQ CUDA Kernel: cos=0.89 im Unit Test, Müll im Serve
+   - RQ hat auf dem Image (`8d373f2ba`) **nie** im Serve funktioniert
+   - Root Cause offen — Unit Test vs Serve Diskrepanz ungeklärt
 
 ## Testdatei
 
