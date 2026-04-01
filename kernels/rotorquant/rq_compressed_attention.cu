@@ -287,6 +287,10 @@ void rq_fused_decode_attention(
     else if (head_dim == 256 && mse_bits == 1) { LAUNCH(256, 1, 2); }
     else if (head_dim == 256 && mse_bits == 2) { LAUNCH(256, 2, 4); }
     else if (head_dim == 256 && mse_bits == 3) { LAUNCH(256, 3, 8); }
+    // HEAD_DIM=512
+    else if (head_dim == 512 && mse_bits == 1) { LAUNCH(512, 1, 2); }
+    else if (head_dim == 512 && mse_bits == 2) { LAUNCH(512, 2, 4); }
+    else if (head_dim == 512 && mse_bits == 3) { LAUNCH(512, 3, 8); }
     else { TORCH_CHECK(false, "RQ fused decode: unsupported config head_dim=",
                         head_dim, " mse_bits=", mse_bits); }
     #undef LAUNCH
