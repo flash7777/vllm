@@ -441,7 +441,7 @@ class MultiQuantImpl:
                     D, self._mse_bits, centroids.shape[0], self.scale,
                     s_block, s_kv, s_slot, s_head,
                 )
-                rq_out = rq_out.clone()  # force sync — JIT kernel is async
+                torch.cuda.synchronize()  # JIT kernel is async — must sync before read
                 output[:num_decode] = rq_out.reshape(
                     num_decode, -1).to(output.dtype)
             else:
