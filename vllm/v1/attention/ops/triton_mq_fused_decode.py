@@ -500,93 +500,6 @@ def _load_cuda_kernel():
         return None
 
 
-_clifford_kernel = None
-_clifford_kernel_tried = False
-
-
-def _load_clifford_kernel():
-    """JIT compile the fused Clifford sandwich kernel."""
-    global _clifford_kernel, _clifford_kernel_tried
-    if _clifford_kernel_tried:
-        return _clifford_kernel
-    _clifford_kernel_tried = True
-
-    # os imported at module level
-    src_dir = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..",
-        "kernels", "rotorquant"
-    )
-    if not os.path.exists(src_dir):
-        src_dir = "/opt/rq_build"
-    src_file = os.path.join(src_dir, "clifford_sandwich.cu")
-    if not os.path.exists(src_file):
-        logger.warning("Clifford sandwich: source not found at %s", src_file)
-        return None
-
-    try:
-        from torch.utils.cpp_extension import load
-        _clifford_kernel = load(
-            name="clifford_sandwich",
-            sources=[src_file],
-            extra_cuda_cflags=[
-                "-O3", "-std=c++17",
-                "--use_fast_math",
-                "-gencode=arch=compute_120,code=sm_120",
-                "-gencode=arch=compute_121,code=sm_121",
-            ],
-            verbose=False,
-        )
-        logger.info("Clifford sandwich CUDA kernel compiled and loaded")
-        return _clifford_kernel
-    except Exception as e:
-        logger.warning("Clifford sandwich CUDA kernel FAILED: %s", e)
-        return None
-
-
-def _rq_rotate_forward(x, rotors, out=None):
-    """RQ forward rotation: fused CUDA kernel or Python fallback."""
-    D = x.shape[-1]
-    kernel = _load_clifford_kernel()
-    if kernel is not None:
-        if out is None:
-            out = torch.empty_like(x)
-        kernel.clifford_sandwich_forward(x.float(), rotors.float(), out, D)
-        return out
-    # Python fallback (~70 kernel launches, not graph-safe)
-    global _rq_fallback_logged
-    if not _rq_fallback_logged:
-        logger.warning("RQ rotation: using Python fallback (Clifford CUDA kernel unavailable)")
-        _rq_fallback_logged = True
-    from vllm.multiquant.rotorquant.clifford import (
-        embed_vectors_as_multivectors, rotor_sandwich,
-        extract_vectors_from_multivectors,
-    )
-    mv = embed_vectors_as_multivectors(x)
-    mv_rot = rotor_sandwich(rotors, mv)
-    return extract_vectors_from_multivectors(mv_rot, D)
-
-_rq_fallback_logged = False
-
-
-def _rq_rotate_inverse(x, rotors, out=None):
-    """RQ inverse rotation: fused CUDA kernel or Python fallback."""
-    D = x.shape[-1]
-    kernel = _load_clifford_kernel()
-    if kernel is not None:
-        if out is None:
-            out = torch.empty_like(x)
-        kernel.clifford_sandwich_inverse(x.float(), rotors.float(), out, D)
-        return out
-    from vllm.multiquant.rotorquant.clifford import (
-        embed_vectors_as_multivectors, rotor_sandwich,
-        extract_vectors_from_multivectors, reverse,
-    )
-    mv = embed_vectors_as_multivectors(x)
-    rotor_rev = reverse(rotors)
-    mv_recon = rotor_sandwich(rotor_rev, mv)
-    return extract_vectors_from_multivectors(mv_recon, D)
-
-
 def mq_fused_decode_attention(
     q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
     kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
@@ -611,15 +524,20 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Pre-allocated buffers for CUDA Graph compatibility + performance.
-    # Previous centroid_acc=0 bug was caused by head_dim=packed_size mismatch,
-    # now fixed by _recover_head_dim().
+    # Pre-allocated buffers for CUDA Graph compatibility.
+    # ALL tensor ops must be allocation-free (no .float(), .clone(), .int()).
     global _decode_buffers
-    buf_key = (B, Hq, D, device)
+    max_blocks = block_table.shape[1]
+    buf_key = (B, Hq, D, max_blocks, device)
     if buf_key not in _decode_buffers:
         _decode_buffers[buf_key] = {
+            "q_flat": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
+            "bt_int": torch.empty(B, max_blocks, device=device, dtype=torch.int32),
+            "sl_int": torch.empty(B, device=device, dtype=torch.int32),
+            # Triton fallback (post-loop GEMV):
             "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "v_mse": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
@@ -627,33 +545,28 @@ def mq_fused_decode_attention(
         }
     buf = _decode_buffers[buf_key]
 
-    q_flat = q.reshape(B * Hq, D).float()
-    if is_rq:
-        _rq_rotate_forward(q_flat, Pi, out=buf["q_rot"])
-    else:
-        torch.mm(q_flat, Pi.T, out=buf["q_rot"])
+    # Graph-safe dtype conversion: copy_() handles bfloat16→float32 in-place
+    q_flat = buf["q_flat"]
+    q_flat.copy_(q.reshape(B * Hq, D))
+
     q_rot = buf["q_rot"]
-    torch.mm(q_flat, S.T, out=buf["q_proj"])
     q_proj = buf["q_proj"]
+    if is_rq:
+        _rq_rotate_forward(q_flat, Pi, out=q_rot)
+    else:
+        torch.mm(q_flat, Pi.T, out=q_rot)
+    torch.mm(q_flat, S.T, out=q_proj)
 
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
 
-    centroid_acc = buf["centroid_acc"]
-    sign_acc = buf["sign_acc"]
-    centroid_acc.zero_()
-    sign_acc.zero_()
+    output = buf["output"]
 
-    # Debug logging (MQ_DEBUG=1)
-    # os imported at module level
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] q: shape=%s norm=%.4f", q.shape, q.float().norm())
-        logger.info("[MQ_DEBUG] cache: shape=%s nonzero_rows=%d",
-                    kv_cache.shape, kv_cache.any(dim=-1).sum().item())
-        logger.info("[MQ_DEBUG] seq_lens=%s block_table=%s",
-                    seq_lens.tolist(), block_table.shape)
-        logger.info("[MQ_DEBUG] q_rot norm=%.4f, q_proj norm=%.4f",
-                    q_rot.norm(), q_proj.norm())
+    # Graph-safe int32 conversion for block_table / seq_lens
+    bt_int = buf["bt_int"]
+    sl_int = buf["sl_int"]
+    bt_int.copy_(block_table)
+    sl_int.copy_(seq_lens)
 
     # KV cache strides
     s_block = kv_cache.stride(0)
@@ -661,13 +574,7 @@ def mq_fused_decode_attention(
     s_slot = kv_cache.stride(2)
     s_head = kv_cache.stride(3)
 
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] strides: block=%d kv=%d slot=%d head=%d ps=%d",
-                    s_block, s_kv, s_slot, s_head, kv_cache.shape[-1])
-        logger.info("[MQ_DEBUG] D=%d Hq=%d Hkv=%d mse_bits=%d n_centroids=%d",
-                    D, Hq, num_kv_heads, mse_bits, n_centroids)
-
-    # 3. Try CUDA kernel (graph-safe), fallback to Triton
+    # Try CUDA kernel (full V decompression — graph-safe, no post-GEMV needed)
     cuda_ok = False
     kernel = _load_cuda_kernel()
     if kernel is not None:
@@ -676,11 +583,12 @@ def mq_fused_decode_attention(
                 q_rot_3d,
                 q_proj_3d,
                 kv_cache,
+                Pi,             # [D, D] float32 rotation matrix
+                S,              # [D, D] float32 QJL projection matrix
                 centroids,
-                block_table.int(),
-                seq_lens.int(),
-                centroid_acc,
-                sign_acc,
+                bt_int,
+                sl_int,
+                output,         # kernel writes fully reconstructed V here
                 D, mse_bits, n_centroids, scale,
                 s_block, s_kv, s_slot, s_head,
             )
@@ -691,14 +599,19 @@ def mq_fused_decode_attention(
     global _decode_path_logged
     if not _decode_path_logged:
         if cuda_ok:
-            logger.info("MQ decode: using CUDA fused kernel")
+            logger.info("MQ decode: using CUDA fused kernel (full V decompression)")
         else:
-            logger.warning("MQ decode: CUDA kernel unavailable, using Triton fallback (slower)")
+            logger.warning("MQ decode: CUDA kernel unavailable, "
+                           "using Triton fallback + post-loop GEMV")
         _decode_path_logged = True
 
     if not cuda_ok:
-        # WARNING: Triton fallback invalidates CUDA Graphs!
-        # Only safe outside graph capture.
+        # Triton fallback with post-loop GEMV (NOT graph-safe due to Triton JIT)
+        centroid_acc = buf["centroid_acc"]
+        sign_acc = buf["sign_acc"]
+        centroid_acc.zero_()
+        sign_acc.zero_()
+
         packed_size = kv_cache.shape[-1]
         mse_bytes = (D * mse_bits + 7) // 8
         qjl_bytes = (D + 7) // 8
@@ -730,29 +643,23 @@ def mq_fused_decode_attention(
             num_stages=1,
         )
 
-    # 4. Post-loop V reconstruction (separate buffers — no aliasing!)
-    c_flat = centroid_acc.reshape(B * Hq, D)
-    s_flat = sign_acc.reshape(B * Hq, D)
-    v_mse = buf["v_mse"]
-    qjl_corr = buf["qjl_corr"]
-    if is_rq:
-        _rq_rotate_inverse(c_flat, Pi, out=v_mse)
-    else:
-        torch.mm(c_flat, Pi, out=v_mse)
-    torch.mm(s_flat, S, out=qjl_corr)
-    v_mse.add_(qjl_corr, alpha=correction)
+        # Post-loop V reconstruction
+        c_flat = centroid_acc.reshape(B * Hq, D)
+        s_flat = sign_acc.reshape(B * Hq, D)
+        v_mse = buf["v_mse"]
+        qjl_corr = buf["qjl_corr"]
+        if is_rq:
+            _rq_rotate_inverse(c_flat, Pi, out=v_mse)
+        else:
+            torch.mm(c_flat, Pi, out=v_mse)
+        torch.mm(s_flat, S, out=qjl_corr)
+        v_mse.add_(qjl_corr, alpha=correction)
+        output.copy_(v_mse.reshape(B, Hq, D))
 
-    if os.environ.get("MQ_DEBUG"):
-        logger.info("[MQ_DEBUG] centroid_acc norm=%.4f, sign_acc norm=%.4f",
-                    centroid_acc.norm(), sign_acc.norm())
-        logger.info("[MQ_DEBUG] output norm=%.4f, var=%.6f",
-                    v_mse.norm(), v_mse.var())
-        logger.info("[MQ_DEBUG] cuda_ok=%s", cuda_ok)
-
-    # .clone() prevents race condition: v_mse is a pre-allocated buffer
-    # that gets overwritten on the next decode step. Without clone, vLLM's
-    # async copy (output[:] = decode_out) may read stale data.
-    return v_mse.reshape(B, Hq, D).clone()
+    # Return pre-allocated buffer directly — caller must copy before next call.
+    # No .clone() needed: caller does output[:N].copy_(decode_out.view(N,-1))
+    # which copies immediately.
+    return output
 
 
 # ============================================================

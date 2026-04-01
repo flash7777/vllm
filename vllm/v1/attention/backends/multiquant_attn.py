@@ -451,7 +451,11 @@ class MultiQuantImpl:
 
     def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
                         attn_metadata, num_decode, block_size, D, device):
-        """Decode: TQ → CUDA fused kernel, RQ → Python loop."""
+        """Decode: TQ → CUDA fused kernel, RQ → RQ CUDA kernel.
+
+        All tensor ops use pre-allocated buffers for CUDA Graph compatibility.
+        No .float(), .clone(), .int(), or torch.empty() during forward.
+        """
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
         if self._is_rq:
             # RQ: separate CUDA kernel with Clifford V decompression
@@ -460,34 +464,53 @@ class MultiQuantImpl:
             )
             rq_kernel = _load_rq_decode_kernel()
             if rq_kernel is not None:
-                q_flat = dq.reshape(num_decode * self.num_heads, D).float()
-                q_rot = _rq_rotate_forward(q_flat, Pi)
-                q_proj = torch.mm(q_flat, S.T)
-                q_rot_3d = q_rot.reshape(num_decode, self.num_heads, D)
-                q_proj_3d = q_proj.reshape(num_decode, self.num_heads, D)
-                rq_out = torch.empty(
-                    num_decode, self.num_heads, D,
-                    device=device, dtype=torch.float32)
+                # Pre-allocate RQ decode buffers (once)
+                rq_key = (num_decode, self.num_heads, D, device)
+                if not hasattr(self, '_rq_decode_bufs') or \
+                        self._rq_decode_bufs.get("key") != rq_key:
+                    self._rq_decode_bufs = {
+                        "key": rq_key,
+                        "q_flat": torch.empty(
+                            num_decode * self.num_heads, D,
+                            device=device, dtype=torch.float32),
+                        "q_rot": torch.empty(
+                            num_decode * self.num_heads, D,
+                            device=device, dtype=torch.float32),
+                        "q_proj": torch.empty(
+                            num_decode * self.num_heads, D,
+                            device=device, dtype=torch.float32),
+                        "rq_out": torch.empty(
+                            num_decode, self.num_heads, D,
+                            device=device, dtype=torch.float32),
+                    }
+                rb = self._rq_decode_bufs
+
+                # Graph-safe: copy_ handles dtype conversion in-place
+                rb["q_flat"].copy_(dq.reshape(num_decode * self.num_heads, D))
+                _rq_rotate_forward(rb["q_flat"], Pi, out=rb["q_rot"])
+                torch.mm(rb["q_flat"], S.T, out=rb["q_proj"])
+
+                q_rot_3d = rb["q_rot"].reshape(num_decode, self.num_heads, D)
+                q_proj_3d = rb["q_proj"].reshape(num_decode, self.num_heads, D)
+
                 s_block = kv_cache.stride(0)
                 s_kv = kv_cache.stride(1)
                 s_slot = kv_cache.stride(2)
                 s_head = kv_cache.stride(3)
                 rq_kernel.rq_fused_decode_attention(
                     q_rot_3d, q_proj_3d, kv_cache,
-                    Pi.float().contiguous(),
-                    S.float().contiguous(),
-                    centroids,
-                    attn_metadata.block_table[:num_decode].int(),
-                    attn_metadata.seq_lens[:num_decode].int(),
-                    rq_out,
+                    Pi, S, centroids,
+                    attn_metadata.block_table[:num_decode],
+                    attn_metadata.seq_lens[:num_decode],
+                    rb["rq_out"],
                     D, self._mse_bits, centroids.shape[0], self.scale,
                     s_block, s_kv, s_slot, s_head,
                 )
-                torch.cuda.synchronize()  # JIT kernel is async — must sync before read
-                output[:num_decode] = rq_out.reshape(
-                    num_decode, -1).to(output.dtype)
+                # copy_ handles float32→bfloat16 in-place (no allocation)
+                output[:num_decode].copy_(
+                    rb["rq_out"].reshape(num_decode, -1))
             else:
-                # Fallback: Python loop
+                # Fallback: Python loop (not graph-safe)
                 self._decode_python_loop(
                     dq, kv_cache, Pi, S, centroids,
                     attn_metadata.seq_lens[:num_decode],
@@ -507,7 +530,8 @@ class MultiQuantImpl:
                 correction=self._correction,
                 is_rq=False,
             )
-            output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
+            # copy_ handles float32→bfloat16 in-place (no allocation)
+            output[:num_decode].copy_(decode_out.reshape(num_decode, -1))
 
     # --- Helpers ---
 
