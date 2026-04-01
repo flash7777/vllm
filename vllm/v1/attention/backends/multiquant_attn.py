@@ -332,6 +332,10 @@ class MultiQuantImpl:
         if self.kv_sharing_target_layer_name is not None:
             return
 
+        # Must be FIRST — no ops before this during graph capture
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         import os
         if os.environ.get("MQ_DEBUG"):
             logger.info("[MQ_KV] WRITE slots=%s key=%s val=%s",
@@ -344,11 +348,6 @@ class MultiQuantImpl:
         Pi, S, centroids = self._get_matrices(layer, device)
 
         num_tokens, num_heads = key.shape[0], key.shape[1]
-
-        # Skip during CUDA Graph capture — pack allocates tensors (not capture-safe).
-        # KV update runs as custom op outside graph — called eagerly during replay.
-        if torch.cuda.is_current_stream_capturing():
-            return
 
         # Vectorized pack: all tokens × all heads in one batch
         k_flat = key.reshape(-1, D)
