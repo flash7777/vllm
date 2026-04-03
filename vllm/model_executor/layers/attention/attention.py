@@ -407,22 +407,33 @@ class Attention(nn.Module, AttentionLayerBase):
         from vllm.multiquant.shared.centroids import get_centroids
 
         # Dispatch rotation based on quantizer type
-        if cache_dtype.startswith("rq"):
+        if cache_dtype.endswith("w"):
+            # WHT mode: no Pi/S matrices needed (WHT is deterministic)
+            from vllm.multiquant.shared.centroids import get_wht_centroids
+            self.register_buffer(
+                "_tq_centroids",
+                get_wht_centroids(mq_config.mse_bits))
+            self._tq_use_wht = True
+        elif cache_dtype.startswith("rq"):
             from vllm.multiquant.rotorquant.quantizer import generate_rotors
             self.register_buffer(
                 "_tq_Pi", generate_rotors(head_size, seed=seed))
+            self.register_buffer(
+                "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
+            self.register_buffer(
+                "_tq_centroids",
+                get_centroids(head_size, mq_config.mse_bits))
         else:
             from vllm.multiquant.turboquant.quantizer import (
                 generate_rotation_matrix,
             )
             self.register_buffer(
                 "_tq_Pi", generate_rotation_matrix(head_size, seed=seed))
-
-        self.register_buffer(
-            "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
-        self.register_buffer(
-            "_tq_centroids",
-            get_centroids(head_size, mq_config.mse_bits))
+            self.register_buffer(
+                "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
+            self.register_buffer(
+                "_tq_centroids",
+                get_centroids(head_size, mq_config.mse_bits))
         self._tq_config = mq_config
         self._mq_cache_dtype = cache_dtype
 
