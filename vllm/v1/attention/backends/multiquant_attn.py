@@ -699,8 +699,8 @@ class MultiQuantImpl:
                 rq_kernel.rq_fused_decode_attention(
                     q_rot_3d, q_proj_3d, kv_cache,
                     Pi, S, centroids,
-                    attn_metadata.block_table[:num_decode],
-                    attn_metadata.seq_lens[:num_decode],
+                    attn_metadata.block_table[:num_decode].int(),
+                    attn_metadata.seq_lens[:num_decode].int(),
                     rb["rq_out"],
                     D, self._mse_bits, centroids.shape[0], self.scale,
                     s_block, s_kv, s_slot, s_head,
