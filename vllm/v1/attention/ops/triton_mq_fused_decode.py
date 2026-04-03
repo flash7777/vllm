@@ -524,49 +524,37 @@ def mq_fused_decode_attention(
     device = q.device
     n_centroids = centroids.shape[0]
 
-    # Pre-allocated buffers for CUDA Graph compatibility.
-    # ALL tensor ops must be allocation-free (no .float(), .clone(), .int()).
+    # Pre-allocated buffers (image-compatible + CUDA kernel fix)
     global _decode_buffers
-    max_blocks = block_table.shape[1]
-    buf_key = (B, Hq, D, max_blocks, device)
+    buf_key = (B, Hq, D, device)
     if buf_key not in _decode_buffers:
         _decode_buffers[buf_key] = {
-            "q_flat": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_rot": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "q_proj": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
-            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
-            "bt_int": torch.empty(B, max_blocks, device=device, dtype=torch.int32),
-            "sl_int": torch.empty(B, device=device, dtype=torch.int32),
-            # Triton fallback (post-loop GEMV):
             "centroid_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "sign_acc": torch.zeros(B, Hq, D, device=device, dtype=torch.float32),
             "v_mse": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
             "qjl_corr": torch.empty(B * Hq, D, device=device, dtype=torch.float32),
+            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
         }
     buf = _decode_buffers[buf_key]
 
-    # Graph-safe dtype conversion: copy_() handles bfloat16→float32 in-place
-    q_flat = buf["q_flat"]
-    q_flat.copy_(q.reshape(B * Hq, D))
-
-    q_rot = buf["q_rot"]
-    q_proj = buf["q_proj"]
+    q_flat = q.reshape(B * Hq, D).float()
     if is_rq:
-        _rq_rotate_forward(q_flat, Pi, out=q_rot)
+        _rq_rotate_forward(q_flat, Pi, out=buf["q_rot"])
     else:
-        torch.mm(q_flat, Pi.T, out=q_rot)
-    torch.mm(q_flat, S.T, out=q_proj)
+        torch.mm(q_flat, Pi.T, out=buf["q_rot"])
+    q_rot = buf["q_rot"]
+    torch.mm(q_flat, S.T, out=buf["q_proj"])
+    q_proj = buf["q_proj"]
 
     q_rot_3d = q_rot.reshape(B, Hq, D)
     q_proj_3d = q_proj.reshape(B, Hq, D)
 
-    output = buf["output"]
-
-    # Graph-safe int32 conversion for block_table / seq_lens
-    bt_int = buf["bt_int"]
-    sl_int = buf["sl_int"]
-    bt_int.copy_(block_table)
-    sl_int.copy_(seq_lens)
+    centroid_acc = buf["centroid_acc"]
+    sign_acc = buf["sign_acc"]
+    centroid_acc.zero_()
+    sign_acc.zero_()
 
     # KV cache strides
     s_block = kv_cache.stride(0)
@@ -574,11 +562,12 @@ def mq_fused_decode_attention(
     s_slot = kv_cache.stride(2)
     s_head = kv_cache.stride(3)
 
-    # Try CUDA kernel (full V decompression — graph-safe, no post-GEMV needed)
+    # Try CUDA kernel (full V decompression — no post-GEMV needed)
     cuda_ok = False
     kernel = _load_cuda_kernel()
     if kernel is not None:
         try:
+            output = buf["output"]
             kernel.tq_fused_decode_attention(
                 q_rot_3d,
                 q_proj_3d,
@@ -586,8 +575,8 @@ def mq_fused_decode_attention(
                 Pi,             # [D, D] float32 rotation matrix
                 S,              # [D, D] float32 QJL projection matrix
                 centroids,
-                bt_int,
-                sl_int,
+                block_table.int(),
+                seq_lens.int(),
                 output,         # kernel writes fully reconstructed V here
                 D, mse_bits, n_centroids, scale,
                 s_block, s_kv, s_slot, s_head,
@@ -605,61 +594,54 @@ def mq_fused_decode_attention(
                            "using Triton fallback + post-loop GEMV")
         _decode_path_logged = True
 
-    if not cuda_ok:
-        # Triton fallback with post-loop GEMV (NOT graph-safe due to Triton JIT)
-        centroid_acc = buf["centroid_acc"]
-        sign_acc = buf["sign_acc"]
-        centroid_acc.zero_()
-        sign_acc.zero_()
+    if cuda_ok:
+        return output
 
-        packed_size = kv_cache.shape[-1]
-        mse_bytes = (D * mse_bits + 7) // 8
-        qjl_bytes = (D + 7) // 8
-        kv_group_size = Hq // num_kv_heads
-        s_bt = block_table.stride(0)
+    # Triton fallback with post-loop GEMV
+    packed_size = kv_cache.shape[-1]
+    mse_bytes = (D * mse_bits + 7) // 8
+    qjl_bytes = (D + 7) // 8
+    kv_group_size = Hq // num_kv_heads
+    s_bt = block_table.stride(0)
 
-        grid = (B, Hq)
-        _mq_fused_decode_kernel_v2[grid](
-            q_rot, q_proj,
-            kv_cache,
-            centroids,
-            block_table, seq_lens,
-            centroid_acc.reshape(B * Hq, D),
-            sign_acc.reshape(B * Hq, D),
-            s_block, s_kv, s_slot, s_head,
-            s_bt,
-            num_q_heads=Hq,
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            KV_GROUP_SIZE=kv_group_size,
-            PACKED_SIZE=packed_size,
-            MSE_BITS=mse_bits,
-            MSE_BYTES=mse_bytes,
-            QJL_BYTES=qjl_bytes,
-            N_CENTROIDS=n_centroids,
-            correction_scale=correction,
-            attn_scale=scale,
-            num_warps=4,
-            num_stages=1,
-        )
+    grid = (B, Hq)
+    _mq_fused_decode_kernel_v2[grid](
+        q_rot, q_proj,
+        kv_cache,
+        centroids,
+        block_table, seq_lens,
+        centroid_acc.reshape(B * Hq, D),
+        sign_acc.reshape(B * Hq, D),
+        s_block, s_kv, s_slot, s_head,
+        s_bt,
+        num_q_heads=Hq,
+        HEAD_DIM=D,
+        BLOCK_SIZE=block_size,
+        KV_GROUP_SIZE=kv_group_size,
+        PACKED_SIZE=packed_size,
+        MSE_BITS=mse_bits,
+        MSE_BYTES=mse_bytes,
+        QJL_BYTES=qjl_bytes,
+        N_CENTROIDS=n_centroids,
+        correction_scale=correction,
+        attn_scale=scale,
+        num_warps=4,
+        num_stages=1,
+    )
 
-        # Post-loop V reconstruction
-        c_flat = centroid_acc.reshape(B * Hq, D)
-        s_flat = sign_acc.reshape(B * Hq, D)
-        v_mse = buf["v_mse"]
-        qjl_corr = buf["qjl_corr"]
-        if is_rq:
-            _rq_rotate_inverse(c_flat, Pi, out=v_mse)
-        else:
-            torch.mm(c_flat, Pi, out=v_mse)
-        torch.mm(s_flat, S, out=qjl_corr)
-        v_mse.add_(qjl_corr, alpha=correction)
-        output.copy_(v_mse.reshape(B, Hq, D))
+    # Post-loop V reconstruction
+    c_flat = centroid_acc.reshape(B * Hq, D)
+    s_flat = sign_acc.reshape(B * Hq, D)
+    v_mse = buf["v_mse"]
+    qjl_corr = buf["qjl_corr"]
+    if is_rq:
+        _rq_rotate_inverse(c_flat, Pi, out=v_mse)
+    else:
+        torch.mm(c_flat, Pi, out=v_mse)
+    torch.mm(s_flat, S, out=qjl_corr)
+    v_mse.add_(qjl_corr, alpha=correction)
 
-    # Return pre-allocated buffer directly — caller must copy before next call.
-    # No .clone() needed: caller does output[:N].copy_(decode_out.view(N,-1))
-    # which copies immediately.
-    return output
+    return v_mse.reshape(B, Hq, D).clone()
 
 
 # ============================================================

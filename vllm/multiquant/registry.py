@@ -60,13 +60,17 @@ def register_kv_quantizer(
 def get_kv_quantizer_config(
     cache_dtype: str, head_dim: int
 ) -> "KVQuantizerConfig":
-    """Get quantizer config for a cache dtype string."""
-    if cache_dtype not in _REGISTRY:
+    """Get quantizer config for a cache dtype string.
+
+    Supports parameterized strings like 'tq3w:bs64'.
+    """
+    base = cache_dtype.split(':')[0] if ':' in cache_dtype else cache_dtype
+    if base not in _REGISTRY:
         raise ValueError(
             f"Unknown multiquant cache dtype: {cache_dtype}. "
             f"Available: {list(_REGISTRY.keys())}"
         )
-    config_mod, config_cls_name, _, _ = _REGISTRY[cache_dtype]
+    config_mod, config_cls_name, _, _ = _REGISTRY[base]
     import importlib
     mod = importlib.import_module(config_mod)
     config_cls = getattr(mod, config_cls_name)
@@ -88,8 +92,12 @@ def get_kv_quantizer(cache_dtype: str) -> "KVQuantizer":
 
 
 def is_multiquant_dtype(cache_dtype: str) -> bool:
-    """Check if a cache dtype is handled by MultiQuant."""
-    return cache_dtype in _REGISTRY
+    """Check if a cache dtype is handled by MultiQuant.
+
+    Supports parameterized strings like 'tq3w:bs64'.
+    """
+    base = cache_dtype.split(':')[0] if ':' in cache_dtype else cache_dtype
+    return base in _REGISTRY
 
 
 def get_registered_dtypes() -> list[str]:

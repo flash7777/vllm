@@ -145,6 +145,14 @@ def pack_wht(
                     val = val | (((idx[:, :, j] >> 2) & 1) << k)
             packed[:, :, qs_bytes + b] = val
         gamma_off = qs_bytes + qr_bytes
+    elif bits == 4:
+        # 4-bit: 2 indices per byte
+        for b in range(bs // 2):
+            packed[:, :, b] = (
+                (idx[:, :, b*2] & 0xF) |
+                ((idx[:, :, b*2+1] & 0xF) << 4)
+            )
+        gamma_off = bs // 2
     else:
         raise ValueError(f"WHT pack: unsupported bits={bits}")
 
@@ -208,6 +216,13 @@ def unpack_wht(
                 if j < bs:
                     idx[:, :, j] = idx[:, :, j] | (((byte_val >> k) & 1) << 2)
         gamma_off = qs_bytes + qr_bytes
+    elif bits == 4:
+        # 4-bit: 2 indices per byte
+        for b in range(bs // 2):
+            byte_val = blocks_packed[:, :, b].to(torch.int32)
+            idx[:, :, b*2]   = byte_val & 0xF
+            idx[:, :, b*2+1] = (byte_val >> 4) & 0xF
+        gamma_off = bs // 2
     else:
         raise ValueError(f"WHT unpack: unsupported bits={bits}")
 

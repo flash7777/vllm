@@ -43,6 +43,9 @@ class TurboQuantWHTConfig(KVQuantizerConfig):
         elif bits == 3:
             # 3-bit split: bs*2/8 (lower 2 bits) + bs/8 (upper 1 bit) + 2 gamma
             return bs * 2 // 8 + bs // 8 + 2
+        elif bits == 4:
+            # 4-bit: bs/2 bytes for indices + 2 bytes gamma
+            return bs // 2 + 2
         else:
             return math.ceil(bs * bits / 8) + 2
 

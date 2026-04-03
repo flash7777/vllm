@@ -57,11 +57,11 @@ class TQMetadata(AttentionMetadata):
 
 class MultiQuantAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "tq3", "tq4", "rq2", "rq3", "rq4",
+        "tq3", "tq4", "tq3w", "tq4w", "rq2", "rq3", "rq4",
     ]
 
     @staticmethod
@@ -145,6 +145,19 @@ class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
             num_prefill = num_tokens
             num_decode = 0
 
+        import os
+        if os.environ.get("MQ_DEBUG"):
+            if not hasattr(TQMetadataBuilder, '_build_cnt'):
+                TQMetadataBuilder._build_cnt = 0
+            TQMetadataBuilder._build_cnt += 1
+            if TQMetadataBuilder._build_cnt <= 5:
+                logger.info("[MQ_BUILD] #%d: tokens=%d reqs=%d "
+                            "max_q_len=%d → pf=%d dc=%d",
+                            TQMetadataBuilder._build_cnt,
+                            num_tokens, num_reqs,
+                            cam.max_query_len,
+                            num_prefill, num_decode)
+
         return TQMetadata(
             seq_lens=cam.seq_lens,
             block_table=cam.block_table_tensor,
@@ -216,44 +229,59 @@ class MultiQuantImpl:
         self._tq_config = get_kv_quantizer_config(kv_cache_dtype, real_head_dim)
         self._packed_size = self._tq_config.key_packed_size
         self._mse_bits = self._tq_config.mse_bits
-        self._mse_bytes = (real_head_dim * self._mse_bits + 7) // 8
-        self._qjl_bytes = (real_head_dim + 7) // 8
-
-        self._mask = (1 << self._mse_bits) - 1
-        self._correction = math.sqrt(math.pi / 2) / real_head_dim
         self._is_rq = kv_cache_dtype.startswith("rq")
+        self._is_wht = kv_cache_dtype.endswith("w")
+
+        if self._is_wht:
+            # WHT mode: no Pi/S matrices, no QJL correction
+            from vllm.multiquant.turboquant.wht_config import TurboQuantWHTConfig
+            assert isinstance(self._tq_config, TurboQuantWHTConfig)
+            self._wht_block_size = self._tq_config.block_size
+            self._mse_bytes = 0  # not used in WHT mode
+            self._qjl_bytes = 0
+            self._mask = 0
+            self._correction = 0.0
+        else:
+            self._mse_bytes = (real_head_dim * self._mse_bits + 7) // 8
+            self._qjl_bytes = (real_head_dim + 7) // 8
+            self._mask = (1 << self._mse_bits) - 1
+            self._correction = math.sqrt(math.pi / 2) / real_head_dim
 
         # Pre-allocate shift constants for _torch_pack (graph-safe bitpacking)
-        if self._mse_bits == 1:
-            self._shifts_mse = torch.arange(8, device="cuda")
-        elif self._mse_bits == 2:
-            self._shifts_mse = torch.tensor([0, 2, 4, 6], device="cuda")
-        else:
-            self._shifts_mse = None
-        self._shifts_sign = torch.arange(8, device="cuda")
+        if not self._is_wht:
+            if self._mse_bits == 1:
+                self._shifts_mse = torch.arange(8, device="cuda")
+            elif self._mse_bits == 2:
+                self._shifts_mse = torch.tensor([0, 2, 4, 6], device="cuda")
+            else:
+                self._shifts_mse = None
+            self._shifts_sign = torch.arange(8, device="cuda")
 
         # Pre-load decode kernel at init (not in forward — graph-safe)
-        from vllm.v1.attention.ops.triton_mq_fused_decode import (
-            mq_fused_decode_attention, _load_cuda_kernel,
-        )
-        cuda_kernel = _load_cuda_kernel()
-        self._decode_fn = mq_fused_decode_attention
-
-        # Pre-load RQ kernels at init (JIT compile before first forward)
-        if self._is_rq:
-            import vllm.multiquant.rotorquant.clifford  # noqa: F401
+        decode_mode = "WHT-Python"  # default for WHT
+        if not self._is_wht:
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                _load_rq_decode_kernel, _load_clifford_kernel,
+                mq_fused_decode_attention, _load_cuda_kernel,
             )
-            _load_rq_decode_kernel()
-            _load_clifford_kernel()
+            cuda_kernel = _load_cuda_kernel()
+            self._decode_fn = mq_fused_decode_attention
+            decode_mode = "CUDA" if cuda_kernel else "Triton"
+
+            # Pre-load RQ kernels at init (JIT compile before first forward)
+            if self._is_rq:
+                import vllm.multiquant.rotorquant.clifford  # noqa: F401
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_rq_decode_kernel, _load_clifford_kernel,
+                )
+                _load_rq_decode_kernel()
+                _load_clifford_kernel()
 
         logger.info(
             "MultiQuant attention: D=%d (from spec %d), %s KV, "
             "decode=%s, %s",
             self.head_size, head_size,
             self.kv_cache_dtype,
-            "CUDA" if cuda_kernel else "Triton",
+            decode_mode,
             "RQ Clifford" if self._is_rq else "TQ rotation",
         )
 
@@ -333,28 +361,73 @@ class MultiQuantImpl:
         if self.kv_sharing_target_layer_name is not None:
             return
 
-        # os imported at module level
-        if os.environ.get("MQ_DEBUG"):
-            logger.info("[MQ_KV] WRITE slots=%s key=%s val=%s",
-                        slot_mapping.tolist()[:4], key.shape, value.shape)
-
         D = self.head_size
         device = key.device
         block_size = kv_cache.shape[2]
 
         Pi, S, centroids = self._get_matrices(layer, device)
 
-        num_tokens, num_heads = key.shape[0], key.shape[1]
+        # vLLM may pass key/value as 2D [N, Hkv*D] or 3D [N, Hkv, D]
+        if key.dim() == 2:
+            num_tokens = key.shape[0]
+            num_heads = self.num_kv_heads
+            key = key.reshape(num_tokens, num_heads, D)
+            value = value.reshape(num_tokens, num_heads, D)
+        else:
+            num_tokens, num_heads = key.shape[0], key.shape[1]
 
-        # Pack K/V: graph-safe _torch_pack or Python fallback
+        # Trace KV write (first call only per layer)
+        # os imported at module level
+        _mq_dbg = os.environ.get("MQ_DEBUG")
+        if _mq_dbg:
+            _lid = getattr(layer, '_mq_layer_id', -1)
+            _kv_cnt = getattr(layer, '_mq_kv_write_cnt', 0)
+            layer._mq_kv_write_cnt = _kv_cnt + 1
+            if _kv_cnt < 3:
+                sm = slot_mapping
+                n_valid = (sm >= 0).sum().item()
+                n_zero = (sm == 0).sum().item()
+                # Check forward context for real slot_mapping
+                fc_info = "N/A"
+                try:
+                    from vllm.forward_context import get_forward_context
+                    fc = get_forward_context()
+                    if hasattr(fc, 'slot_mapping') and fc.slot_mapping:
+                        fc_sm = fc.slot_mapping
+                        if isinstance(fc_sm, dict):
+                            for k, v in list(fc_sm.items())[:1]:
+                                fc_info = (f"dict[{k}]: valid="
+                                           f"{int((v>=0).sum())} "
+                                           f"first4={v[:4].tolist()}")
+                except Exception as ex:
+                    fc_info = f"err:{ex}"
+                logger.info(
+                    "[MQ_KV] L%02d write#%d: key=%s slots=%d "
+                    "valid=%d zero=%d first8=%s "
+                    "fc=%s",
+                    _lid, _kv_cnt, list(key.shape), len(sm),
+                    n_valid, n_zero,
+                    sm[:8].tolist(), fc_info)
+
+        # Pack K/V
         k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
-        if torch.cuda.is_current_stream_capturing():
+        if self._is_wht:
+            from vllm.multiquant.turboquant.wht_quantizer import pack_wht
+            k_packed = pack_wht(k_flat.float(), self._tq_config)
+            v_packed = pack_wht(v_flat.float(), self._tq_config)
+        elif torch.cuda.is_current_stream_capturing():
             k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
             v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)
         else:
             k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)
             v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
+
+        if _mq_dbg and _kv_cnt < 3:
+            logger.info("[MQ_KV] L%02d packed: k=%s v=%s ps=%d",
+                        _lid, list(k_packed.shape), list(v_packed.shape),
+                        self._packed_size)
+
         k_packed = k_packed.reshape(num_tokens, num_heads, -1)
         v_packed = v_packed.reshape(num_tokens, num_heads, -1)
 
@@ -366,9 +439,24 @@ class MultiQuantImpl:
         kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed[valid]
         kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed[valid]
 
+        if _mq_dbg and _kv_cnt < 3:
+            # Verify: read back what we just wrote
+            if len(slots) > 0:
+                s0 = slots[0]
+                b0, o0 = s0 // block_size, s0 % block_size
+                written = kv_cache[b0, 0, o0, 0, :self._packed_size]
+                logger.info("[MQ_KV] L%02d verify slot=%d: written_k[0]=%s",
+                            _lid, s0.item(),
+                            written[:8].tolist())
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        """Dispatch to decode (graph-safe) or prefill (compiler-disabled)."""
+        """Dispatch to decode (graph-safe) or prefill (compiler-disabled).
+
+        forward_includes_kv_cache_update=True: KV cache write happens here
+        using attn_metadata.slot_mapping (correctly populated by vLLM scheduler),
+        not via unified_kv_cache_update (which gets empty slot_mapping during prefill).
+        """
         D = self.head_size
         N = query.shape[0]
 
@@ -394,6 +482,32 @@ class MultiQuantImpl:
                 return output.fill_(0).view(out_shape)
             return output.fill_(0)
 
+        # KV cache update: use attn_metadata.slot_mapping (from scheduler)
+        if (key is not None and value is not None
+                and self.kv_sharing_target_layer_name is None):
+            slot_mapping = attn_metadata.slot_mapping
+            num_actual = attn_metadata.num_prefill_tokens + \
+                         attn_metadata.num_decode_tokens
+            # Trace slot_mapping in forward (first few calls)
+            if os.environ.get("MQ_DEBUG"):
+                _lid = getattr(layer, '_mq_layer_id', -1)
+                _fwd_cnt = getattr(self, '_fwd_kv_cnt', 0)
+                self._fwd_kv_cnt = _fwd_cnt + 1
+                if _fwd_cnt < 50:
+                    sm = slot_mapping[:num_actual]
+                    _v = int((sm >= 0).sum())
+                    _u = int(sm[:_v].unique().numel()) if _v > 0 else 0
+                    logger.info(
+                        "[MQ_FWD_KV] L%02d #%d: actual=%d sm_u=%d "
+                        "first8=%s kv_ptr=%x",
+                        _lid, _fwd_cnt, num_actual,
+                        _u, sm[:8].tolist(),
+                        kv_cache.data_ptr())
+            k3d = key[:num_actual].reshape(-1, self.num_kv_heads, D)
+            v3d = value[:num_actual].reshape(-1, self.num_kv_heads, D)
+            self.do_kv_cache_update(
+                layer, k3d, v3d, kv_cache, slot_mapping[:num_actual])
+
         device = query.device
         Pi, S, centroids = self._get_matrices(layer, device)
         block_size = kv_cache.shape[2]
@@ -401,17 +515,29 @@ class MultiQuantImpl:
         num_prefill = attn_metadata.num_prefill_tokens
         num_decode = attn_metadata.num_decode_tokens
 
+        # Layer tracing (MQ_DEBUG=1): log norms per layer per step
         # os imported at module level
-        if os.environ.get("MQ_DEBUG"):
-            sl = attn_metadata.seq_lens[:max(1,num_decode)].tolist() if num_decode > 0 else []
-            cache_nz = kv_cache.any(dim=-1).sum().item()
-            logger.info("[MQ_FWD] pf=%d dc=%d sl=%s cache_nz=%d",
-                        num_prefill, num_decode, sl[:4], cache_nz)
+        _mq_dbg = os.environ.get("MQ_DEBUG")
+        if _mq_dbg:
+            # Identify layer by Pi data_ptr (unique per layer)
+            _lid = getattr(layer, '_mq_layer_id', None)
+            if _lid is None:
+                if not hasattr(MultiQuantImpl, '_mq_layer_counter'):
+                    MultiQuantImpl._mq_layer_counter = 0
+                _lid = MultiQuantImpl._mq_layer_counter
+                MultiQuantImpl._mq_layer_counter += 1
+                layer._mq_layer_id = _lid
+            if num_decode > 0:
+                sl = attn_metadata.seq_lens[:1].item()
+                qn = query[:num_decode].float().norm().item()
+                bt = attn_metadata.block_table[:1, :4].tolist()
+                logger.info("[MQ] L%02d sl=%d q=%.1f bt=%s pf=%d dc=%d",
+                            _lid, sl, qn, bt, num_prefill, num_decode)
 
         if num_prefill > 0:
             self._forward_prefill(
                 query, key, value, output, Pi, S, centroids,
-                num_decode, num_prefill, D, device,
+                num_decode, num_prefill, D, device, layer=layer,
             )
 
         if num_decode > 0:
@@ -419,6 +545,39 @@ class MultiQuantImpl:
                 query, output, kv_cache, Pi, S, centroids,
                 attn_metadata, num_decode, block_size, D, device,
             )
+            if _mq_dbg and _lid is not None:
+                on = output[:num_decode].float().norm().item()
+                bt = attn_metadata.block_table[:1, :4].tolist()
+                sl = attn_metadata.seq_lens[:1].item()
+                logger.info("[MQ] L%02d sl=%d out=%.1f bt=%s",
+                            _lid, sl, on, bt)
+                # On first decode, compare with stored prefill K/V
+                if not hasattr(layer, '_dbg_ref_done') and \
+                        hasattr(layer, '_dbg_pf_k'):
+                    layer._dbg_ref_done = True
+                    # BF16 reference: use stored prefill K/V
+                    pf_k = layer._dbg_pf_k  # [L, nkv, D]
+                    pf_v = layer._dbg_pf_v
+                    L = pf_k.shape[0]
+                    dq = query[:1].reshape(1, self.num_heads, D)
+                    # GQA expand
+                    kg = pf_k.unsqueeze(2).expand(
+                        -1,-1,self.num_kv_groups,-1
+                    ).reshape(L, self.num_heads, D).float()
+                    vg = pf_v.unsqueeze(2).expand(
+                        -1,-1,self.num_kv_groups,-1
+                    ).reshape(L, self.num_heads, D).float()
+                    sc = torch.einsum('bhd,thd->bht', dq.float(), kg) * self.scale
+                    wt = F.softmax(sc, dim=-1)
+                    ref_out = torch.einsum('bht,thd->bhd', wt, vg)
+                    ref_flat = ref_out.reshape(1, -1).to(output.dtype)
+                    cos = F.cosine_similarity(
+                        output[:1].float(), ref_flat.float(), dim=-1).item()
+                    logger.info(
+                        "[MQ_REF] L%02d DECODE vs BF16_REF: cos=%.4f "
+                        "out_norm=%.1f ref_norm=%.1f",
+                        _lid, cos, output[:1].float().norm().item(),
+                        ref_flat.float().norm().item())
 
         if output_3d:
             return output.view(out_shape)
@@ -426,12 +585,18 @@ class MultiQuantImpl:
 
     @torch.compiler.disable
     def _forward_prefill(self, query, key, value, output, Pi, S, centroids,
-                         num_decode, num_prefill, D, device):
+                         num_decode, num_prefill, D, device, layer=None):
         """Prefill: naive causal bmm. Not graph-captured."""
         L = num_prefill
         pq = query[num_decode:num_decode + L].reshape(L, self.num_heads, D)
         pk = key[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
         pv = value[num_decode:num_decode + L].reshape(L, self.num_kv_heads, D)
+
+        # Store prefill K/V for decode reference comparison
+        if layer is not None and os.environ.get("MQ_DEBUG") \
+                and not hasattr(layer, '_dbg_pf_k'):
+            layer._dbg_pf_k = pk.detach().clone()
+            layer._dbg_pf_v = pv.detach().clone()
 
         if self.num_kv_groups > 1:
             pk = pk.repeat_interleave(self.num_kv_groups, dim=1)
@@ -451,12 +616,22 @@ class MultiQuantImpl:
 
     def _forward_decode(self, query, output, kv_cache, Pi, S, centroids,
                         attn_metadata, num_decode, block_size, D, device):
-        """Decode: TQ → CUDA fused kernel, RQ → RQ CUDA kernel.
-
-        All tensor ops use pre-allocated buffers for CUDA Graph compatibility.
-        No .float(), .clone(), .int(), or torch.empty() during forward.
-        """
+        """Decode: WHT → Python fallback, TQ → CUDA kernel, RQ → RQ kernel."""
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
+
+        if self._is_wht:
+            # WHT mode: Python decode (CUDA kernel TODO)
+            if not hasattr(self, '_wht_fallback_logged'):
+                self._wht_fallback_logged = True
+                logger.warning("WHT decode: using Python fallback "
+                               "(CUDA kernel not yet implemented)")
+            decode_out = self._wht_decode_python(
+                dq, kv_cache, centroids, attn_metadata, num_decode,
+                block_size, D, device)
+            output[:num_decode] = decode_out.reshape(
+                num_decode, -1).to(output.dtype)
+            return
+
         if self._is_rq:
             # RQ: separate CUDA kernel with Clifford V decompression
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
@@ -519,6 +694,17 @@ class MultiQuantImpl:
                 )
         else:
             # TQ: CUDA fused kernel with full V decompression via Pi/S GEMV
+            if os.environ.get("MQ_DEBUG"):
+                _lid2 = getattr(layer, '_mq_layer_id', -1)
+                if not hasattr(layer, '_dc_trace_cnt'):
+                    layer._dc_trace_cnt = 0
+                layer._dc_trace_cnt += 1
+                if layer._dc_trace_cnt <= 2:
+                    bt = attn_metadata.block_table[:num_decode]
+                    sl = attn_metadata.seq_lens[:num_decode]
+                    logger.info(
+                        "[MQ_DC] L%02d bt=%s sl=%s",
+                        _lid2, bt[0, :4].tolist(), sl.tolist())
             decode_out = self._decode_fn(
                 q=dq, kv_cache=kv_cache, Pi=Pi, S=S,
                 centroids=centroids,
@@ -530,8 +716,7 @@ class MultiQuantImpl:
                 correction=self._correction,
                 is_rq=False,
             )
-            # copy_ handles float32→bfloat16 in-place (no allocation)
-            output[:num_decode].copy_(decode_out.reshape(num_decode, -1))
+            output[:num_decode] = decode_out.reshape(num_decode, -1).to(output.dtype)
 
     # --- Helpers ---
 
@@ -653,7 +838,67 @@ class MultiQuantImpl:
                     out_h = (weights.unsqueeze(-1) * v_recon).sum(0)
                     output[qi, h * D:(h + 1) * D] = out_h.to(output.dtype)
 
+    @torch.compiler.disable
+    def _wht_decode_python(self, dq, kv_cache, centroids, attn_metadata,
+                           num_decode, block_size, D, device):
+        """WHT decode: Python fallback (no CUDA kernel yet).
+
+        Reads packed WHT blocks from kv_cache, reconstructs K/V via
+        inverse WHT, computes attention scores and weighted V sum.
+        """
+        from vllm.multiquant.turboquant.wht_quantizer import unpack_wht
+
+        seq_lens = attn_metadata.seq_lens[:num_decode]
+        block_table = attn_metadata.block_table[:num_decode]
+        ps = self._packed_size
+
+        outputs = []
+        for qi in range(num_decode):
+            sl = seq_lens[qi].item()
+            if sl <= 0:
+                outputs.append(torch.zeros(self.num_heads, D,
+                                           device=device, dtype=torch.float32))
+                continue
+
+            # Gather K/V from cache via block_table
+            positions = torch.arange(sl, device=device)
+            bi = positions // block_size
+            bo = positions % block_size
+            phys_blocks = block_table[qi, bi.long()]
+            # [sl, num_kv_heads, packed_size]
+            k_packed = kv_cache[phys_blocks, 0, bo, :, :ps]
+            v_packed = kv_cache[phys_blocks, 1, bo, :, :ps]
+
+            # Unpack per head
+            q_h = dq[qi]  # [num_heads, D]
+            head_outputs = []
+            for h in range(self.num_kv_heads):
+                k_h = unpack_wht(k_packed[:, h, :], self._tq_config)  # [sl, D]
+                v_h = unpack_wht(v_packed[:, h, :], self._tq_config)  # [sl, D]
+
+                # GQA: expand to all q-heads in this group
+                kv_group_size = self.num_kv_groups
+                for g in range(kv_group_size):
+                    qh_idx = h * kv_group_size + g
+                    q_vec = q_h[qh_idx].float()  # [D]
+                    scores = (k_h.float() @ q_vec) * self.scale  # [sl]
+                    weights = F.softmax(scores, dim=0)  # [sl]
+                    out_h = (weights.unsqueeze(-1) * v_h.float()).sum(0)  # [D]
+                    head_outputs.append(out_h)
+
+            outputs.append(torch.stack(head_outputs))  # [num_heads, D]
+
+        return torch.stack(outputs)  # [num_decode, num_heads, D]
+
     def _get_matrices(self, layer, device):
+        if self._is_wht:
+            # WHT mode: no Pi/S, only centroids
+            if not hasattr(layer, '_tq_c_f32'):
+                from vllm.multiquant.shared.centroids import get_wht_centroids
+                c = get_wht_centroids(self._mse_bits).to(device)
+                layer._tq_c_f32 = c.float().contiguous()
+            # Return None for Pi/S — callers must check _is_wht
+            return None, None, layer._tq_c_f32
         if not hasattr(layer, '_tq_Pi_f32'):
             layer._tq_Pi_f32 = layer._tq_Pi.to(device).float().contiguous()
             layer._tq_S_f32 = layer._tq_S.to(device).float().contiguous()
