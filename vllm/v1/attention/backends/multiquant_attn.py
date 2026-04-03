@@ -632,8 +632,21 @@ class MultiQuantImpl:
                 block_size_wht=self._wht_block_size,
             )
             if cuda_out is not None:
-                output[:num_decode] = cuda_out.reshape(
-                    num_decode, -1).to(output.dtype)
+                # Debug: trace exactly what goes into output
+                reshaped = cuda_out.reshape(num_decode, -1)
+                converted = reshaped.to(output.dtype)
+                if not hasattr(self, '_cuda_out_cnt'):
+                    self._cuda_out_cnt = 0
+                self._cuda_out_cnt += 1
+                if self._cuda_out_cnt <= 50:
+                    logger.info(
+                        "[WHT_OUT] cuda_out=%s reshaped=%s converted=%s "
+                        "output=%s norm_f32=%.2f norm_cvt=%.2f",
+                        list(cuda_out.shape), list(reshaped.shape),
+                        list(converted.shape), list(output[:num_decode].shape),
+                        reshaped.float().norm().item(),
+                        converted.float().norm().item())
+                output[:num_decode] = converted
             else:
                 # Python fallback
                 decode_out = self._wht_decode_python(

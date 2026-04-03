@@ -583,7 +583,8 @@ def wht_fused_decode_attention(
     q_wht = buf["q_wht"]
     q_wht.copy_(q_wht_flat.reshape(B, Hq, D))
 
-    output = buf["output"]
+    # Fresh output tensor each call (no buffer reuse — debug)
+    output = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
 
     # KV cache strides
     s_block = kv_cache.stride(0)
@@ -591,9 +592,31 @@ def wht_fused_decode_attention(
     s_slot = kv_cache.stride(2)
     s_head = kv_cache.stride(3)
 
-    # Try CUDA kernel
+    # Debug: check if kv_cache has any data
+    if os.environ.get("MQ_DEBUG"):
+        if not hasattr(wht_fused_decode_attention, '_kv_dbg_cnt'):
+            wht_fused_decode_attention._kv_dbg_cnt = 0
+        wht_fused_decode_attention._kv_dbg_cnt += 1
+        if wht_fused_decode_attention._kv_dbg_cnt <= 50:
+            sl0 = seq_lens[0].item()
+            bt0 = block_table[0, :3].tolist()
+            # Read what the kernel would read at pos=0
+            phys_b = bt0[0]
+            k_bytes = kv_cache[phys_b, 0, 0, 0, :14]  # First WHT block of K
+            nz_bytes = int((k_bytes != 0).sum())
+            logger.info("[WHT_KV] #%d sl=%d bt=%s "
+                        "k_block0_bytes=[%s] nz=%d out_norm=%.2f",
+                        wht_fused_decode_attention._kv_dbg_cnt,
+                        sl0, bt0,
+                        ','.join(str(x) for x in k_bytes[:8].tolist()),
+                        nz_bytes, output.norm().item())
+
+    # Try CUDA kernel (MQ_WHT_CUDA=1 enables, default is Python fallback)
+    # CUDA kernel has a bug: outputs zeros for layers 3+ in live serve
+    # despite producing correct results in unit tests (cos=1.0).
+    # Suspected: silent CUDA error or shared memory overflow on SM121.
     cuda_ok = False
-    kernel = _load_wht_cuda_kernel()
+    kernel = _load_wht_cuda_kernel() if os.environ.get("MQ_WHT_CUDA") else None
     if kernel is not None:
         try:
             kernel.tq_wht_fused_decode_attention(
@@ -620,9 +643,25 @@ def wht_fused_decode_attention(
 
     if not cuda_ok:
         # Python fallback — correct but very slow
+        logger.warning("WHT decode: falling back to Python (SLOW)")
         return None  # signal caller to use Python fallback
 
-    return output
+    # Debug: log output norm on first few calls
+    if os.environ.get("MQ_DEBUG"):
+        if not hasattr(wht_fused_decode_attention, '_call_cnt'):
+            wht_fused_decode_attention._call_cnt = 0
+        wht_fused_decode_attention._call_cnt += 1
+        if wht_fused_decode_attention._call_cnt <= 3:
+            logger.info("[WHT_CUDA] out_norm=%.2f q_norm=%.2f sl=%s",
+                        output.float().norm().item(),
+                        q.float().norm().item(),
+                        seq_lens[:1].tolist())
+
+    # Allocate fresh output — pre-allocated buffer causes corruption
+    # when shared across 47 layers in the same forward pass.
+    fresh = torch.empty_like(output)
+    fresh.copy_(output)
+    return fresh
 
 
 def mq_fused_decode_attention(
