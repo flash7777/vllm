@@ -89,6 +89,43 @@ _PRECOMPUTED = {
 }
 
 
+# ── WHT Block-Compression Centroids ──────────────────────────
+# Lloyd-Max optimal centroids for N(0,1) distribution.
+# Used with Walsh-Hadamard Transform (WHT) block compression.
+# These are UNIVERSAL — same for all head_dim, all layers.
+# Reference: github.com/animehacker/llama-turboquant
+
+WHT_CENTROIDS = {
+    # bits: [centroids]
+    2: [-1.5104, -0.4528, 0.4528, 1.5104],
+    3: [-2.1573, -1.3336, -0.7434, -0.2428,
+         0.2428,  0.7434,  1.3336,  2.1573],
+}
+
+WHT_THRESHOLDS = {
+    # bits: [decision boundaries between centroids]
+    2: [-0.9816, 0.0, 0.9816],
+    3: [-1.7455, -1.0385, -0.4906, 0.0, 0.4906, 1.0385, 1.7455],
+}
+
+
+def get_wht_centroids(bits: int) -> torch.Tensor:
+    """Get WHT-mode centroids (N(0,1) Lloyd-Max, universal)."""
+    if bits not in WHT_CENTROIDS:
+        raise ValueError(f"No WHT centroids for {bits} bits. "
+                         f"Available: {list(WHT_CENTROIDS.keys())}")
+    return torch.tensor(WHT_CENTROIDS[bits], dtype=torch.float32)
+
+
+def get_wht_thresholds(bits: int) -> torch.Tensor:
+    """Get WHT-mode decision thresholds."""
+    if bits not in WHT_THRESHOLDS:
+        raise ValueError(f"No WHT thresholds for {bits} bits.")
+    return torch.tensor(WHT_THRESHOLDS[bits], dtype=torch.float32)
+
+
+# ── Original per-dimension centroids ─────────────────────────
+
 @lru_cache(maxsize=32)
 def get_centroids(d: int, bits: int) -> torch.Tensor:
     """Get precomputed Lloyd-Max centroids (cached)."""
