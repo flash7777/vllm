@@ -620,40 +620,39 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            # WHT mode: try CUDA kernel, fallback to Python
-            from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                wht_fused_decode_attention,
-            )
-            cuda_out = wht_fused_decode_attention(
-                q=dq, kv_cache=kv_cache,
-                block_table=attn_metadata.block_table[:num_decode],
-                seq_lens=attn_metadata.seq_lens[:num_decode],
-                scale=self.scale, mse_bits=self._mse_bits,
-                block_size_wht=self._wht_block_size,
-            )
-            if cuda_out is not None:
-                # Debug: trace exactly what goes into output
-                reshaped = cuda_out.reshape(num_decode, -1)
-                converted = reshaped.to(output.dtype)
-                if not hasattr(self, '_cuda_out_cnt'):
-                    self._cuda_out_cnt = 0
-                self._cuda_out_cnt += 1
-                if self._cuda_out_cnt <= 50:
-                    logger.info(
-                        "[WHT_OUT] cuda_out=%s reshaped=%s converted=%s "
-                        "output=%s norm_f32=%.2f norm_cvt=%.2f",
-                        list(cuda_out.shape), list(reshaped.shape),
-                        list(converted.shape), list(output[:num_decode].shape),
-                        reshaped.float().norm().item(),
-                        converted.float().norm().item())
-                output[:num_decode] = converted
-            else:
-                # Python fallback
-                decode_out = self._wht_decode_python(
-                    dq, kv_cache, centroids, attn_metadata, num_decode,
+            if torch.cuda.is_current_stream_capturing():
+                # Graph capture: pure PyTorch (graph-safe)
+                if not hasattr(self, '_wht_graph_logged'):
+                    self._wht_graph_logged = True
+                    logger.info("WHT decode: using PyTorch path "
+                                "(CUDA Graph capture)")
+                decode_out = self._wht_decode_torch(
+                    dq, kv_cache, attn_metadata, num_decode,
                     block_size, D, device)
-                output[:num_decode] = decode_out.reshape(
-                    num_decode, -1).to(output.dtype)
+            else:
+                # Eager: try JIT CUDA kernel, fallback to PyTorch
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    wht_fused_decode_attention,
+                )
+                cuda_out = wht_fused_decode_attention(
+                    q=dq, kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table[:num_decode],
+                    seq_lens=attn_metadata.seq_lens[:num_decode],
+                    scale=self.scale, mse_bits=self._mse_bits,
+                    block_size_wht=self._wht_block_size,
+                )
+                if cuda_out is not None:
+                    decode_out = cuda_out
+                else:
+                    if not hasattr(self, '_wht_torch_logged'):
+                        self._wht_torch_logged = True
+                        logger.warning("WHT decode: CUDA kernel unavailable, "
+                                       "using PyTorch fallback")
+                    decode_out = self._wht_decode_torch(
+                        dq, kv_cache, attn_metadata, num_decode,
+                        block_size, D, device)
+            output[:num_decode] = decode_out.reshape(
+                num_decode, -1).to(output.dtype)
             return
 
         if self._is_rq:
@@ -861,6 +860,64 @@ class MultiQuantImpl:
                     weights = F.softmax(scores, dim=-1)
                     out_h = (weights.unsqueeze(-1) * v_recon).sum(0)
                     output[qi, h * D:(h + 1) * D] = out_h.to(output.dtype)
+
+    def _wht_decode_torch(self, dq, kv_cache, attn_metadata,
+                          num_decode, block_size, D, device):
+        """Graph-safe WHT decode using pure PyTorch ops (no CUDA kernel).
+
+        Vectorized over all heads — no Python loops.
+        Safe for CUDA Graph capture.
+        """
+        from vllm.multiquant.turboquant.wht_quantizer import unpack_wht
+
+        seq_lens = attn_metadata.seq_lens[:num_decode]  # [B]
+        block_table = attn_metadata.block_table[:num_decode]  # [B, max_blocks]
+        ps = self._packed_size
+        Hkv = self.num_kv_heads
+        Hq = self.num_heads
+        max_sl = int(seq_lens.max().item())
+
+        # Gather K/V from cache: [B, max_sl, Hkv, ps]
+        positions = torch.arange(max_sl, device=device)  # [max_sl]
+        bi = positions // block_size  # [max_sl]
+        bo = positions % block_size   # [max_sl]
+
+        # For single-decode (B=1), vectorize over all positions
+        # block_table[0, bi] → physical blocks for each position
+        phys = block_table[0, bi.long()]  # [max_sl]
+        k_packed_all = kv_cache[phys, 0, bo, :, :ps]  # [max_sl, Hkv, ps]
+        v_packed_all = kv_cache[phys, 1, bo, :, :ps]  # [max_sl, Hkv, ps]
+
+        # Mask out positions beyond seq_len
+        sl = seq_lens[0]  # single batch item
+        # No mask needed — positions already capped at max_sl = seq_len
+
+        # Unpack all heads at once: reshape [max_sl * Hkv, ps] → unpack → reshape
+        k_flat = k_packed_all.reshape(max_sl * Hkv, ps)
+        v_flat = v_packed_all.reshape(max_sl * Hkv, ps)
+        k_recon = unpack_wht(k_flat, self._tq_config)  # [max_sl*Hkv, D]
+        v_recon = unpack_wht(v_flat, self._tq_config)  # [max_sl*Hkv, D]
+
+        k_recon = k_recon.reshape(max_sl, Hkv, D)  # [T, Hkv, D]
+        v_recon = v_recon.reshape(max_sl, Hkv, D)  # [T, Hkv, D]
+
+        # GQA expand: [T, Hkv, D] → [T, Hq, D]
+        if self.num_kv_groups > 1:
+            k_recon = k_recon.unsqueeze(2).expand(
+                -1, -1, self.num_kv_groups, -1).reshape(max_sl, Hq, D)
+            v_recon = v_recon.unsqueeze(2).expand(
+                -1, -1, self.num_kv_groups, -1).reshape(max_sl, Hq, D)
+
+        # Attention: Q[1, Hq, D] · K[T, Hq, D] → scores[Hq, T]
+        q = dq[0].float()  # [Hq, D]
+        k = k_recon.float()  # [T, Hq, D]
+        v = v_recon.float()  # [T, Hq, D]
+
+        scores = torch.einsum('hd,thd->ht', q, k) * self.scale  # [Hq, T]
+        weights = F.softmax(scores, dim=-1)  # [Hq, T]
+        out = torch.einsum('ht,thd->hd', weights, v)  # [Hq, D]
+
+        return out.unsqueeze(0)  # [1, Hq, D]
 
     @torch.compiler.disable
     def _wht_decode_python(self, dq, kv_cache, centroids, attn_metadata,
