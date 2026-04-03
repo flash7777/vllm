@@ -611,12 +611,9 @@ def wht_fused_decode_attention(
                         ','.join(str(x) for x in k_bytes[:8].tolist()),
                         nz_bytes, output.norm().item())
 
-    # Try CUDA kernel (MQ_WHT_CUDA=1 enables, default is Python fallback)
-    # CUDA kernel has a bug: outputs zeros for layers 3+ in live serve
-    # despite producing correct results in unit tests (cos=1.0).
-    # Suspected: silent CUDA error or shared memory overflow on SM121.
+    # Try CUDA kernel (MQ_WHT_PYTHON=1 forces Python fallback)
     cuda_ok = False
-    kernel = _load_wht_cuda_kernel() if os.environ.get("MQ_WHT_CUDA") else None
+    kernel = _load_wht_cuda_kernel() if not os.environ.get("MQ_WHT_PYTHON") else None
     if kernel is not None:
         try:
             kernel.tq_wht_fused_decode_attention(
@@ -628,6 +625,9 @@ def wht_fused_decode_attention(
                 D, mse_bits, scale,
                 s_block, s_kv, s_slot, s_head,
             )
+            # JIT kernels run async — must sync before returning output.
+            # Without this, vLLM reads zeros (kernel hasn't finished).
+            torch.cuda.synchronize()
             cuda_ok = True
         except Exception as e:
             logger.warning("WHT CUDA decode call failed: %s", e)
@@ -657,11 +657,7 @@ def wht_fused_decode_attention(
                         q.float().norm().item(),
                         seq_lens[:1].tolist())
 
-    # Allocate fresh output — pre-allocated buffer causes corruption
-    # when shared across 47 layers in the same forward pass.
-    fresh = torch.empty_like(output)
-    fresh.copy_(output)
-    return fresh
+    return output
 
 
 def mq_fused_decode_attention(
