@@ -620,16 +620,27 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            # WHT mode: Python decode (CUDA kernel TODO)
-            if not hasattr(self, '_wht_fallback_logged'):
-                self._wht_fallback_logged = True
-                logger.warning("WHT decode: using Python fallback "
-                               "(CUDA kernel not yet implemented)")
-            decode_out = self._wht_decode_python(
-                dq, kv_cache, centroids, attn_metadata, num_decode,
-                block_size, D, device)
-            output[:num_decode] = decode_out.reshape(
-                num_decode, -1).to(output.dtype)
+            # WHT mode: try CUDA kernel, fallback to Python
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                wht_fused_decode_attention,
+            )
+            cuda_out = wht_fused_decode_attention(
+                q=dq, kv_cache=kv_cache,
+                block_table=attn_metadata.block_table[:num_decode],
+                seq_lens=attn_metadata.seq_lens[:num_decode],
+                scale=self.scale, mse_bits=self._mse_bits,
+                block_size_wht=self._wht_block_size,
+            )
+            if cuda_out is not None:
+                output[:num_decode] = cuda_out.reshape(
+                    num_decode, -1).to(output.dtype)
+            else:
+                # Python fallback
+                decode_out = self._wht_decode_python(
+                    dq, kv_cache, centroids, attn_metadata, num_decode,
+                    block_size, D, device)
+                output[:num_decode] = decode_out.reshape(
+                    num_decode, -1).to(output.dtype)
             return
 
         if self._is_rq:

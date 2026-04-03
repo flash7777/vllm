@@ -500,6 +500,131 @@ def _load_cuda_kernel():
         return None
 
 
+# ============================================================
+# WHT Kernel loader + decode wrapper
+# ============================================================
+
+_wht_cuda_kernel = None
+_wht_cuda_kernel_tried = False
+_wht_decode_path_logged = False
+_wht_decode_buffers = {}
+
+
+def _load_wht_cuda_kernel():
+    """JIT compile the WHT fused decode kernel."""
+    global _wht_cuda_kernel, _wht_cuda_kernel_tried
+    if _wht_cuda_kernel_tried:
+        return _wht_cuda_kernel
+    _wht_cuda_kernel_tried = True
+
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "turboquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/tq_build"
+    src_file = os.path.join(src_dir, "tq_wht_decode.cu")
+    if not os.path.exists(src_file):
+        logger.warning("WHT fused decode: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _wht_cuda_kernel = load(
+            name="tq_wht_fused_decode",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        logger.info("WHT fused decode CUDA kernel compiled and loaded")
+        return _wht_cuda_kernel
+    except Exception as e:
+        logger.warning("WHT fused decode CUDA kernel FAILED: %s", e)
+        return None
+
+
+def wht_fused_decode_attention(
+    q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
+    kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
+    block_table: torch.Tensor, # [B, max_blocks] int32
+    seq_lens: torch.Tensor,    # [B] int32
+    scale: float,              # 1/sqrt(D)
+    mse_bits: int,
+    block_size_wht: int = 32,  # WHT block size
+) -> torch.Tensor:
+    """Fused WHT decode: pre-WHT query + CUDA kernel.
+
+    Falls back to Python if CUDA kernel unavailable.
+    """
+    B, Hq, D = q.shape
+    device = q.device
+
+    # Pre-allocated buffers
+    global _wht_decode_buffers
+    buf_key = (B, Hq, D, device)
+    if buf_key not in _wht_decode_buffers:
+        _wht_decode_buffers[buf_key] = {
+            "q_wht": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
+            "output": torch.empty(B, Hq, D, device=device, dtype=torch.float32),
+        }
+    buf = _wht_decode_buffers[buf_key]
+
+    # Pre-compute WHT of query
+    from vllm.multiquant.shared.wht import wht_forward
+    q_flat = q.reshape(B * Hq, D).float()
+    q_wht_flat = wht_forward(q_flat, block_size=block_size_wht)
+    q_wht = buf["q_wht"]
+    q_wht.copy_(q_wht_flat.reshape(B, Hq, D))
+
+    output = buf["output"]
+
+    # KV cache strides
+    s_block = kv_cache.stride(0)
+    s_kv = kv_cache.stride(1)
+    s_slot = kv_cache.stride(2)
+    s_head = kv_cache.stride(3)
+
+    # Try CUDA kernel
+    cuda_ok = False
+    kernel = _load_wht_cuda_kernel()
+    if kernel is not None:
+        try:
+            kernel.tq_wht_fused_decode_attention(
+                q_wht,
+                kv_cache,
+                block_table.int(),
+                seq_lens.int(),
+                output,
+                D, mse_bits, scale,
+                s_block, s_kv, s_slot, s_head,
+            )
+            cuda_ok = True
+        except Exception as e:
+            logger.warning("WHT CUDA decode call failed: %s", e)
+
+    global _wht_decode_path_logged
+    if not _wht_decode_path_logged:
+        if cuda_ok:
+            logger.info("WHT decode: using CUDA fused kernel")
+        else:
+            logger.warning("WHT decode: CUDA kernel unavailable, "
+                           "using Python fallback (SLOW)")
+        _wht_decode_path_logged = True
+
+    if not cuda_ok:
+        # Python fallback — correct but very slow
+        return None  # signal caller to use Python fallback
+
+    return output
+
+
 def mq_fused_decode_attention(
     q: torch.Tensor,           # [B, Hq, D] bfloat16/float16
     kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, Hkv, packed_size] uint8
