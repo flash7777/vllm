@@ -419,22 +419,19 @@ class MultiQuantImpl:
             )
             pack_kernel = _load_wht_pack_kernel()
             if pack_kernel is not None:
-                # Zero-alloc: pre-allocated buffers + bf16 input (no .float())
+                # Max-buffer: allocate once for max batch, slice for current
                 N_vecs = k_flat.shape[0]
                 ps = self._packed_size
-                _pk = (N_vecs, ps, device)
-                if not hasattr(self, '_pack_bufs') or \
-                        self._pack_bufs.get('key') != _pk:
-                    self._pack_bufs = {
-                        'key': _pk,
-                        'k': torch.empty(N_vecs, ps, dtype=torch.uint8,
-                                         device=device),
-                        'v': torch.empty(N_vecs, ps, dtype=torch.uint8,
-                                         device=device),
-                    }
-                k_packed = self._pack_bufs['k']
-                v_packed = self._pack_bufs['v']
-                pack_kernel.tq_wht_pack(k_flat, k_packed)  # bf16 direct
+                if not hasattr(self, '_pack_k_buf') or \
+                        self._pack_k_buf.shape[0] < N_vecs:
+                    max_n = max(N_vecs, 256 * self.num_kv_heads)
+                    self._pack_k_buf = torch.empty(
+                        max_n, ps, dtype=torch.uint8, device=device)
+                    self._pack_v_buf = torch.empty(
+                        max_n, ps, dtype=torch.uint8, device=device)
+                k_packed = self._pack_k_buf[:N_vecs]  # View, zero alloc
+                v_packed = self._pack_v_buf[:N_vecs]
+                pack_kernel.tq_wht_pack(k_flat, k_packed)
                 pack_kernel.tq_wht_pack(v_flat, v_packed)
             else:
                 if not hasattr(self, '_wht_pack_fallback_logged'):
@@ -662,10 +659,13 @@ class MultiQuantImpl:
                                         kv_cache.stride(2), kv_cache.stride(3))
                 out_3d = output[:num_decode].reshape(
                     num_decode, self.num_heads, D)
+                # bt is int32 (no-op .int()). sl may be int32 or int64.
+                bt = attn_metadata.block_table[:num_decode]
+                sl = attn_metadata.seq_lens[:num_decode]
+                if sl.dtype != torch.int32:
+                    sl = sl.int()  # only allocs if int64
                 kernel.tq_wht_fused_decode_attention(
-                    dq, kv_cache,
-                    attn_metadata.block_table[:num_decode].int(),
-                    attn_metadata.seq_lens[:num_decode].int(),
+                    dq, kv_cache, bt, sl,
                     out_3d, D, self._mse_bits, self.scale,
                     s_b, s_kv, s_s, s_h)
             else:
