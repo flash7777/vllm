@@ -16,6 +16,7 @@
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
+#include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream()
 
 namespace turboquant {
 
@@ -305,8 +306,13 @@ void tq_wht_fused_decode_attention(
     int threads = ((head_dim + 31) / 32) * 32;
     dim3 block(threads);
 
+    // Launch on current PyTorch stream (critical for CUDA Graph capture).
+    // Without this, kernel runs on default stream 0 and graph replay
+    // produces corrupt output because the kernel was never recorded.
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
     #define LAUNCH_WHT(HD, MB) \
-        tq_wht_fused_decode_kernel<HD, MB><<<grid, block>>>( \
+        tq_wht_fused_decode_kernel<HD, MB><<<grid, block, 0, stream>>>( \
             q_wht.data_ptr<float>(), \
             kv_cache.data_ptr<uint8_t>(), \
             block_table.data_ptr<int>(), seq_lens.data_ptr<int>(), \

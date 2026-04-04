@@ -485,13 +485,9 @@ class MultiQuantImpl:
             return output.fill_(0)
 
         # KV cache update: use attn_metadata.slot_mapping (from scheduler)
-        # Skip during CUDA Graph capture — pack_wht temporaries blow up
-        # the graph pool (~104 MB per call × 47 layers × 35 graphs = OOM).
-        # The warmup run before capture writes the KV data;
-        # during capture only the decode path runs.
+        # pack_wht uses ~0.4 MB per call at B=1 (graph-safe with GPU caches)
         if (key is not None and value is not None
-                and self.kv_sharing_target_layer_name is None
-                and not torch.cuda.is_current_stream_capturing()):
+                and self.kv_sharing_target_layer_name is None):
             slot_mapping = attn_metadata.slot_mapping
             num_actual = attn_metadata.num_prefill_tokens + \
                          attn_metadata.num_decode_tokens
@@ -664,17 +660,12 @@ class MultiQuantImpl:
                 buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
                                         kv_cache.stride(2), kv_cache.stride(3))
-                # Sync before AND after kernel in eager mode.
-                # The pack_wht in do_kv_cache_update may still be writing
-                # to kv_cache async when the kernel tries to read it.
-                if not torch.cuda.is_current_stream_capturing():
-                    torch.cuda.synchronize()
+                # Kernel uses at::cuda::getCurrentCUDAStream() — runs on
+                # same stream as PyTorch ops. No sync needed in eager or graph.
                 kernel.tq_wht_fused_decode_attention(
                     buf['q_wht'], kv_cache, buf['bt'], buf['sl'],
                     buf['out'], D, self._mse_bits, self.scale,
                     s_b, s_kv, s_s, s_h)
-                if not torch.cuda.is_current_stream_capturing():
-                    torch.cuda.synchronize()
                 output[:num_decode] = buf['out'].reshape(
                     num_decode, -1).to(output.dtype)
             else:
