@@ -650,9 +650,9 @@ class MultiQuantImpl:
                                              device=device, dtype=torch.float32),
                         'out': torch.empty(num_decode, self.num_heads, D,
                                            device=device, dtype=torch.float32),
-                        'bt': torch.empty(num_decode, bt_slice.shape[1],
+                        'bt': torch.zeros(num_decode, bt_slice.shape[1],
                                           device=device, dtype=torch.int32),
-                        'sl': torch.empty(num_decode,
+                        'sl': torch.zeros(num_decode,
                                           device=device, dtype=torch.int32),
                     }
                 buf = self._wht_bufs
@@ -664,6 +664,11 @@ class MultiQuantImpl:
                 buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
                                         kv_cache.stride(2), kv_cache.stride(3))
+                # Sync before AND after kernel in eager mode.
+                # The pack_wht in do_kv_cache_update may still be writing
+                # to kv_cache async when the kernel tries to read it.
+                if not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
                 kernel.tq_wht_fused_decode_attention(
                     buf['q_wht'], kv_cache, buf['bt'], buf['sl'],
                     buf['out'], D, self._mse_bits, self.scale,

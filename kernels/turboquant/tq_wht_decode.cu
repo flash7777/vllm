@@ -127,10 +127,17 @@ __global__ void tq_wht_fused_decode_kernel(
     const int lane = tid % WARP_SIZE;
     const int wht_block = warp_id;  // each warp handles one WHT block
 
+    int q_base = (q_token * num_q_heads + q_head) * D;
     int seq_len = seq_lens[q_token];
+    // Clamp: avoid block_table OOB and negative/garbage seq_lens
+    if (seq_len <= 0) {
+        if (tid < D) output[q_base + tid] = 0.0f;
+        return;
+    }
+    int max_seq = max_blocks_per_seq * block_size_kv;
+    if (seq_len > max_seq) seq_len = max_seq;
 
     // Load pre-computed q_wht for this thread's position
-    int q_base = (q_token * num_q_heads + q_head) * D;
     float my_q_wht = (tid < D) ? q_wht[q_base + tid] : 0.0f;
 
     // Centroids pointer
@@ -144,7 +151,9 @@ __global__ void tq_wht_fused_decode_kernel(
     for (int pos = 0; pos < seq_len; pos++) {
         int bi = pos / block_size_kv;
         int bo = pos % block_size_kv;
+        if (bi >= max_blocks_per_seq) break;
         int phys_block = block_table[q_token * max_blocks_per_seq + bi];
+        if (phys_block < 0) continue;  // skip invalid blocks
 
         // ── K Score: dot(q_wht, k_wht) in WHT space ──────────────
         // Each warp unpacks one WHT block of K and computes partial dot product
@@ -261,9 +270,9 @@ __global__ void tq_wht_fused_decode_kernel(
         __syncthreads();
     }
 
-    // Normalize and store
-    if (tid < D && d_prev > 0.0f) {
-        output[q_base + tid] = v_acc / d_prev;
+    // Normalize and store (always write — 0.0 for empty sequences)
+    if (tid < D) {
+        output[q_base + tid] = (d_prev > 0.0f) ? (v_acc / d_prev) : 0.0f;
     }
 }
 
