@@ -419,29 +419,23 @@ class MultiQuantImpl:
             )
             pack_kernel = _load_wht_pack_kernel()
             if pack_kernel is not None:
+                # Zero-alloc: pre-allocated buffers + bf16 input (no .float())
                 N_vecs = k_flat.shape[0]
                 ps = self._packed_size
-                k_packed = torch.empty(N_vecs, ps, dtype=torch.uint8,
-                                       device=device)
-                v_packed = torch.empty(N_vecs, ps, dtype=torch.uint8,
-                                       device=device)
-                _perf = os.environ.get("MQ_PERF")
-                if _perf:
-                    _ps = torch.cuda.Event(enable_timing=True)
-                    _pe = torch.cuda.Event(enable_timing=True)
-                    _ps.record()
-                pack_kernel.tq_wht_pack(k_flat.float(), k_packed)
-                pack_kernel.tq_wht_pack(v_flat.float(), v_packed)
-                if _perf:
-                    _pe.record()
-                    torch.cuda.synchronize()
-                    _lid = getattr(layer, '_mq_layer_id', -1)
-                    if not hasattr(self, '_perf_pack_cnt'):
-                        self._perf_pack_cnt = 0
-                    self._perf_pack_cnt += 1
-                    if self._perf_pack_cnt <= 50:
-                        logger.info("[WHT_PERF] L%02d pack: %.0fµs (N=%d)",
-                                    _lid, _ps.elapsed_time(_pe) * 1000, N_vecs)
+                _pk = (N_vecs, ps, device)
+                if not hasattr(self, '_pack_bufs') or \
+                        self._pack_bufs.get('key') != _pk:
+                    self._pack_bufs = {
+                        'key': _pk,
+                        'k': torch.empty(N_vecs, ps, dtype=torch.uint8,
+                                         device=device),
+                        'v': torch.empty(N_vecs, ps, dtype=torch.uint8,
+                                         device=device),
+                    }
+                k_packed = self._pack_bufs['k']
+                v_packed = self._pack_bufs['v']
+                pack_kernel.tq_wht_pack(k_flat, k_packed)  # bf16 direct
+                pack_kernel.tq_wht_pack(v_flat, v_packed)
             else:
                 if not hasattr(self, '_wht_pack_fallback_logged'):
                     self._wht_pack_fallback_logged = True

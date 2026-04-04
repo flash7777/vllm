@@ -12,6 +12,7 @@
 
 #include <torch/extension.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
 
 namespace turboquant {
@@ -70,7 +71,7 @@ __device__ __forceinline__ int threshold_quantize_3bit(float x) {
 // packed_size = (D/32) * 14 bytes
 template <int HEAD_DIM, int BLOCK_SIZE = 32>
 __global__ void tq_wht_pack_kernel(
-    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ input,
     uint8_t* __restrict__ output,
     int N,
     int packed_size
@@ -83,8 +84,8 @@ __global__ void tq_wht_pack_kernel(
 
     if (vec_idx >= N) return;
 
-    // 1. Load input
-    float val = input[vec_idx * HEAD_DIM + wht_block * BLOCK_SIZE + lane];
+    // 1. Load bfloat16 input → float
+    float val = __bfloat162float(input[vec_idx * HEAD_DIM + wht_block * BLOCK_SIZE + lane]);
 
     // 2. WHT forward
     val = warp_wht_forward(val, lane);
@@ -140,12 +141,12 @@ __global__ void tq_wht_pack_kernel(
 
 // C++ wrapper
 void tq_wht_pack(
-    torch::Tensor input,    // [N, D] float32
+    torch::Tensor input,    // [N, D] bfloat16 — zero-copy from vLLM
     torch::Tensor output    // [N, packed_size] uint8 (pre-allocated)
 ) {
     TORCH_CHECK(input.dim() == 2, "input must be 2D");
     TORCH_CHECK(output.dim() == 2, "output must be 2D");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(input.dtype() == torch::kBFloat16, "input must be bfloat16");
     TORCH_CHECK(output.dtype() == torch::kUInt8, "output must be uint8");
 
     int N = input.size(0);
@@ -156,22 +157,17 @@ void tq_wht_pack(
     dim3 block(32);  // one warp
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Template dispatch on HEAD_DIM
-    if (D == 256) {
-        tq_wht_pack_kernel<256><<<grid, block, 0, stream>>>(
-            input.data_ptr<float>(), output.data_ptr<uint8_t>(), N, packed_size);
-    } else if (D == 128) {
-        tq_wht_pack_kernel<128><<<grid, block, 0, stream>>>(
-            input.data_ptr<float>(), output.data_ptr<uint8_t>(), N, packed_size);
-    } else if (D == 64) {
-        tq_wht_pack_kernel<64><<<grid, block, 0, stream>>>(
-            input.data_ptr<float>(), output.data_ptr<uint8_t>(), N, packed_size);
-    } else if (D == 512) {
-        tq_wht_pack_kernel<512><<<grid, block, 0, stream>>>(
-            input.data_ptr<float>(), output.data_ptr<uint8_t>(), N, packed_size);
-    } else {
-        TORCH_CHECK(false, "tq_wht_pack: unsupported D=", D);
-    }
+    #define PACK_LAUNCH(HD) \
+        tq_wht_pack_kernel<HD><<<grid, block, 0, stream>>>( \
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()), \
+            output.data_ptr<uint8_t>(), N, packed_size)
+
+    if (D == 256) { PACK_LAUNCH(256); }
+    else if (D == 128) { PACK_LAUNCH(128); }
+    else if (D == 64) { PACK_LAUNCH(64); }
+    else if (D == 512) { PACK_LAUNCH(512); }
+    else { TORCH_CHECK(false, "tq_wht_pack: unsupported D=", D); }
+    #undef PACK_LAUNCH
 }
 
 }  // namespace turboquant
