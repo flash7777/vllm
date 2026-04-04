@@ -413,11 +413,28 @@ class MultiQuantImpl:
         k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
         if self._is_wht:
-            from vllm.multiquant.turboquant.wht_quantizer import pack_wht
-            # pack_wht uses Python loops over fixed constants — graph-safe
-            # (no .item(), no data-dependent shapes)
-            k_packed = pack_wht(k_flat.float(), self._tq_config)
-            v_packed = pack_wht(v_flat.float(), self._tq_config)
+            # Try fused CUDA pack kernel (1 launch, graph-safe)
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                _load_wht_pack_kernel,
+            )
+            pack_kernel = _load_wht_pack_kernel()
+            if pack_kernel is not None:
+                N_vecs = k_flat.shape[0]
+                ps = self._packed_size
+                k_packed = torch.empty(N_vecs, ps, dtype=torch.uint8,
+                                       device=device)
+                v_packed = torch.empty(N_vecs, ps, dtype=torch.uint8,
+                                       device=device)
+                pack_kernel.tq_wht_pack(k_flat.float(), k_packed)
+                pack_kernel.tq_wht_pack(v_flat.float(), v_packed)
+            else:
+                if not hasattr(self, '_wht_pack_fallback_logged'):
+                    self._wht_pack_fallback_logged = True
+                    logger.warning("WHT pack: CUDA kernel unavailable, "
+                                   "using Python fallback (SLOW)")
+                from vllm.multiquant.turboquant.wht_quantizer import pack_wht
+                k_packed = pack_wht(k_flat.float(), self._tq_config)
+                v_packed = pack_wht(v_flat.float(), self._tq_config)
         elif torch.cuda.is_current_stream_capturing():
             k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
             v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)

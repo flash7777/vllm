@@ -501,7 +501,55 @@ def _load_cuda_kernel():
 
 
 # ============================================================
-# WHT Kernel loader + decode wrapper
+# WHT Pack Kernel (fused: WHT → amax → quantize → bitpack)
+# ============================================================
+
+_wht_pack_kernel = None
+_wht_pack_kernel_tried = False
+
+
+def _load_wht_pack_kernel():
+    """JIT compile the fused WHT pack kernel."""
+    global _wht_pack_kernel, _wht_pack_kernel_tried
+    if _wht_pack_kernel_tried:
+        return _wht_pack_kernel
+    _wht_pack_kernel_tried = True
+
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "turboquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/tq_build"
+    src_file = os.path.join(src_dir, "tq_wht_pack.cu")
+    if not os.path.exists(src_file):
+        logger.warning("WHT fused pack: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _wht_pack_kernel = load(
+            name="tq_wht_fused_pack",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        logger.info("WHT fused pack CUDA kernel compiled and loaded")
+        return _wht_pack_kernel
+    except Exception as e:
+        logger.warning("WHT fused pack CUDA kernel FAILED: %s", e)
+        return None
+
+
+# ============================================================
+# WHT Decode Kernel loader + decode wrapper
 # ============================================================
 
 _wht_cuda_kernel = None
