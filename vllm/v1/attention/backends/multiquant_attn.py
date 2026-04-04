@@ -635,7 +635,13 @@ class MultiQuantImpl:
             if kernel is not None:
                 # Graph-safe: pre-allocated buffers, direct kernel call
                 # NO .zero_() on output (JIT kernel async — zero overwrites result in graph)
-                _bk = (num_decode, self.num_heads, D, device)
+                # Pre-allocated buffers — sized for max batch
+                # Reuse if shape matches, otherwise re-alloc
+                # (re-alloc only happens in eager warmup, never in graph)
+                bt_slice = attn_metadata.block_table[:num_decode]
+                sl_slice = attn_metadata.seq_lens[:num_decode]
+                _bk = (num_decode, self.num_heads, D,
+                       bt_slice.shape[1], device)
                 if not hasattr(self, '_wht_bufs') or \
                         self._wht_bufs.get('key') != _bk:
                     self._wht_bufs = {
@@ -644,12 +650,10 @@ class MultiQuantImpl:
                                              device=device, dtype=torch.float32),
                         'out': torch.empty(num_decode, self.num_heads, D,
                                            device=device, dtype=torch.float32),
-                        'bt': torch.empty_like(
-                            attn_metadata.block_table[:num_decode],
-                            dtype=torch.int32),
-                        'sl': torch.empty_like(
-                            attn_metadata.seq_lens[:num_decode],
-                            dtype=torch.int32),
+                        'bt': torch.empty(num_decode, bt_slice.shape[1],
+                                          device=device, dtype=torch.int32),
+                        'sl': torch.empty(num_decode,
+                                          device=device, dtype=torch.int32),
                     }
                 buf = self._wht_bufs
                 buf['q_wht'].copy_(wht_forward(
