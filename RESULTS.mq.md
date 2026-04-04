@@ -12,6 +12,7 @@ Model: `unsloth/GLM-4.7-Flash-FP8-Dynamic` (FP8) / `GLM-4.7-Flash-int4-AutoRound
 |----------|------|-------------|-------|-------|------------|-------|
 | fp8      | 8    | 576         | 45.6/51.0/51.7 | 0%* | — | Baseline, TRITON_MLA |
 | tq3      | 3    | ~220        | 30.9/50.2/49.9 | 0%* | — | MLA+MQ, 30064 MiB |
+| tq3w     | 3.5  | 112         | 35.3 (avg)     | 100 | — | WHT v2, CUDA Graph, fused kernels |
 | tq4      | 4    | ~292        |       |       |            | TurboQuant |
 | rq2      | 2    | ~148        |       |       |            | RotorQuant |
 | rq3      | 3    | ~220        |       |       |            | RotorQuant |
@@ -61,9 +62,39 @@ Flags: `--compilation-config '{"cudagraph_mode":"none"}' -e TORCH_CUDNN_V8_API_D
 | 256 | rq3  | 100 B  | 2.6×   | 5.1×    |
 | 256 | rq4  | 132 B  | 1.9×   | 3.9×    |
 
+## WHT TurboQuant v2 (tq3w, CUDA Graphs, GLM-4.7-Flash, D=256)
+
+Offline-Benchmark (kein HTTP/Scheduler-Overhead), 5 Runs avg:
+
+| KV-Dtype | tok/s (avg) | Math | Mozart | KV vs FP8 | Notes |
+|----------|------------|------|--------|-----------|-------|
+| fp8      | 43.2       | 788✓ | ✓      | 1.0×      | FlashInfer decode, CUDA Graph |
+| tq3w     | 35.3       | 788✓ | ✓      | 2.3× less | WHT block-32, fused CUDA pack+decode |
+
+tq3w = **82% of FP8 speed** mit **2.3× weniger KV-Cache Speicher**.
+
+### Kernel-Level Profiling (CUDA Event Timing, B=1, D=256, 40 Layers)
+
+| Kernel | Time/call | Time/token (40L) | Share |
+|--------|-----------|-------------------|-------|
+| WHT Pack (K+V) | 2.3 us | 0.19 ms | 0.7% |
+| WHT Fused Decode (sl=50) | 58.2 us | 2.33 ms | 8.2% |
+| **Total Attention** | — | **2.52 ms** | **8.9%** |
+| Other (MoE, norms, LM head) | — | ~25.8 ms | 91.1% |
+
+Decode kernel scales linear: 10.3 us pro seq-Position pro Layer.
+
+Gap-Analyse: Die 18% Differenz (5.4 ms/token) kommt NICHT von den
+Attention-Kernels (nur 2.5 ms total), sondern vom Graph-Overhead:
+tq3w Graphs sind ~4.6 GiB (FP8 ~2 GiB) wegen mehr Kernel-Launches
+pro Layer (2× pack + decode + scatter vs 1× FlashInfer + reshape_and_cache).
+
+Features: fused WHT pack kernel (1 launch), in-kernel WHT decode, bf16 zero-copy,
+CUDA Graph compatible, warp-shuffle WHT (5 butterfly stages).
+
 ## Bisherige TQ-Ergebnisse (Q4, GLM-4.7-Flash, D=128)
 
-Referenz aus früheren Benchmarks:
+Referenz aus früheren Benchmarks (eager, serve-mode):
 
 | KV-Dtype | tok/s (short/med/long) | Math% | KV B/Block |
 |----------|----------------------|-------|------------|
