@@ -425,8 +425,23 @@ class MultiQuantImpl:
                                        device=device)
                 v_packed = torch.empty(N_vecs, ps, dtype=torch.uint8,
                                        device=device)
+                _perf = os.environ.get("MQ_PERF")
+                if _perf:
+                    _ps = torch.cuda.Event(enable_timing=True)
+                    _pe = torch.cuda.Event(enable_timing=True)
+                    _ps.record()
                 pack_kernel.tq_wht_pack(k_flat.float(), k_packed)
                 pack_kernel.tq_wht_pack(v_flat.float(), v_packed)
+                if _perf:
+                    _pe.record()
+                    torch.cuda.synchronize()
+                    _lid = getattr(layer, '_mq_layer_id', -1)
+                    if not hasattr(self, '_perf_pack_cnt'):
+                        self._perf_pack_cnt = 0
+                    self._perf_pack_cnt += 1
+                    if self._perf_pack_cnt <= 50:
+                        logger.info("[WHT_PERF] L%02d pack: %.0fµs (N=%d)",
+                                    _lid, _ps.elapsed_time(_pe) * 1000, N_vecs)
             else:
                 if not hasattr(self, '_wht_pack_fallback_logged'):
                     self._wht_pack_fallback_logged = True
@@ -670,12 +685,26 @@ class MultiQuantImpl:
                 buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
                                         kv_cache.stride(2), kv_cache.stride(3))
-                # Kernel uses at::cuda::getCurrentCUDAStream() — runs on
-                # same stream as PyTorch ops. No sync needed in eager or graph.
+                _perf = os.environ.get("MQ_PERF")
+                if _perf:
+                    _ds = torch.cuda.Event(enable_timing=True)
+                    _de = torch.cuda.Event(enable_timing=True)
+                    _ds.record()
                 kernel.tq_wht_fused_decode_attention(
                     buf['q_raw'], kv_cache, buf['bt'], buf['sl'],
                     buf['out'], D, self._mse_bits, self.scale,
                     s_b, s_kv, s_s, s_h)
+                if _perf:
+                    _de.record()
+                    torch.cuda.synchronize()
+                    _lid = getattr(layer, '_mq_layer_id', -1)
+                    if not hasattr(self, '_perf_dec_cnt'):
+                        self._perf_dec_cnt = 0
+                    self._perf_dec_cnt += 1
+                    if self._perf_dec_cnt <= 200:
+                        sl_val = attn_metadata.seq_lens[0].item() if not torch.cuda.is_current_stream_capturing() else -1
+                        logger.info("[WHT_PERF] L%02d decode: %.0fµs (sl=%d)",
+                                    _lid, _ds.elapsed_time(_de) * 1000, sl_val)
                 output[:num_decode] = buf['out'].reshape(
                     num_decode, -1).to(output.dtype)
             else:
