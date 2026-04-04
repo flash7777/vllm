@@ -138,8 +138,12 @@ __global__ void tq_wht_fused_decode_kernel(
     int max_seq = max_blocks_per_seq * block_size_kv;
     if (seq_len > max_seq) seq_len = max_seq;
 
-    // Load pre-computed q_wht for this thread's position
+    // Load raw query and apply WHT in-kernel (saves Python wht_forward calls)
     float my_q_wht = (tid < D) ? q_wht[q_base + tid] : 0.0f;
+    // WHT forward on query: each warp transforms its 32-element block
+    if (tid < D) {
+        my_q_wht = warp_wht_forward(my_q_wht, lane);
+    }
 
     // Centroids pointer
     const float* centroids = (MSE_BITS == 3) ? WHT_CENTROIDS_3BIT : WHT_CENTROIDS_4BIT;
@@ -281,7 +285,7 @@ __global__ void tq_wht_fused_decode_kernel(
 // ── C++ wrapper ───────────────────────────────────────────────
 
 void tq_wht_fused_decode_attention(
-    torch::Tensor q_wht,        // [num_q, num_q_heads, D] float32 (pre-WHT'd query)
+    torch::Tensor q_wht,        // [num_q, num_q_heads, D] float32 (raw query — WHT applied in-kernel)
     torch::Tensor kv_cache,      // [num_blocks, 2, block_size, num_kv_heads, packed_size] uint8
     torch::Tensor block_table,   // [num_seqs, max_blocks_per_seq] int32
     torch::Tensor seq_lens,      // [num_seqs] int32

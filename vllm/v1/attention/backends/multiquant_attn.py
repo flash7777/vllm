@@ -643,23 +643,18 @@ class MultiQuantImpl:
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
                 _load_wht_cuda_kernel,
             )
-            from vllm.multiquant.shared.wht import wht_forward
             kernel = _load_wht_cuda_kernel()
             if kernel is not None:
-                # Graph-safe: pre-allocated buffers, direct kernel call
-                # NO .zero_() on output (JIT kernel async — zero overwrites result in graph)
-                # Pre-allocated buffers — sized for max batch
-                # Reuse if shape matches, otherwise re-alloc
-                # (re-alloc only happens in eager warmup, never in graph)
+                # Graph-safe: pre-allocated buffers, direct kernel call.
+                # Kernel does WHT on query internally (no Python wht_forward).
                 bt_slice = attn_metadata.block_table[:num_decode]
-                sl_slice = attn_metadata.seq_lens[:num_decode]
                 _bk = (num_decode, self.num_heads, D,
                        bt_slice.shape[1], device)
                 if not hasattr(self, '_wht_bufs') or \
                         self._wht_bufs.get('key') != _bk:
                     self._wht_bufs = {
                         'key': _bk,
-                        'q_wht': torch.empty(num_decode, self.num_heads, D,
+                        'q_raw': torch.empty(num_decode, self.num_heads, D,
                                              device=device, dtype=torch.float32),
                         'out': torch.empty(num_decode, self.num_heads, D,
                                            device=device, dtype=torch.float32),
@@ -669,10 +664,8 @@ class MultiQuantImpl:
                                           device=device, dtype=torch.int32),
                     }
                 buf = self._wht_bufs
-                buf['q_wht'].copy_(wht_forward(
-                    dq.reshape(num_decode * self.num_heads, D).float(),
-                    block_size=self._wht_block_size
-                ).reshape(num_decode, self.num_heads, D))
+                # Pass raw query — kernel applies WHT internally
+                buf['q_raw'].copy_(dq.float())
                 buf['bt'].copy_(attn_metadata.block_table[:num_decode])
                 buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
@@ -680,7 +673,7 @@ class MultiQuantImpl:
                 # Kernel uses at::cuda::getCurrentCUDAStream() — runs on
                 # same stream as PyTorch ops. No sync needed in eager or graph.
                 kernel.tq_wht_fused_decode_attention(
-                    buf['q_wht'], kv_cache, buf['bt'], buf['sl'],
+                    buf['q_raw'], kv_cache, buf['bt'], buf['sl'],
                     buf['out'], D, self._mse_bits, self.scale,
                     s_b, s_kv, s_s, s_h)
                 output[:num_decode] = buf['out'].reshape(
