@@ -414,6 +414,8 @@ class MultiQuantImpl:
         v_flat = value.reshape(-1, D)
         if self._is_wht:
             from vllm.multiquant.turboquant.wht_quantizer import pack_wht
+            # pack_wht uses Python loops over fixed constants — graph-safe
+            # (no .item(), no data-dependent shapes)
             k_packed = pack_wht(k_flat.float(), self._tq_config)
             v_packed = pack_wht(v_flat.float(), self._tq_config)
         elif torch.cuda.is_current_stream_capturing():
@@ -431,13 +433,13 @@ class MultiQuantImpl:
         k_packed = k_packed.reshape(num_tokens, num_heads, -1)
         v_packed = v_packed.reshape(num_tokens, num_heads, -1)
 
-        # Write to cache via slot_mapping
-        valid = slot_mapping >= 0
-        slots = slot_mapping[valid]
-        bi = slots // block_size
-        bo = slots % block_size
-        kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed[valid]
-        kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed[valid]
+        # Write to cache via slot_mapping (graph-safe: no boolean indexing)
+        # Clamp -1 slots to 0 (writes to block 0, offset 0 — harmless padding)
+        slots_clamped = slot_mapping.clamp(min=0)
+        bi = slots_clamped // block_size
+        bo = slots_clamped % block_size
+        kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed
+        kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed
 
         if _mq_dbg and _kv_cnt < 3:
             # Verify: read back what we just wrote
@@ -620,12 +622,13 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            if torch.cuda.is_current_stream_capturing():
+            _capturing = torch.cuda.is_current_stream_capturing()
+            if _capturing:
                 # Graph capture: pure PyTorch (graph-safe)
                 if not hasattr(self, '_wht_graph_logged'):
                     self._wht_graph_logged = True
-                    logger.info("WHT decode: using PyTorch path "
-                                "(CUDA Graph capture)")
+                    logger.info("WHT decode: GRAPH CAPTURE detected, "
+                                "using PyTorch path")
                 decode_out = self._wht_decode_torch(
                     dq, kv_cache, attn_metadata, num_decode,
                     block_size, D, device)
@@ -863,61 +866,72 @@ class MultiQuantImpl:
 
     def _wht_decode_torch(self, dq, kv_cache, attn_metadata,
                           num_decode, block_size, D, device):
-        """Graph-safe WHT decode using pure PyTorch ops (no CUDA kernel).
+        """Graph-safe WHT decode using pure PyTorch ops.
 
-        Vectorized over all heads — no Python loops.
-        Safe for CUDA Graph capture.
+        Supports batch decode (num_decode >= 1) for CUDA Graph capture.
+        No .item(), no data-dependent shapes, no Python loops.
         """
         from vllm.multiquant.turboquant.wht_quantizer import unpack_wht
 
-        seq_lens = attn_metadata.seq_lens[:num_decode]  # [B]
-        block_table = attn_metadata.block_table[:num_decode]  # [B, max_blocks]
+        B = num_decode
+        seq_lens = attn_metadata.seq_lens[:B]  # [B]
+        block_table = attn_metadata.block_table[:B]  # [B, max_blocks]
         ps = self._packed_size
         Hkv = self.num_kv_heads
         Hq = self.num_heads
-        max_sl = int(seq_lens.max().item())
 
-        # Gather K/V from cache: [B, max_sl, Hkv, ps]
-        positions = torch.arange(max_sl, device=device)  # [max_sl]
+        # Use max_seq_len from metadata (set by scheduler, fixed per capture)
+        max_sl = attn_metadata.max_seq_len
+        if max_sl <= 0:
+            max_sl = 1
+        if not hasattr(self, '_wht_maxsl_logged'):
+            self._wht_maxsl_logged = True
+            logger.info("WHT decode torch: max_sl=%d B=%d", max_sl, B)
+
+        # Positions [max_sl]
+        positions = torch.arange(max_sl, device=device)
         bi = positions // block_size  # [max_sl]
-        bo = positions % block_size   # [max_sl]
+        bo = positions % block_size
 
-        # For single-decode (B=1), vectorize over all positions
-        # block_table[0, bi] → physical blocks for each position
-        phys = block_table[0, bi.long()]  # [max_sl]
-        k_packed_all = kv_cache[phys, 0, bo, :, :ps]  # [max_sl, Hkv, ps]
-        v_packed_all = kv_cache[phys, 1, bo, :, :ps]  # [max_sl, Hkv, ps]
+        # For batch: gather per-batch-item
+        # block_table: [B, max_blocks] → phys_blocks: [B, max_sl]
+        phys = block_table[:, bi.long()]  # [B, max_sl]
 
-        # Mask out positions beyond seq_len
-        sl = seq_lens[0]  # single batch item
-        # No mask needed — positions already capped at max_sl = seq_len
+        # Gather K/V: [B, max_sl, Hkv, ps]
+        bo_exp = bo.unsqueeze(0).expand(B, -1)  # [B, max_sl]
+        k_packed = kv_cache[phys, 0, bo_exp, :, :ps]  # [B, max_sl, Hkv, ps]
+        v_packed = kv_cache[phys, 1, bo_exp, :, :ps]
 
-        # Unpack all heads at once: reshape [max_sl * Hkv, ps] → unpack → reshape
-        k_flat = k_packed_all.reshape(max_sl * Hkv, ps)
-        v_flat = v_packed_all.reshape(max_sl * Hkv, ps)
-        k_recon = unpack_wht(k_flat, self._tq_config)  # [max_sl*Hkv, D]
-        v_recon = unpack_wht(v_flat, self._tq_config)  # [max_sl*Hkv, D]
+        # Unpack: [B*max_sl*Hkv, ps] → [B*max_sl*Hkv, D]
+        k_flat = k_packed.reshape(B * max_sl * Hkv, ps)
+        v_flat = v_packed.reshape(B * max_sl * Hkv, ps)
+        k_recon = unpack_wht(k_flat, self._tq_config).reshape(B, max_sl, Hkv, D)
+        v_recon = unpack_wht(v_flat, self._tq_config).reshape(B, max_sl, Hkv, D)
 
-        k_recon = k_recon.reshape(max_sl, Hkv, D)  # [T, Hkv, D]
-        v_recon = v_recon.reshape(max_sl, Hkv, D)  # [T, Hkv, D]
-
-        # GQA expand: [T, Hkv, D] → [T, Hq, D]
+        # GQA expand: [B, T, Hkv, D] → [B, T, Hq, D]
         if self.num_kv_groups > 1:
-            k_recon = k_recon.unsqueeze(2).expand(
-                -1, -1, self.num_kv_groups, -1).reshape(max_sl, Hq, D)
-            v_recon = v_recon.unsqueeze(2).expand(
-                -1, -1, self.num_kv_groups, -1).reshape(max_sl, Hq, D)
+            k_recon = k_recon.unsqueeze(3).expand(
+                -1, -1, -1, self.num_kv_groups, -1).reshape(B, max_sl, Hq, D)
+            v_recon = v_recon.unsqueeze(3).expand(
+                -1, -1, -1, self.num_kv_groups, -1).reshape(B, max_sl, Hq, D)
 
-        # Attention: Q[1, Hq, D] · K[T, Hq, D] → scores[Hq, T]
-        q = dq[0].float()  # [Hq, D]
-        k = k_recon.float()  # [T, Hq, D]
-        v = v_recon.float()  # [T, Hq, D]
+        # Attention: Q[B, Hq, D] · K[B, T, Hq, D] → scores[B, Hq, T]
+        q = dq.float()  # [B, Hq, D]
+        k = k_recon.float()  # [B, T, Hq, D]
+        v = v_recon.float()
 
-        scores = torch.einsum('hd,thd->ht', q, k) * self.scale  # [Hq, T]
-        weights = F.softmax(scores, dim=-1)  # [Hq, T]
-        out = torch.einsum('ht,thd->hd', weights, v)  # [Hq, D]
+        scores = torch.einsum('bhd,bthd->bht', q, k) * self.scale  # [B, Hq, T]
 
-        return out.unsqueeze(0)  # [1, Hq, D]
+        # Mask: positions beyond seq_len get -inf (handles padding + seq_len=0)
+        mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)  # [B, max_sl]
+        scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+
+        weights = F.softmax(scores, dim=-1)  # [B, Hq, T]
+        # NaN guard: seq_len=0 → softmax(all -inf) → NaN → replace with 0
+        weights = weights.nan_to_num(0.0)
+        out = torch.einsum('bht,bthd->bhd', weights, v)  # [B, Hq, D]
+
+        return out  # [B, Hq, D]
 
     @torch.compiler.disable
     def _wht_decode_python(self, dq, kv_cache, centroids, attn_metadata,

@@ -98,68 +98,65 @@ def pack_wht(
     blocks = rotated.reshape(N, n_blocks, bs)  # [N, n_blocks, bs]
 
     # Step 2: Per-block amax normalization
+    # Cache centroids/thresholds on GPU (host→device transfer is NOT graph-safe)
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)  # [N, n_blocks, 1]
-    centroids = get_wht_centroids(bits).to(x.device)
-    outermost = centroids[-1].item()  # e.g., 2.1573 for 3-bit
-    gamma = (amax / outermost).squeeze(-1)  # [N, n_blocks] — scale factor
-    normalized = blocks / (gamma.unsqueeze(-1) + 1e-10)  # [N, n_blocks, bs]
-
-    # Step 3: Quantize to nearest centroid via thresholds (faster than argmin)
-    thresholds = get_wht_thresholds(bits).to(x.device)
+    _cache_key = (bits, x.device)
+    if not hasattr(pack_wht, '_gpu_cache'):
+        pack_wht._gpu_cache = {}
+    if _cache_key not in pack_wht._gpu_cache:
+        c = get_wht_centroids(bits).to(x.device)
+        t = get_wht_thresholds(bits).to(x.device)
+        pack_wht._gpu_cache[_cache_key] = (c, t)
+    centroids, thresholds = pack_wht._gpu_cache[_cache_key]
+    outermost = centroids[-1]  # tensor, no .item()
+    gamma = (amax / outermost).squeeze(-1)  # [N, n_blocks]
+    normalized = blocks / (gamma.unsqueeze(-1) + 1e-10)
     # idx[i] = number of thresholds that normalized[i] exceeds
     idx = (normalized.unsqueeze(-1) > thresholds).sum(dim=-1).to(torch.uint8)
     # [N, n_blocks, bs] uint8 indices
 
-    # Step 4: Bitpack per block
+    # Step 4: Bitpack per block — VECTORIZED (no Python loops, graph-safe)
     bpb = config.bytes_per_block
-    packed = torch.zeros(N, n_blocks, bpb, dtype=torch.uint8, device=x.device)
+    idx_int = idx.to(torch.int32)  # [N, n_blocks, bs]
 
-    if bits == 2:
-        # 2-bit: 4 indices per byte
-        for b in range(bs // 4):
-            packed[:, :, b] = (
-                (idx[:, :, b*4] & 0x3) |
-                ((idx[:, :, b*4+1] & 0x3) << 2) |
-                ((idx[:, :, b*4+2] & 0x3) << 4) |
-                ((idx[:, :, b*4+3] & 0x3) << 6)
-            )
-        gamma_off = bs // 4
-    elif bits == 3:
-        # 3-bit split: lower 2 bits in qs, upper 1 bit in qr
-        qs_bytes = bs * 2 // 8  # e.g., 8 for bs=32
-        qr_bytes = bs // 8      # e.g., 4 for bs=32
-        # Pack lower 2 bits (4 per byte)
-        for b in range(qs_bytes):
-            packed[:, :, b] = (
-                (idx[:, :, b*4] & 0x3) |
-                ((idx[:, :, b*4+1] & 0x3) << 2) |
-                ((idx[:, :, b*4+2] & 0x3) << 4) |
-                ((idx[:, :, b*4+3] & 0x3) << 6)
-            )
-        # Pack upper 1 bit (8 per byte)
-        for b in range(qr_bytes):
-            val = torch.zeros_like(packed[:, :, 0])
-            for k in range(8):
-                j = b * 8 + k
-                if j < bs:
-                    val = val | (((idx[:, :, j] >> 2) & 1) << k)
-            packed[:, :, qs_bytes + b] = val
-        gamma_off = qs_bytes + qr_bytes
+    # Cache constant shift tensors on GPU (graph-safe: no host→device during capture)
+    if not hasattr(pack_wht, '_shift_cache'):
+        pack_wht._shift_cache = {}
+    _sk = x.device
+    if _sk not in pack_wht._shift_cache:
+        pack_wht._shift_cache[_sk] = {
+            'qs': torch.tensor([0, 2, 4, 6], device=_sk, dtype=torch.int32),
+            'qr': torch.arange(8, device=_sk, dtype=torch.int32),
+            '4b': torch.tensor([0, 4], device=_sk, dtype=torch.int32),
+        }
+    _shifts = pack_wht._shift_cache[_sk]
+
+    if bits == 3:
+        qs_bytes = bs * 2 // 8
+        qr_bytes = bs // 8
+        low2 = (idx_int & 0x3).reshape(N, n_blocks, qs_bytes, 4)
+        qs = (low2 << _shifts['qs']).sum(dim=-1).to(torch.uint8)
+        hi1 = ((idx_int >> 2) & 1).reshape(N, n_blocks, qr_bytes, 8)
+        qr = (hi1 << _shifts['qr']).sum(dim=-1).to(torch.uint8)
+        # Gamma as fp16
+        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
+        # Concat: [qs | qr | gamma]
+        packed = torch.cat([qs, qr, gamma_bytes], dim=-1)  # [N, n_blocks, bpb]
     elif bits == 4:
-        # 4-bit: 2 indices per byte
-        for b in range(bs // 2):
-            packed[:, :, b] = (
-                (idx[:, :, b*2] & 0xF) |
-                ((idx[:, :, b*2+1] & 0xF) << 4)
-            )
-        gamma_off = bs // 2
+        n_bytes = bs // 2
+        idx_pairs = idx_int.reshape(N, n_blocks, n_bytes, 2)
+        packed_bytes = (idx_pairs[..., 0] & 0xF) | ((idx_pairs[..., 1] & 0xF) << 4)
+        packed_bytes = packed_bytes.to(torch.uint8)
+        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
+        packed = torch.cat([packed_bytes, gamma_bytes], dim=-1)
+    elif bits == 2:
+        n_bytes = bs // 4
+        idx_quads = idx_int.reshape(N, n_blocks, n_bytes, 4)
+        packed_bytes = ((idx_quads & 0x3) << _shifts['qs']).sum(dim=-1).to(torch.uint8)
+        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
+        packed = torch.cat([packed_bytes, gamma_bytes], dim=-1)
     else:
         raise ValueError(f"WHT pack: unsupported bits={bits}")
-
-    # Store gamma as fp16 (2 bytes)
-    gamma_fp16 = gamma.to(torch.float16)  # [N, n_blocks]
-    gamma_bytes = gamma_fp16.view(torch.uint8).reshape(N, n_blocks, 2)
-    packed[:, :, gamma_off:gamma_off+2] = gamma_bytes
 
     return packed.reshape(N, -1)  # [N, packed_size]
 
@@ -185,52 +182,52 @@ def unpack_wht(
 
     blocks_packed = packed.reshape(N, n_blocks, bpb)
 
-    centroids = get_wht_centroids(bits).to(packed.device)
+    # Cache centroids on GPU (host→device NOT graph-safe)
+    _ukey = (bits, packed.device)
+    if not hasattr(unpack_wht, '_gpu_cache'):
+        unpack_wht._gpu_cache = {}
+    if _ukey not in unpack_wht._gpu_cache:
+        unpack_wht._gpu_cache[_ukey] = get_wht_centroids(bits).to(packed.device)
+    centroids = unpack_wht._gpu_cache[_ukey]
 
-    # Unpack indices
-    idx = torch.zeros(N, n_blocks, bs, dtype=torch.long, device=packed.device)
+    # Unpack indices — VECTORIZED (graph-safe: cached shift tensors)
+    if not hasattr(unpack_wht, '_shift_cache'):
+        unpack_wht._shift_cache = {}
+    _sk = packed.device
+    if _sk not in unpack_wht._shift_cache:
+        unpack_wht._shift_cache[_sk] = {
+            'qs': torch.tensor([0, 2, 4, 6], device=_sk, dtype=torch.int32),
+            'qr': torch.arange(8, device=_sk, dtype=torch.int32),
+            '4b': torch.tensor([0, 4], device=_sk, dtype=torch.int32),
+        }
+    _sh = unpack_wht._shift_cache[_sk]
 
-    if bits == 2:
-        for b in range(bs // 4):
-            byte_val = blocks_packed[:, :, b].to(torch.int32)
-            idx[:, :, b*4]   = byte_val & 0x3
-            idx[:, :, b*4+1] = (byte_val >> 2) & 0x3
-            idx[:, :, b*4+2] = (byte_val >> 4) & 0x3
-            idx[:, :, b*4+3] = (byte_val >> 6) & 0x3
-        gamma_off = bs // 4
-    elif bits == 3:
+    if bits == 3:
         qs_bytes = bs * 2 // 8
         qr_bytes = bs // 8
-        # Lower 2 bits
-        for b in range(qs_bytes):
-            byte_val = blocks_packed[:, :, b].to(torch.int32)
-            idx[:, :, b*4]   = byte_val & 0x3
-            idx[:, :, b*4+1] = (byte_val >> 2) & 0x3
-            idx[:, :, b*4+2] = (byte_val >> 4) & 0x3
-            idx[:, :, b*4+3] = (byte_val >> 6) & 0x3
-        # Upper 1 bit
-        for b in range(qr_bytes):
-            byte_val = blocks_packed[:, :, qs_bytes + b].to(torch.int32)
-            for k in range(8):
-                j = b * 8 + k
-                if j < bs:
-                    idx[:, :, j] = idx[:, :, j] | (((byte_val >> k) & 1) << 2)
+        qs_raw = blocks_packed[:, :, :qs_bytes].to(torch.int32)
+        low2 = ((qs_raw.unsqueeze(-1) >> _sh['qs']) & 0x3).reshape(N, n_blocks, bs)
+        qr_raw = blocks_packed[:, :, qs_bytes:qs_bytes+qr_bytes].to(torch.int32)
+        hi1 = ((qr_raw.unsqueeze(-1) >> _sh['qr']) & 1).reshape(N, n_blocks, bs)
+        idx = (low2 | (hi1 << 2)).to(torch.long)
         gamma_off = qs_bytes + qr_bytes
     elif bits == 4:
-        # 4-bit: 2 indices per byte
-        for b in range(bs // 2):
-            byte_val = blocks_packed[:, :, b].to(torch.int32)
-            idx[:, :, b*2]   = byte_val & 0xF
-            idx[:, :, b*2+1] = (byte_val >> 4) & 0xF
-        gamma_off = bs // 2
+        n_bytes = bs // 2
+        raw = blocks_packed[:, :, :n_bytes].to(torch.int32)
+        idx = ((raw.unsqueeze(-1) >> _sh['4b']) & 0xF).reshape(N, n_blocks, bs).to(torch.long)
+        gamma_off = n_bytes
+    elif bits == 2:
+        n_bytes = bs // 4
+        raw = blocks_packed[:, :, :n_bytes].to(torch.int32)
+        idx = ((raw.unsqueeze(-1) >> _sh['qs']) & 0x3).reshape(N, n_blocks, bs).to(torch.long)
+        gamma_off = n_bytes
     else:
         raise ValueError(f"WHT unpack: unsupported bits={bits}")
 
-    # Unpack gamma (fp16)
-    gamma_bytes = blocks_packed[:, :, gamma_off:gamma_off+2].contiguous()
-    gamma = gamma_bytes.view(torch.uint8).reshape(N, n_blocks, 2)
-    gamma = gamma.view(torch.uint8).reshape(N * n_blocks, 2)
-    gamma_fp16 = gamma.view(torch.float16).reshape(N, n_blocks).float()
+    # Unpack gamma (fp16) — vectorized
+    gamma_raw = blocks_packed[:, :, gamma_off:gamma_off+2].contiguous()
+    gamma_fp16 = gamma_raw.view(torch.uint8).reshape(N * n_blocks, 2).view(
+        torch.float16).reshape(N, n_blocks).float()
 
     # Reconstruct: centroid lookup + scale + inverse WHT
     values_wht = centroids[idx] * gamma_fp16.unsqueeze(-1)  # [N, n_blocks, bs]
