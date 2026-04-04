@@ -15,6 +15,7 @@
 
 #include <torch/extension.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <math_constants.h>
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream()
 
@@ -89,18 +90,20 @@ __constant__ float WHT_CENTROIDS_4BIT[16] = {
 };
 
 // Main WHT decode kernel
-// Template: HEAD_DIM, MSE_BITS (3 or 4), BLOCK_SIZE (32)
+// Accepts bfloat16 query and output — zero-copy from vLLM tensors.
+// Accepts int64 block_table and seq_lens — no Python .int() needed.
+// WHT applied to query in-kernel.
 template <int HEAD_DIM, int MSE_BITS, int BLOCK_SIZE = 32>
 __global__ void tq_wht_fused_decode_kernel(
-    // Pre-computed query in WHT space [num_q, num_q_heads, D]
-    const float* __restrict__ q_wht,
+    // Raw query [num_q, num_q_heads, D] — bfloat16, WHT applied in-kernel
+    const __nv_bfloat16* __restrict__ q_wht,
     // Compressed KV cache: (num_blocks, 2, block_size_kv, num_kv_heads, packed_size)
     const uint8_t* __restrict__ kv_cache,
     // Block table
-    const int* __restrict__ block_table,   // [num_seqs, max_blocks_per_seq]
-    const int* __restrict__ seq_lens,      // [num_seqs]
-    // Output: fully reconstructed attention output [num_q, num_q_heads, D]
-    float* __restrict__ output,
+    const int* __restrict__ block_table,   // [num_seqs, max_blocks_per_seq] int32
+    const int* __restrict__ seq_lens,      // [num_seqs] int32
+    // Output: [num_q, num_q_heads, D] bfloat16 — writes directly to vLLM output
+    __nv_bfloat16* __restrict__ output,
     // Dims
     int num_q_heads,
     int num_kv_heads,
@@ -130,16 +133,15 @@ __global__ void tq_wht_fused_decode_kernel(
 
     int q_base = (q_token * num_q_heads + q_head) * D;
     int seq_len = seq_lens[q_token];
-    // Clamp: avoid block_table OOB and negative/garbage seq_lens
     if (seq_len <= 0) {
-        if (tid < D) output[q_base + tid] = 0.0f;
+        if (tid < D) output[q_base + tid] = __float2bfloat16(0.0f);
         return;
     }
     int max_seq = max_blocks_per_seq * block_size_kv;
     if (seq_len > max_seq) seq_len = max_seq;
 
-    // Load raw query and apply WHT in-kernel (saves Python wht_forward calls)
-    float my_q_wht = (tid < D) ? q_wht[q_base + tid] : 0.0f;
+    // Load bfloat16 query → float, then apply WHT in-kernel
+    float my_q_wht = (tid < D) ? __bfloat162float(q_wht[q_base + tid]) : 0.0f;
     // WHT forward on query: each warp transforms its 32-element block
     if (tid < D) {
         my_q_wht = warp_wht_forward(my_q_wht, lane);
@@ -275,9 +277,10 @@ __global__ void tq_wht_fused_decode_kernel(
         __syncthreads();
     }
 
-    // Normalize and store (always write — 0.0 for empty sequences)
+    // Normalize and store as bfloat16 (zero-copy to vLLM output)
     if (tid < D) {
-        output[q_base + tid] = (d_prev > 0.0f) ? (v_acc / d_prev) : 0.0f;
+        float result = (d_prev > 0.0f) ? (v_acc / d_prev) : 0.0f;
+        output[q_base + tid] = __float2bfloat16(result);
     }
 }
 
@@ -285,11 +288,11 @@ __global__ void tq_wht_fused_decode_kernel(
 // ── C++ wrapper ───────────────────────────────────────────────
 
 void tq_wht_fused_decode_attention(
-    torch::Tensor q_wht,        // [num_q, num_q_heads, D] float32 (raw query — WHT applied in-kernel)
+    torch::Tensor q_wht,        // [num_q, num_q_heads, D] bfloat16 (raw query, WHT in-kernel)
     torch::Tensor kv_cache,      // [num_blocks, 2, block_size, num_kv_heads, packed_size] uint8
     torch::Tensor block_table,   // [num_seqs, max_blocks_per_seq] int32
     torch::Tensor seq_lens,      // [num_seqs] int32
-    torch::Tensor output,        // [num_q, num_q_heads, D] float32
+    torch::Tensor output,        // [num_q, num_q_heads, D] bfloat16 (direct output)
     int head_dim,
     int mse_bits,
     float attn_scale,
@@ -317,10 +320,10 @@ void tq_wht_fused_decode_attention(
 
     #define LAUNCH_WHT(HD, MB) \
         tq_wht_fused_decode_kernel<HD, MB><<<grid, block, 0, stream>>>( \
-            q_wht.data_ptr<float>(), \
+            reinterpret_cast<const __nv_bfloat16*>(q_wht.data_ptr()), \
             kv_cache.data_ptr<uint8_t>(), \
             block_table.data_ptr<int>(), seq_lens.data_ptr<int>(), \
-            output.data_ptr<float>(), \
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), \
             num_q_heads, num_kv_heads, block_size_kv, packed_size, \
             max_blocks, attn_scale, \
             stride_block, stride_kv, stride_slot, stride_head);

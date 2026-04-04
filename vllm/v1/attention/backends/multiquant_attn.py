@@ -660,53 +660,20 @@ class MultiQuantImpl:
             )
             kernel = _load_wht_cuda_kernel()
             if kernel is not None:
-                # Graph-safe: pre-allocated buffers, direct kernel call.
-                # Kernel does WHT on query internally (no Python wht_forward).
-                bt_slice = attn_metadata.block_table[:num_decode]
-                _bk = (num_decode, self.num_heads, D,
-                       bt_slice.shape[1], device)
-                if not hasattr(self, '_wht_bufs') or \
-                        self._wht_bufs.get('key') != _bk:
-                    self._wht_bufs = {
-                        'key': _bk,
-                        'q_raw': torch.empty(num_decode, self.num_heads, D,
-                                             device=device, dtype=torch.float32),
-                        'out': torch.empty(num_decode, self.num_heads, D,
-                                           device=device, dtype=torch.float32),
-                        'bt': torch.zeros(num_decode, bt_slice.shape[1],
-                                          device=device, dtype=torch.int32),
-                        'sl': torch.zeros(num_decode,
-                                          device=device, dtype=torch.int32),
-                    }
-                buf = self._wht_bufs
-                # Pass raw query — kernel applies WHT internally
-                buf['q_raw'].copy_(dq.float())
-                buf['bt'].copy_(attn_metadata.block_table[:num_decode])
-                buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
+                # Zero-copy: kernel reads bf16 query, int64 bt/sl directly.
+                # Kernel writes bf16 output directly to vLLM output tensor.
+                # WHT applied to query in-kernel. No Python copy_() needed.
+                # 1 CUDA op per layer (just the kernel launch).
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
                                         kv_cache.stride(2), kv_cache.stride(3))
-                _perf = os.environ.get("MQ_PERF")
-                if _perf:
-                    _ds = torch.cuda.Event(enable_timing=True)
-                    _de = torch.cuda.Event(enable_timing=True)
-                    _ds.record()
+                out_3d = output[:num_decode].reshape(
+                    num_decode, self.num_heads, D)
                 kernel.tq_wht_fused_decode_attention(
-                    buf['q_raw'], kv_cache, buf['bt'], buf['sl'],
-                    buf['out'], D, self._mse_bits, self.scale,
+                    dq, kv_cache,
+                    attn_metadata.block_table[:num_decode].int(),
+                    attn_metadata.seq_lens[:num_decode].int(),
+                    out_3d, D, self._mse_bits, self.scale,
                     s_b, s_kv, s_s, s_h)
-                if _perf:
-                    _de.record()
-                    torch.cuda.synchronize()
-                    _lid = getattr(layer, '_mq_layer_id', -1)
-                    if not hasattr(self, '_perf_dec_cnt'):
-                        self._perf_dec_cnt = 0
-                    self._perf_dec_cnt += 1
-                    if self._perf_dec_cnt <= 200:
-                        sl_val = attn_metadata.seq_lens[0].item() if not torch.cuda.is_current_stream_capturing() else -1
-                        logger.info("[WHT_PERF] L%02d decode: %.0fµs (sl=%d)",
-                                    _lid, _ds.elapsed_time(_de) * 1000, sl_val)
-                output[:num_decode] = buf['out'].reshape(
-                    num_decode, -1).to(output.dtype)
             else:
                 if not hasattr(self, '_wht_torch_logged'):
                     self._wht_torch_logged = True
