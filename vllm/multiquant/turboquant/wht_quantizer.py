@@ -131,34 +131,39 @@ def pack_wht(
         }
     _shifts = pack_wht._shift_cache[_sk]
 
+    # Pre-allocate output (no torch.cat — graph-safe, less memory)
+    packed = torch.empty(N, n_blocks, bpb, dtype=torch.uint8, device=x.device)
+    gamma_fp16 = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
+
     if bits == 3:
         qs_bytes = bs * 2 // 8
         qr_bytes = bs // 8
+        # Write qs directly into packed[:, :, :qs_bytes]
         low2 = (idx_int & 0x3).reshape(N, n_blocks, qs_bytes, 4)
-        qs = (low2 << _shifts['qs']).sum(dim=-1).to(torch.uint8)
+        packed[:, :, :qs_bytes] = (low2 << _shifts['qs']).sum(dim=-1).to(torch.uint8)
+        # Write qr into packed[:, :, qs_bytes:qs_bytes+qr_bytes]
         hi1 = ((idx_int >> 2) & 1).reshape(N, n_blocks, qr_bytes, 8)
-        qr = (hi1 << _shifts['qr']).sum(dim=-1).to(torch.uint8)
-        # Gamma as fp16
-        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
-        # Concat: [qs | qr | gamma]
-        packed = torch.cat([qs, qr, gamma_bytes], dim=-1)  # [N, n_blocks, bpb]
+        packed[:, :, qs_bytes:qs_bytes+qr_bytes] = (
+            hi1 << _shifts['qr']).sum(dim=-1).to(torch.uint8)
+        # Write gamma
+        packed[:, :, qs_bytes+qr_bytes:] = gamma_fp16
     elif bits == 4:
         n_bytes = bs // 2
         idx_pairs = idx_int.reshape(N, n_blocks, n_bytes, 2)
-        packed_bytes = (idx_pairs[..., 0] & 0xF) | ((idx_pairs[..., 1] & 0xF) << 4)
-        packed_bytes = packed_bytes.to(torch.uint8)
-        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
-        packed = torch.cat([packed_bytes, gamma_bytes], dim=-1)
+        packed[:, :, :n_bytes] = (
+            (idx_pairs[..., 0] & 0xF) | ((idx_pairs[..., 1] & 0xF) << 4)
+        ).to(torch.uint8)
+        packed[:, :, n_bytes:] = gamma_fp16
     elif bits == 2:
         n_bytes = bs // 4
         idx_quads = idx_int.reshape(N, n_blocks, n_bytes, 4)
-        packed_bytes = ((idx_quads & 0x3) << _shifts['qs']).sum(dim=-1).to(torch.uint8)
-        gamma_bytes = gamma.to(torch.float16).view(torch.uint8).reshape(N, n_blocks, 2)
-        packed = torch.cat([packed_bytes, gamma_bytes], dim=-1)
+        packed[:, :, :n_bytes] = (
+            (idx_quads & 0x3) << _shifts['qs']).sum(dim=-1).to(torch.uint8)
+        packed[:, :, n_bytes:] = gamma_fp16
     else:
         raise ValueError(f"WHT pack: unsupported bits={bits}")
 
-    return packed.reshape(N, -1)  # [N, packed_size]
+    return packed.reshape(N, -1)
 
 
 def unpack_wht(

@@ -485,8 +485,13 @@ class MultiQuantImpl:
             return output.fill_(0)
 
         # KV cache update: use attn_metadata.slot_mapping (from scheduler)
+        # Skip during CUDA Graph capture — pack_wht temporaries blow up
+        # the graph pool (~104 MB per call × 47 layers × 35 graphs = OOM).
+        # The warmup run before capture writes the KV data;
+        # during capture only the decode path runs.
         if (key is not None and value is not None
-                and self.kv_sharing_target_layer_name is None):
+                and self.kv_sharing_target_layer_name is None
+                and not torch.cuda.is_current_stream_capturing()):
             slot_mapping = attn_metadata.slot_mapping
             num_actual = attn_metadata.num_prefill_tokens + \
                          attn_metadata.num_decode_tokens
@@ -622,38 +627,28 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            _capturing = torch.cuda.is_current_stream_capturing()
-            if _capturing:
-                # Graph capture: pure PyTorch (graph-safe)
-                if not hasattr(self, '_wht_graph_logged'):
-                    self._wht_graph_logged = True
-                    logger.info("WHT decode: GRAPH CAPTURE detected, "
-                                "using PyTorch path")
+            # Always use CUDA kernel (graph-safe: no allocs, only kernel launch)
+            # In eager: kernel + sync. In graph capture: kernel recorded, no sync.
+            from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                wht_fused_decode_attention,
+            )
+            cuda_out = wht_fused_decode_attention(
+                q=dq, kv_cache=kv_cache,
+                block_table=attn_metadata.block_table[:num_decode],
+                seq_lens=attn_metadata.seq_lens[:num_decode],
+                scale=self.scale, mse_bits=self._mse_bits,
+                block_size_wht=self._wht_block_size,
+            )
+            if cuda_out is not None:
+                decode_out = cuda_out
+            else:
+                if not hasattr(self, '_wht_torch_logged'):
+                    self._wht_torch_logged = True
+                    logger.warning("WHT decode: CUDA kernel unavailable, "
+                                   "using PyTorch fallback")
                 decode_out = self._wht_decode_torch(
                     dq, kv_cache, attn_metadata, num_decode,
                     block_size, D, device)
-            else:
-                # Eager: try JIT CUDA kernel, fallback to PyTorch
-                from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    wht_fused_decode_attention,
-                )
-                cuda_out = wht_fused_decode_attention(
-                    q=dq, kv_cache=kv_cache,
-                    block_table=attn_metadata.block_table[:num_decode],
-                    seq_lens=attn_metadata.seq_lens[:num_decode],
-                    scale=self.scale, mse_bits=self._mse_bits,
-                    block_size_wht=self._wht_block_size,
-                )
-                if cuda_out is not None:
-                    decode_out = cuda_out
-                else:
-                    if not hasattr(self, '_wht_torch_logged'):
-                        self._wht_torch_logged = True
-                        logger.warning("WHT decode: CUDA kernel unavailable, "
-                                       "using PyTorch fallback")
-                    decode_out = self._wht_decode_torch(
-                        dq, kv_cache, attn_metadata, num_decode,
-                        block_size, D, device)
             output[:num_decode] = decode_out.reshape(
                 num_decode, -1).to(output.dtype)
             return

@@ -576,15 +576,17 @@ def wht_fused_decode_attention(
         }
     buf = _wht_decode_buffers[buf_key]
 
-    # Pre-compute WHT of query
+    # Pre-compute WHT of query (graph-safe: pre-allocated buffers)
     from vllm.multiquant.shared.wht import wht_forward
-    q_flat = q.reshape(B * Hq, D).float()
-    q_wht_flat = wht_forward(q_flat, block_size=block_size_wht)
+    if 'q_flat' not in buf or buf['q_flat'].shape[0] != B * Hq:
+        buf['q_flat'] = torch.empty(B * Hq, D, device=device, dtype=torch.float32)
+    buf['q_flat'].copy_(q.reshape(B * Hq, D))
+    q_wht_flat = wht_forward(buf['q_flat'], block_size=block_size_wht)
     q_wht = buf["q_wht"]
     q_wht.copy_(q_wht_flat.reshape(B, Hq, D))
 
-    # Fresh output tensor each call (no buffer reuse — debug)
-    output = torch.zeros(B, Hq, D, device=device, dtype=torch.float32)
+    output = buf["output"]
+    output.zero_()
 
     # KV cache strides
     s_block = kv_cache.stride(0)
@@ -616,18 +618,25 @@ def wht_fused_decode_attention(
     kernel = _load_wht_cuda_kernel() if not os.environ.get("MQ_WHT_PYTHON") else None
     if kernel is not None:
         try:
+            # Pre-allocate int32 buffers (graph-safe: no .int() alloc)
+            if 'bt_int' not in buf or buf['bt_int'].shape != block_table.shape:
+                buf['bt_int'] = torch.empty_like(block_table, dtype=torch.int32)
+                buf['sl_int'] = torch.empty_like(seq_lens, dtype=torch.int32)
+            buf['bt_int'].copy_(block_table)
+            buf['sl_int'].copy_(seq_lens)
             kernel.tq_wht_fused_decode_attention(
                 q_wht,
                 kv_cache,
-                block_table.int(),
-                seq_lens.int(),
+                buf['bt_int'],
+                buf['sl_int'],
                 output,
                 D, mse_bits, scale,
                 s_block, s_kv, s_slot, s_head,
             )
-            # JIT kernels run async — must sync before returning output.
-            # Without this, vLLM reads zeros (kernel hasn't finished).
-            torch.cuda.synchronize()
+            # JIT kernels run async — sync in eager mode only.
+            # During graph capture: kernel is recorded, sync would break capture.
+            if not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
             cuda_ok = True
         except Exception as e:
             logger.warning("WHT CUDA decode call failed: %s", e)
