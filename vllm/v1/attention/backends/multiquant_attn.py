@@ -627,30 +627,57 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            # Always use CUDA kernel (graph-safe: no allocs, only kernel launch)
-            # In eager: kernel + sync. In graph capture: kernel recorded, no sync.
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                wht_fused_decode_attention,
+                _load_wht_cuda_kernel,
             )
-            cuda_out = wht_fused_decode_attention(
-                q=dq, kv_cache=kv_cache,
-                block_table=attn_metadata.block_table[:num_decode],
-                seq_lens=attn_metadata.seq_lens[:num_decode],
-                scale=self.scale, mse_bits=self._mse_bits,
-                block_size_wht=self._wht_block_size,
-            )
-            if cuda_out is not None:
-                decode_out = cuda_out
+            from vllm.multiquant.shared.wht import wht_forward
+            kernel = _load_wht_cuda_kernel()
+            if kernel is not None:
+                # Graph-safe: pre-allocated buffers, direct kernel call
+                # NO .zero_() on output (JIT kernel async — zero overwrites result in graph)
+                _bk = (num_decode, self.num_heads, D, device)
+                if not hasattr(self, '_wht_bufs') or \
+                        self._wht_bufs.get('key') != _bk:
+                    self._wht_bufs = {
+                        'key': _bk,
+                        'q_wht': torch.empty(num_decode, self.num_heads, D,
+                                             device=device, dtype=torch.float32),
+                        'out': torch.empty(num_decode, self.num_heads, D,
+                                           device=device, dtype=torch.float32),
+                        'bt': torch.empty_like(
+                            attn_metadata.block_table[:num_decode],
+                            dtype=torch.int32),
+                        'sl': torch.empty_like(
+                            attn_metadata.seq_lens[:num_decode],
+                            dtype=torch.int32),
+                    }
+                buf = self._wht_bufs
+                buf['q_wht'].copy_(wht_forward(
+                    dq.reshape(num_decode * self.num_heads, D).float(),
+                    block_size=self._wht_block_size
+                ).reshape(num_decode, self.num_heads, D))
+                buf['bt'].copy_(attn_metadata.block_table[:num_decode])
+                buf['sl'].copy_(attn_metadata.seq_lens[:num_decode])
+                s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
+                                        kv_cache.stride(2), kv_cache.stride(3))
+                kernel.tq_wht_fused_decode_attention(
+                    buf['q_wht'], kv_cache, buf['bt'], buf['sl'],
+                    buf['out'], D, self._mse_bits, self.scale,
+                    s_b, s_kv, s_s, s_h)
+                if not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
+                output[:num_decode] = buf['out'].reshape(
+                    num_decode, -1).to(output.dtype)
             else:
                 if not hasattr(self, '_wht_torch_logged'):
                     self._wht_torch_logged = True
                     logger.warning("WHT decode: CUDA kernel unavailable, "
-                                   "using PyTorch fallback")
+                                   "using PyTorch fallback (SLOW)")
                 decode_out = self._wht_decode_torch(
                     dq, kv_cache, attn_metadata, num_decode,
                     block_size, D, device)
-            output[:num_decode] = decode_out.reshape(
-                num_decode, -1).to(output.dtype)
+                output[:num_decode] = decode_out.reshape(
+                    num_decode, -1).to(output.dtype)
             return
 
         if self._is_rq:
