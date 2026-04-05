@@ -70,6 +70,7 @@ Offline-Benchmark (kein HTTP/Scheduler-Overhead), 5 Runs avg:
 |----------|------------|------|--------|-----------|-------|
 | fp8      | 43.2       | 788✓ | ✓      | 1.0×      | FlashInfer decode, CUDA Graph |
 | tq3w     | 35.3       | 788✓ | ✓      | 2.3× less | WHT block-32, fused CUDA pack+decode |
+| tq3r     | 34.7       | 788✓ | ✓      | 2.3× less | Block-rot 32×32, fused CUDA pack+decode |
 
 tq3w = **82% of FP8 speed** mit **2.3× weniger KV-Cache Speicher**.
 
