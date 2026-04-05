@@ -416,38 +416,59 @@ class MultiQuantImpl:
         v_flat = value.reshape(-1, D)
         if self._is_wht:
             pi_blocks = self._get_pi_blocks(layer, device)
-            # Try fused CUDA pack kernel (1 launch, graph-safe)
-            # Only available for WHT mode (not block-rot, which needs Pi_blocks)
-            from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                _load_wht_pack_kernel,
-            )
-            pack_kernel = _load_wht_pack_kernel() if not self._is_block_rot \
-                else None
-            if pack_kernel is not None:
-                # Max-buffer: allocate once for max batch, slice for current
-                N_vecs = k_flat.shape[0]
-                ps = self._packed_size
-                if not hasattr(self, '_pack_k_buf') or \
-                        self._pack_k_buf.shape[0] < N_vecs:
-                    max_n = max(N_vecs, 256 * self.num_kv_heads)
-                    self._pack_k_buf = torch.empty(
-                        max_n, ps, dtype=torch.uint8, device=device)
-                    self._pack_v_buf = torch.empty(
-                        max_n, ps, dtype=torch.uint8, device=device)
-                k_packed = self._pack_k_buf[:N_vecs]  # View, zero alloc
-                v_packed = self._pack_v_buf[:N_vecs]
-                pack_kernel.tq_wht_pack(k_flat, k_packed)
-                pack_kernel.tq_wht_pack(v_flat, v_packed)
+            # Max-buffer: allocate once for max batch, slice for current
+            N_vecs = k_flat.shape[0]
+            ps = self._packed_size
+            if not hasattr(self, '_pack_k_buf') or \
+                    self._pack_k_buf.shape[0] < N_vecs:
+                max_n = max(N_vecs, 256 * self.num_kv_heads)
+                self._pack_k_buf = torch.empty(
+                    max_n, ps, dtype=torch.uint8, device=device)
+                self._pack_v_buf = torch.empty(
+                    max_n, ps, dtype=torch.uint8, device=device)
+            k_packed = self._pack_k_buf[:N_vecs]
+            v_packed = self._pack_v_buf[:N_vecs]
+
+            if self._is_block_rot:
+                # Block-rotation CUDA pack kernel
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_blockrot_pack_kernel,
+                )
+                brot_pack = _load_blockrot_pack_kernel()
+                if brot_pack is not None:
+                    brot_pack.tq_blockrot_pack(k_flat, pi_blocks, k_packed)
+                    brot_pack.tq_blockrot_pack(v_flat, pi_blocks, v_packed)
+                else:
+                    if not hasattr(self, '_brot_pack_fallback_logged'):
+                        self._brot_pack_fallback_logged = True
+                        logger.warning("block-rot pack: CUDA unavailable, "
+                                       "Python fallback")
+                    from vllm.multiquant.turboquant.wht_quantizer import (
+                        pack_wht,
+                    )
+                    k_packed = pack_wht(
+                        k_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
+                    v_packed = pack_wht(
+                        v_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
             else:
-                if not hasattr(self, '_wht_pack_fallback_logged'):
-                    self._wht_pack_fallback_logged = True
-                    mode = "block-rot" if self._is_block_rot else "WHT"
-                    logger.warning("%s pack: using Python fallback", mode)
-                from vllm.multiquant.turboquant.wht_quantizer import pack_wht
-                k_packed = pack_wht(
-                    k_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
-                v_packed = pack_wht(
-                    v_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
+                # WHT CUDA pack kernel
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_wht_pack_kernel,
+                )
+                wht_pack = _load_wht_pack_kernel()
+                if wht_pack is not None:
+                    wht_pack.tq_wht_pack(k_flat, k_packed)
+                    wht_pack.tq_wht_pack(v_flat, v_packed)
+                else:
+                    if not hasattr(self, '_wht_pack_fallback_logged'):
+                        self._wht_pack_fallback_logged = True
+                        logger.warning("WHT pack: CUDA unavailable, "
+                                       "Python fallback")
+                    from vllm.multiquant.turboquant.wht_quantizer import (
+                        pack_wht,
+                    )
+                    k_packed = pack_wht(k_flat.float(), self._tq_config)
+                    v_packed = pack_wht(v_flat.float(), self._tq_config)
         elif torch.cuda.is_current_stream_capturing():
             k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
             v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)
@@ -656,31 +677,40 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            # CUDA kernel only for pure WHT (not block-rot which needs Pi_blocks)
+            # Load appropriate CUDA kernel
             kernel = None
-            if not self._is_block_rot:
+            if self._is_block_rot:
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_blockrot_decode_kernel,
+                )
+                kernel = _load_blockrot_decode_kernel()
+            else:
                 from vllm.v1.attention.ops.triton_mq_fused_decode import (
                     _load_wht_cuda_kernel,
                 )
                 kernel = _load_wht_cuda_kernel()
             if kernel is not None:
-                # Zero-copy: kernel reads bf16 query, int64 bt/sl directly.
-                # Kernel writes bf16 output directly to vLLM output tensor.
-                # WHT applied to query in-kernel. No Python copy_() needed.
-                # 1 CUDA op per layer (just the kernel launch).
                 s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
                                         kv_cache.stride(2), kv_cache.stride(3))
                 out_3d = output[:num_decode].reshape(
                     num_decode, self.num_heads, D)
-                # bt is int32 (no-op .int()). sl may be int32 or int64.
                 bt = attn_metadata.block_table[:num_decode]
                 sl = attn_metadata.seq_lens[:num_decode]
                 if sl.dtype != torch.int32:
-                    sl = sl.int()  # only allocs if int64
-                kernel.tq_wht_fused_decode_attention(
-                    dq, kv_cache, bt, sl,
-                    out_3d, D, self._mse_bits, self.scale,
-                    s_b, s_kv, s_s, s_h)
+                    sl = sl.int()
+                if self._is_block_rot:
+                    # Block-rot decode: pass Pi_blocks
+                    pi_blk = getattr(self, '_cached_pi_blocks', None)
+                    kernel.tq_blockrot_fused_decode_attention(
+                        dq, pi_blk, kv_cache, bt, sl,
+                        out_3d, D, self._mse_bits, self.scale,
+                        s_b, s_kv, s_s, s_h)
+                else:
+                    # WHT decode: no Pi needed
+                    kernel.tq_wht_fused_decode_attention(
+                        dq, kv_cache, bt, sl,
+                        out_3d, D, self._mse_bits, self.scale,
+                        s_b, s_kv, s_s, s_h)
             else:
                 if not hasattr(self, '_wht_torch_logged'):
                     self._wht_torch_logged = True

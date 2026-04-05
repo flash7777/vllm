@@ -25,7 +25,7 @@ def main():
         model=args.model,
         kv_cache_dtype=args.kv,
         max_model_len=args.max_model_len,
-        gpu_memory_utilization=0.33,
+        gpu_memory_utilization=0.05,
         kv_cache_memory_bytes=16 * 1024 * 1024 * 1024,
         trust_remote_code=True,
         enforce_eager=False,

@@ -982,3 +982,94 @@ def _load_rq_decode_kernel():
     except Exception as e:
         logger.warning("RQ fused decode kernel FAILED: %s", e)
         return None
+
+
+# ============================================================
+# Block-Rotation Kernel loaders (tq3r/tq4r)
+# ============================================================
+
+_blockrot_pack_kernel = None
+_blockrot_pack_kernel_tried = False
+
+_blockrot_decode_kernel = None
+_blockrot_decode_kernel_tried = False
+
+
+def _load_blockrot_pack_kernel():
+    """JIT compile the fused block-rotation pack kernel."""
+    global _blockrot_pack_kernel, _blockrot_pack_kernel_tried
+    if _blockrot_pack_kernel_tried:
+        return _blockrot_pack_kernel
+    _blockrot_pack_kernel_tried = True
+
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "turboquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/tq_build"
+    src_file = os.path.join(src_dir, "tq_blockrot_pack.cu")
+    if not os.path.exists(src_file):
+        logger.warning("Block-rot pack: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _blockrot_pack_kernel = load(
+            name="tq_blockrot_pack",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        logger.info("Block-rot fused pack CUDA kernel compiled and loaded")
+        return _blockrot_pack_kernel
+    except Exception as e:
+        logger.warning("Block-rot fused pack CUDA kernel FAILED: %s", e)
+        return None
+
+
+def _load_blockrot_decode_kernel():
+    """JIT compile the block-rotation fused decode kernel."""
+    global _blockrot_decode_kernel, _blockrot_decode_kernel_tried
+    if _blockrot_decode_kernel_tried:
+        return _blockrot_decode_kernel
+    _blockrot_decode_kernel_tried = True
+
+    src_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..",
+        "kernels", "turboquant"
+    )
+    if not os.path.exists(src_dir):
+        src_dir = "/opt/tq_build"
+    src_file = os.path.join(src_dir, "tq_blockrot_decode.cu")
+    if not os.path.exists(src_file):
+        logger.warning("Block-rot decode: source not found at %s", src_file)
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        _blockrot_decode_kernel = load(
+            name="tq_blockrot_decode",
+            sources=[src_file],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        logger.info("Block-rot fused decode CUDA kernel compiled and loaded")
+        return _blockrot_decode_kernel
+    except Exception as e:
+        logger.warning("Block-rot fused decode CUDA kernel FAILED: %s", e)
+        return None
