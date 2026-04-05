@@ -40,11 +40,15 @@ def _archer_apply_impl(
     mse_bits: int,
     is_rq: bool,
 ) -> torch.Tensor:
-    """Real impl: decompress packed uint8 → F.linear."""
+    """Real impl: decompress packed uint8 → F.linear.
+
+    Graph-safe: uses CUDA kernels (no Python loops, no host→device).
+    Falls back to Python only when no CUDA kernel available.
+    """
     out_features = packed_weight.shape[0]
     device = packed_weight.device
 
-    # Try CUDA full decompress (TQ only, D≤256)
+    # Try CUDA full decompress (TQ only, D≤256) — graph-safe
     if in_features <= 256 and not is_rq:
         try:
             from vllm.multiquant.weight_quant.archer_ops import cuda_decompress
@@ -57,7 +61,7 @@ def _archer_apply_impl(
         except Exception:
             pass
 
-    # Try CUDA unpack
+    # Try CUDA unpack — graph-safe (uses getCurrentCUDAStream)
     result = None
     try:
         from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
@@ -69,11 +73,12 @@ def _archer_apply_impl(
         result = None
 
     if result is None:
-        # Python fallback
+        # Python fallback — NOT graph-safe (Python loops).
+        # This path should not be reached if CUDA kernels are available.
         mse_bytes = math.ceil(in_features * mse_bits / 8)
         qjl_bytes = math.ceil(in_features / 8)
         mask = (1 << mse_bits) - 1
-        idx = torch.zeros(out_features, in_features,
+        idx = torch.empty(out_features, in_features,
                           dtype=torch.long, device=device)
         for j in range(in_features):
             bo = j * mse_bits
@@ -84,19 +89,15 @@ def _archer_apply_impl(
             if spill > 0 and bi + 1 < mse_bytes:
                 bv = bv | (packed_weight[:, bi + 1].long() << (mse_bits - spill))
             idx[:, j] = bv & mask
-        signs = torch.zeros(out_features, in_features,
+        # Vectorized sign unpack (graph-safer, no torch.ones/torch.where)
+        sign_bytes = packed_weight[:, mse_bytes:mse_bytes + qjl_bytes]
+        signs = torch.empty(out_features, in_features,
                             dtype=torch.float32, device=device)
-        for b in range(qjl_bytes):
-            bv = packed_weight[:, mse_bytes + b].long()
-            for k in range(8):
-                j = b * 8 + k
-                if j >= in_features:
-                    break
-                signs[:, j] = torch.where(
-                    ((bv >> k) & 1).bool(),
-                    torch.ones(out_features, device=device),
-                    -torch.ones(out_features, device=device),
-                )
+        for j in range(in_features):
+            b = j // 8
+            k = j % 8
+            bit = (sign_bytes[:, b].long() >> k) & 1
+            signs[:, j] = bit.float() * 2.0 - 1.0  # 0→-1, 1→+1
         no = mse_bytes + qjl_bytes
         row_norms = packed_weight[:, no:no + 2].contiguous().view(
             torch.float16).float().squeeze(-1)

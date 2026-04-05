@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-KV=tq3
+KV=tq3w
 RESULTS=()
 
 test_variant() {
@@ -29,11 +29,12 @@ test_variant() {
     sleep 2
 
     local MTP=${4:-false}
+    local KV_OVERRIDE=${5:-""}
 
-    # KV dtype: use Archer method if set, else default
+    # KV dtype: default from global KV, override per-test if specified
     local KV_USE="$KV"
-    if [ -n "$WEIGHTS" ]; then
-        KV_USE="$WEIGHTS"  # Archer rq3 → KV rq3
+    if [ -n "$KV_OVERRIDE" ]; then
+        KV_USE="$KV_OVERRIDE"
     fi
 
     local ARGS=(--model "$MODEL" --kv "$KV_USE")
@@ -90,16 +91,13 @@ echo "════════════════════════�
 printf "  %-4s  %-12s  %-10s  %-6s  %-3s\n" "#" "Modell-Quant" "Archer" "KV" "MTP"
 echo "───────────────────────────────────────────────────────────────────"
 
-#                    Label                Model                            Archer  MTP
+#                    Label                               Model                            Archer  MTP
 #       Modell-Quant | Archer-Gewichte | KV-Cache | MTP
-test_variant "INT4  / —    / tq3 / —"    "GLM-4.7-Flash-int4-AutoRound"  ""      ""
-test_variant "FP8   / —    / tq3 / —"    "GLM-4.7-Flash-FP8"            ""      ""
-test_variant "BF16  / tq3  / tq3 / —"    "GLM-4.7-Flash"               "tq3"   ""
-test_variant "BF16  / rq3  / rq3 / —"    "GLM-4.7-Flash"               "rq3"   ""
-test_variant "FP8   / tq3  / tq3 / —"    "GLM-4.7-Flash-FP8"           "tq3"   ""
-test_variant "INT4  / —    / tq3 / mtp"  "GLM-4.7-Flash-int4-AutoRound" ""      "true"
-test_variant "FP8   / —    / tq3 / mtp"  "GLM-4.7-Flash-FP8"           ""      "true"
-test_variant "BF16  / tq3  / tq3 / mtp"  "GLM-4.7-Flash"               "tq3"   "true"
+test_variant "INT4  / —    / tq3w / —"    "GLM-4.7-Flash-int4-AutoRound"  ""      ""
+test_variant "FP8   / —    / tq3w / —"    "GLM-4.7-Flash-FP8"            ""      ""
+test_variant "FP8   / —    / tq2w / —"    "GLM-4.7-Flash-FP8"            ""      ""     "tq2w"
+test_variant "BF16  / tq3  / tq3w / —"    "GLM-4.7-Flash"               "tq3"   ""
+test_variant "BF16  / rq3  / tq3w / —"    "GLM-4.7-Flash"               "rq3"   ""
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════"

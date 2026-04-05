@@ -72,9 +72,14 @@ def reverse(x: torch.Tensor) -> torch.Tensor:
 
     This is used for rotor conjugation: R x R̃
     """
-    signs = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1],
-                         dtype=x.dtype, device=x.device)
-    return x * signs
+    # GPU-cached signs (graph-safe: no host→device during capture)
+    if not hasattr(reverse, '_signs_cache'):
+        reverse._signs_cache = {}
+    _key = (x.dtype, x.device)
+    if _key not in reverse._signs_cache:
+        reverse._signs_cache[_key] = torch.tensor(
+            [1, 1, 1, 1, -1, -1, -1, -1], dtype=x.dtype, device=x.device)
+    return x * reverse._signs_cache[_key]
 
 
 def multivector_norm_sq(x: torch.Tensor) -> torch.Tensor:
