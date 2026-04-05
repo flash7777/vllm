@@ -693,40 +693,68 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            # Load appropriate CUDA kernel
-            kernel = None
-            if self._is_block_rot:
+            s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
+                                    kv_cache.stride(2), kv_cache.stride(3))
+            out_3d = output[:num_decode].reshape(
+                num_decode, self.num_heads, D)
+            bt = attn_metadata.block_table[:num_decode]
+            sl = attn_metadata.seq_lens[:num_decode]
+            if sl.dtype != torch.int32:
+                sl = sl.int()
+
+            # Try split-KV kernel first (WHT only, not block-rot yet)
+            splitkv_ok = False
+            if not self._is_block_rot:
                 from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    _load_blockrot_decode_kernel,
+                    _load_splitkv_decode_kernel,
                 )
-                kernel = _load_blockrot_decode_kernel()
-            else:
-                from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    _load_wht_cuda_kernel,
-                )
-                kernel = _load_wht_cuda_kernel()
-            if kernel is not None:
-                s_b, s_kv, s_s, s_h = (kv_cache.stride(0), kv_cache.stride(1),
-                                        kv_cache.stride(2), kv_cache.stride(3))
-                out_3d = output[:num_decode].reshape(
-                    num_decode, self.num_heads, D)
-                bt = attn_metadata.block_table[:num_decode]
-                sl = attn_metadata.seq_lens[:num_decode]
-                if sl.dtype != torch.int32:
-                    sl = sl.int()
-                if self._is_block_rot:
-                    # Block-rot decode: pass Pi_blocks
-                    pi_blk = getattr(self, '_cached_pi_blocks', None)
-                    kernel.tq_blockrot_fused_decode_attention(
-                        dq, pi_blk, kv_cache, bt, sl,
-                        out_3d, D, self._mse_bits, self.scale,
-                        s_b, s_kv, s_s, s_h)
-                else:
-                    # WHT decode: no Pi needed
-                    kernel.tq_wht_fused_decode_attention(
+                skv_kernel = _load_splitkv_decode_kernel()
+                if skv_kernel is not None:
+                    # num_splits: aim for ~8 positions per split
+                    NUM_SPLITS = 8
+                    num_qh = num_decode * self.num_heads
+                    # Pre-allocate split buffer (once, max size)
+                    buf_key = (num_qh, NUM_SPLITS, D)
+                    if not hasattr(self, '_split_buf') or \
+                            getattr(self, '_split_buf_key', None) != buf_key:
+                        max_qh = max(num_qh, 256 * self.num_heads)
+                        self._split_buf = torch.empty(
+                            max_qh, NUM_SPLITS, D + 2,
+                            dtype=torch.float32, device=device)
+                        self._split_buf_key = buf_key
+                    split_buf = self._split_buf[:num_qh]
+                    skv_kernel.tq_wht_splitkv_decode(
                         dq, kv_cache, bt, sl,
-                        out_3d, D, self._mse_bits, self.scale,
-                        s_b, s_kv, s_s, s_h)
+                        split_buf, out_3d,
+                        D, self._mse_bits, self.scale,
+                        s_b, s_kv, s_s, s_h, NUM_SPLITS)
+                    splitkv_ok = True
+
+            if not splitkv_ok:
+                # Fallback: original single-block kernel
+                kernel = None
+                if self._is_block_rot:
+                    from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                        _load_blockrot_decode_kernel,
+                    )
+                    kernel = _load_blockrot_decode_kernel()
+                else:
+                    from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                        _load_wht_cuda_kernel,
+                    )
+                    kernel = _load_wht_cuda_kernel()
+                if kernel is not None:
+                    if self._is_block_rot:
+                        pi_blk = getattr(self, '_cached_pi_blocks', None)
+                        kernel.tq_blockrot_fused_decode_attention(
+                            dq, pi_blk, kv_cache, bt, sl,
+                            out_3d, D, self._mse_bits, self.scale,
+                            s_b, s_kv, s_s, s_h)
+                    else:
+                        kernel.tq_wht_fused_decode_attention(
+                            dq, kv_cache, bt, sl,
+                            out_3d, D, self._mse_bits, self.scale,
+                            s_b, s_kv, s_s, s_h)
             else:
                 if not hasattr(self, '_wht_torch_logged'):
                     self._wht_torch_logged = True
