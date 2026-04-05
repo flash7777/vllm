@@ -69,7 +69,7 @@ Offline-Benchmark (kein HTTP/Scheduler-Overhead), 5 Runs avg:
 | KV-Dtype | tok/s (avg) | Math | Mozart | KV vs FP8 | Notes |
 |----------|------------|------|--------|-----------|-------|
 | fp8      | 43.2       | 788✓ | ✓      | 1.0×      | FlashInfer decode, CUDA Graph |
-| tq3w     | 35.3       | 788✓ | ✓      | 2.3× less | WHT block-32, fused CUDA pack+decode |
+| tq3w     | **41.2**   | 788✓ | ✓      | 2.3× less | Split-KV decode, fused pack-to-cache |
 | tq3r     | 34.7       | 788✓ | ✓      | 2.3× less | Block-rot 32×32, fused CUDA pack+decode |
 
 tq3w = **82% of FP8 speed** mit **2.3× weniger KV-Cache Speicher**.
