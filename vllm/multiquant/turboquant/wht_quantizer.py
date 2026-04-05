@@ -19,14 +19,17 @@ from vllm.multiquant.turboquant.wht_config import TurboQuantWHTConfig
 
 
 class TurboQuantWHTQuantizer(KVQuantizer):
-    """WHT-based TurboQuant quantizer.
+    """WHT/block-rotation TurboQuant quantizer.
 
-    No per-layer state (Pi, S matrices) — WHT is deterministic.
-    Only stores universal centroids (8 values for 3-bit).
+    WHT mode: No per-layer state — WHT is deterministic.
+    Random mode: Stores [n_blocks, block_size, block_size] rotation matrices per layer.
+    Both use universal centroids (8 values for 3-bit).
     """
 
     def init_buffers(self, head_dim: int, seed: int) -> dict[str, Tensor]:
-        """No per-layer buffers needed for WHT mode."""
+        """WHT: no buffers. Random: block rotation matrices."""
+        # Check if we have a config with rotation_type
+        # This is called from attention.py with just head_dim and seed
         return {}
 
     def pack(
@@ -77,13 +80,15 @@ class TurboQuantWHTQuantizer(KVQuantizer):
 
 
 def pack_wht(
-    x: Tensor, config: TurboQuantWHTConfig
+    x: Tensor, config: TurboQuantWHTConfig,
+    Pi_blocks: Tensor | None = None,
 ) -> Tensor:
-    """Pack float vectors using WHT block compression.
+    """Pack float vectors using WHT or block-rotation compression.
 
     Args:
         x: [N, D] float32 tensor
         config: WHT config with block_size and total_bits
+        Pi_blocks: [n_blocks, block_size, block_size] for random rotation mode
 
     Returns:
         [N, packed_size] uint8 tensor
@@ -93,9 +98,19 @@ def pack_wht(
     bits = config.mse_bits
     n_blocks = D // bs
 
-    # Step 1: WHT transform (per block)
-    rotated = wht_forward(x, block_size=bs)  # [N, D]
-    blocks = rotated.reshape(N, n_blocks, bs)  # [N, n_blocks, bs]
+    # Step 1: Block transform (WHT or random rotation)
+    if Pi_blocks is not None:
+        # Random block rotation: reshape to blocks, bmm with rotation matrices
+        x_blocks = x.reshape(N, n_blocks, bs)  # [N, n_blocks, bs]
+        # bmm: [N*n_blocks, 1, bs] @ [N*n_blocks, bs, bs] → [N*n_blocks, 1, bs]
+        # More efficient: einsum or manual broadcast
+        # Pi_blocks: [n_blocks, bs, bs], x_blocks: [N, n_blocks, bs]
+        # rotated[n, b, :] = x_blocks[n, b, :] @ Pi_blocks[b, :, :].T
+        blocks = torch.einsum('nbi,bij->nbj', x_blocks, Pi_blocks)
+    else:
+        # WHT: fixed Hadamard butterfly transform
+        rotated = wht_forward(x, block_size=bs)  # [N, D]
+        blocks = rotated.reshape(N, n_blocks, bs)  # [N, n_blocks, bs]
 
     # Step 2: Per-block amax normalization
     # Cache centroids/thresholds on GPU (host→device transfer is NOT graph-safe)
@@ -167,13 +182,15 @@ def pack_wht(
 
 
 def unpack_wht(
-    packed: Tensor, config: TurboQuantWHTConfig
+    packed: Tensor, config: TurboQuantWHTConfig,
+    Pi_blocks: Tensor | None = None,
 ) -> Tensor:
     """Unpack compressed uint8 back to float vectors.
 
     Args:
         packed: [N, packed_size] uint8 tensor
         config: WHT config
+        Pi_blocks: [n_blocks, block_size, block_size] for random rotation mode
 
     Returns:
         [N, D] float32 tensor
@@ -234,9 +251,16 @@ def unpack_wht(
     gamma_fp16 = gamma_raw.view(torch.uint8).reshape(N * n_blocks, 2).view(
         torch.float16).reshape(N, n_blocks).float()
 
-    # Reconstruct: centroid lookup + scale + inverse WHT
-    values_wht = centroids[idx] * gamma_fp16.unsqueeze(-1)  # [N, n_blocks, bs]
-    values_flat = values_wht.reshape(N, D)  # [N, D]
+    # Reconstruct: centroid lookup + scale + inverse transform
+    values_rot = centroids[idx] * gamma_fp16.unsqueeze(-1)  # [N, n_blocks, bs]
 
-    # Inverse WHT
-    return wht_inverse(values_flat, block_size=bs)
+    if Pi_blocks is not None:
+        # Inverse random rotation: multiply by Pi_blocks^T per block
+        # values_rot: [N, n_blocks, bs], Pi_blocks: [n_blocks, bs, bs]
+        # result[n, b, :] = values_rot[n, b, :] @ Pi_blocks[b, :, :]^T
+        values_orig = torch.einsum('nbj,bij->nbi', values_rot, Pi_blocks)
+        return values_orig.reshape(N, D)
+    else:
+        # Inverse WHT
+        values_flat = values_rot.reshape(N, D)
+        return wht_inverse(values_flat, block_size=bs)

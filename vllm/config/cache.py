@@ -24,6 +24,8 @@ CacheDType = Literal[
     "tq4",
     "tq3w",
     "tq4w",
+    "tq3r",
+    "tq4r",
     "rq2",
     "rq3",
     "rq4",

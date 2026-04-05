@@ -45,6 +45,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "tq4": torch.uint8,
     "tq3w": torch.uint8,
     "tq4w": torch.uint8,
+    "tq3r": torch.uint8,
+    "tq4r": torch.uint8,
     "rq2": torch.uint8,
     "rq3": torch.uint8,
     "rq4": torch.uint8,

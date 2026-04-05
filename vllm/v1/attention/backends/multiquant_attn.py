@@ -61,7 +61,7 @@ class MultiQuantAttentionBackend(AttentionBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "tq3", "tq4", "tq3w", "tq4w", "rq2", "rq3", "rq4",
+        "tq3", "tq4", "tq3w", "tq4w", "tq3r", "tq4r", "rq2", "rq3", "rq4",
     ]
 
     @staticmethod
@@ -230,7 +230,9 @@ class MultiQuantImpl:
         self._packed_size = self._tq_config.key_packed_size
         self._mse_bits = self._tq_config.mse_bits
         self._is_rq = kv_cache_dtype.startswith("rq")
-        self._is_wht = kv_cache_dtype.endswith("w")
+        # WHT-family: block-based format (tq3w/tq4w = Hadamard, tq3r/tq4r = random rotation)
+        self._is_wht = kv_cache_dtype.endswith("w") or kv_cache_dtype.endswith("r")
+        self._is_block_rot = kv_cache_dtype.endswith("r")
 
         if self._is_wht:
             # WHT mode: no Pi/S matrices, no QJL correction
@@ -413,11 +415,14 @@ class MultiQuantImpl:
         k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
         if self._is_wht:
+            pi_blocks = self._get_pi_blocks(layer, device)
             # Try fused CUDA pack kernel (1 launch, graph-safe)
+            # Only available for WHT mode (not block-rot, which needs Pi_blocks)
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
                 _load_wht_pack_kernel,
             )
-            pack_kernel = _load_wht_pack_kernel()
+            pack_kernel = _load_wht_pack_kernel() if not self._is_block_rot \
+                else None
             if pack_kernel is not None:
                 # Max-buffer: allocate once for max batch, slice for current
                 N_vecs = k_flat.shape[0]
@@ -436,11 +441,13 @@ class MultiQuantImpl:
             else:
                 if not hasattr(self, '_wht_pack_fallback_logged'):
                     self._wht_pack_fallback_logged = True
-                    logger.warning("WHT pack: CUDA kernel unavailable, "
-                                   "using Python fallback (SLOW)")
+                    mode = "block-rot" if self._is_block_rot else "WHT"
+                    logger.warning("%s pack: using Python fallback", mode)
                 from vllm.multiquant.turboquant.wht_quantizer import pack_wht
-                k_packed = pack_wht(k_flat.float(), self._tq_config)
-                v_packed = pack_wht(v_flat.float(), self._tq_config)
+                k_packed = pack_wht(
+                    k_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
+                v_packed = pack_wht(
+                    v_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
         elif torch.cuda.is_current_stream_capturing():
             k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
             v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)
@@ -536,6 +543,9 @@ class MultiQuantImpl:
 
         device = query.device
         Pi, S, centroids = self._get_matrices(layer, device)
+        # Cache Pi_blocks for block-rot decode (needs layer reference)
+        if self._is_block_rot:
+            self._get_pi_blocks(layer, device)
         block_size = kv_cache.shape[2]
 
         num_prefill = attn_metadata.num_prefill_tokens
@@ -646,10 +656,13 @@ class MultiQuantImpl:
         dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
 
         if self._is_wht:
-            from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                _load_wht_cuda_kernel,
-            )
-            kernel = _load_wht_cuda_kernel()
+            # CUDA kernel only for pure WHT (not block-rot which needs Pi_blocks)
+            kernel = None
+            if not self._is_block_rot:
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_wht_cuda_kernel,
+                )
+                kernel = _load_wht_cuda_kernel()
             if kernel is not None:
                 # Zero-copy: kernel reads bf16 query, int64 bt/sl directly.
                 # Kernel writes bf16 output directly to vLLM output tensor.
@@ -671,8 +684,8 @@ class MultiQuantImpl:
             else:
                 if not hasattr(self, '_wht_torch_logged'):
                     self._wht_torch_logged = True
-                    logger.warning("WHT decode: CUDA kernel unavailable, "
-                                   "using PyTorch fallback (SLOW)")
+                    mode = "block-rot" if self._is_block_rot else "WHT"
+                    logger.warning("%s decode: using PyTorch fallback", mode)
                 decode_out = self._wht_decode_torch(
                     dq, kv_cache, attn_metadata, num_decode,
                     block_size, D, device)
@@ -927,8 +940,13 @@ class MultiQuantImpl:
         # Unpack: [B*max_sl*Hkv, ps] → [B*max_sl*Hkv, D]
         k_flat = k_packed.reshape(B * max_sl * Hkv, ps)
         v_flat = v_packed.reshape(B * max_sl * Hkv, ps)
-        k_recon = unpack_wht(k_flat, self._tq_config).reshape(B, max_sl, Hkv, D)
-        v_recon = unpack_wht(v_flat, self._tq_config).reshape(B, max_sl, Hkv, D)
+        pi_blk = getattr(self, '_cached_pi_blocks', None)
+        k_recon = unpack_wht(
+            k_flat, self._tq_config, Pi_blocks=pi_blk
+        ).reshape(B, max_sl, Hkv, D)
+        v_recon = unpack_wht(
+            v_flat, self._tq_config, Pi_blocks=pi_blk
+        ).reshape(B, max_sl, Hkv, D)
 
         # GQA expand: [B, T, Hkv, D] → [B, T, Hq, D]
         if self.num_kv_groups > 1:
@@ -987,11 +1005,14 @@ class MultiQuantImpl:
             v_packed = kv_cache[phys_blocks, 1, bo, :, :ps]
 
             # Unpack per head
+            pi_blk = getattr(self, '_cached_pi_blocks', None)
             q_h = dq[qi]  # [num_heads, D]
             head_outputs = []
             for h in range(self.num_kv_heads):
-                k_h = unpack_wht(k_packed[:, h, :], self._tq_config)  # [sl, D]
-                v_h = unpack_wht(v_packed[:, h, :], self._tq_config)  # [sl, D]
+                k_h = unpack_wht(k_packed[:, h, :], self._tq_config,
+                                 Pi_blocks=pi_blk)  # [sl, D]
+                v_h = unpack_wht(v_packed[:, h, :], self._tq_config,
+                                 Pi_blocks=pi_blk)  # [sl, D]
 
                 # GQA: expand to all q-heads in this group
                 kv_group_size = self.num_kv_groups
@@ -1007,9 +1028,20 @@ class MultiQuantImpl:
 
         return torch.stack(outputs)  # [num_decode, num_heads, D]
 
+    def _get_pi_blocks(self, layer, device):
+        """Get cached block rotation matrices for tq3r/tq4r. None for WHT."""
+        if not self._is_block_rot:
+            return None
+        if not hasattr(layer, '_tq_Pi_blocks_f32'):
+            layer._tq_Pi_blocks_f32 = (
+                layer._tq_Pi_blocks.to(device).float().contiguous())
+        # Also cache on self for use in decode (which doesn't get layer)
+        self._cached_pi_blocks = layer._tq_Pi_blocks_f32
+        return layer._tq_Pi_blocks_f32
+
     def _get_matrices(self, layer, device):
         if self._is_wht:
-            # WHT mode: no Pi/S, only centroids
+            # WHT/block-rot mode: no Pi/S, only centroids (+ Pi_blocks for tq3r)
             if not hasattr(layer, '_tq_c_f32'):
                 from vllm.multiquant.shared.centroids import get_wht_centroids
                 c = get_wht_centroids(self._mse_bits).to(device)

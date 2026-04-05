@@ -11,10 +11,12 @@ from vllm.multiquant.base import KVQuantizerConfig
 
 @dataclass
 class TurboQuantWHTConfig(KVQuantizerConfig):
-    """Configuration for WHT-based TurboQuant KV-cache quantization.
+    """Configuration for WHT/block-rotation TurboQuant KV-cache quantization.
 
-    Uses Walsh-Hadamard Transform on fixed-size blocks instead of
-    full D×D random orthogonal rotation. No per-layer state needed.
+    Uses Walsh-Hadamard Transform (tq3w/tq4w) or block-diagonal random
+    orthogonal rotation (tq3r/tq4r) on fixed-size blocks instead of
+    full D×D random orthogonal rotation. WHT needs no per-layer state;
+    random rotation stores [n_blocks, block_size, block_size] per layer.
 
     Block format (per block_size values):
         qs: lower 2 bits of 3-bit indices (block_size/4 bytes)
@@ -22,6 +24,7 @@ class TurboQuantWHTConfig(KVQuantizerConfig):
         gamma: per-block FP16 scale factor (2 bytes)
     """
     block_size: int = 32  # WHT block size (must be power of 2)
+    rotation_type: str = "wht"  # "wht" (Hadamard) or "random" (block-diagonal)
 
     @property
     def mse_bits(self) -> int:
@@ -67,13 +70,18 @@ class TurboQuantWHTConfig(KVQuantizerConfig):
     def from_cache_dtype(
         cls, cache_dtype: str, head_dim: int
     ) -> TurboQuantWHTConfig:
-        """Parse dtype string like 'tq3w', 'tq3w:bs64'."""
-        # Strip 'w' suffix and optional block_size
-        base = cache_dtype.rstrip('w').replace('tq', '')
+        """Parse dtype string like 'tq3w', 'tq3r', 'tq3w:bs64'."""
+        # Determine rotation type from suffix: 'w' = WHT, 'r' = random
+        base_dtype = cache_dtype.split(':')[0] if ':' in cache_dtype else cache_dtype
+        if base_dtype.endswith('r'):
+            rotation_type = "random"
+        else:
+            rotation_type = "wht"
+        # Strip suffix and 'tq' prefix to get bits
+        base = base_dtype.rstrip('wr').replace('tq', '')
         block_size = 32  # default
         if ':' in cache_dtype:
             parts = cache_dtype.split(':')
-            base = parts[0].rstrip('w').replace('tq', '')
             for p in parts[1:]:
                 if p.startswith('bs'):
                     block_size = int(p[2:])
@@ -86,4 +94,5 @@ class TurboQuantWHTConfig(KVQuantizerConfig):
             head_dim=head_dim,
             total_bits=total_bits,
             block_size=block_size,
+            rotation_type=rotation_type,
         )

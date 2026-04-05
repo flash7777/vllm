@@ -30,6 +30,33 @@ def generate_rotation_matrix(
     return Q.contiguous().to(device)
 
 
+def generate_block_rotation_matrices(
+    d: int, block_size: int, seed: int,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Generate block-diagonal rotation matrices.
+
+    Returns [n_blocks, block_size, block_size] tensor of independent
+    Haar-distributed random orthogonal matrices. Each block is seeded
+    deterministically: seed + block_idx * 7919.
+
+    For D=256, block_size=32: 8 blocks × 32×32 × 4 bytes = 32 KB.
+    """
+    n_blocks = d // block_size
+    blocks = torch.empty(n_blocks, block_size, block_size,
+                         dtype=torch.float32, device="cpu")
+    for i in range(n_blocks):
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed + i * 7919)
+        G = torch.randn(block_size, block_size, generator=gen,
+                         device="cpu", dtype=torch.float32)
+        Q, R = torch.linalg.qr(G)
+        diag_sign = torch.sign(torch.diag(R))
+        diag_sign[diag_sign == 0] = 1.0
+        blocks[i] = Q * diag_sign.unsqueeze(0)
+    return blocks.contiguous().to(device)
+
+
 from vllm.multiquant.shared.qjl import generate_qjl_matrix  # noqa: F401
 
 

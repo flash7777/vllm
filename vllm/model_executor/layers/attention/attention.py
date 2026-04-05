@@ -407,7 +407,22 @@ class Attention(nn.Module, AttentionLayerBase):
         from vllm.multiquant.shared.centroids import get_centroids
 
         # Dispatch rotation based on quantizer type
-        if cache_dtype.endswith("w"):
+        if cache_dtype.endswith("r"):
+            # Block-diagonal random rotation mode (tq3r/tq4r)
+            from vllm.multiquant.shared.centroids import get_wht_centroids
+            from vllm.multiquant.turboquant.quantizer import (
+                generate_block_rotation_matrices,
+            )
+            block_size = getattr(mq_config, 'block_size', 32)
+            self.register_buffer(
+                "_tq_Pi_blocks",
+                generate_block_rotation_matrices(
+                    head_size, block_size, seed=seed))
+            self.register_buffer(
+                "_tq_centroids",
+                get_wht_centroids(mq_config.mse_bits))
+            self._tq_use_wht = True  # same format/code path as WHT
+        elif cache_dtype.endswith("w"):
             # WHT mode: no Pi/S matrices needed (WHT is deterministic)
             from vllm.multiquant.shared.centroids import get_wht_centroids
             self.register_buffer(
