@@ -73,7 +73,20 @@ Offline-Benchmark (kein HTTP/Scheduler-Overhead), 5 Runs avg:
 | tq3w     | **41.2**   | 788✓ | ✓      | 2.3× less | 3-bit WHT, Split-KV, fused pack-to-cache |
 | tq3r     | 34.7       | 788✓ | ✓      | 2.3× less | Block-rot 32×32, fused CUDA pack+decode |
 
-tq3w = **82% of FP8 speed** mit **2.3× weniger KV-Cache Speicher**.
+tq2w = **96% of FP8** mit **3.2× weniger KV**, tq3w = **95%** mit **2.3× weniger**.
+
+## Serve-Mode Benchmarks (bench.py, HTTP, GLM-4.7-Flash)
+
+| Modell-Quant | Archer Gewichte | KV-Cache | tok/s (s/m/l) | Math |
+|-------------|-----------------|----------|---------------|------|
+| **INT4 AutoRound** | — | tq3w | **45/51/47** | 70% |
+| FP8 | — | tq3w | 34/40/38 | 80% |
+| FP8 | — | tq2w | 35/40/38 | 60% |
+| BF16 | TQ3 (cos=0.63) | tq3w | ~0.2 (eager) | **Müll** (7×8=10.12) |
+
+Math%: GLM-4.7 Prompt-Varianz bei n=10 (nicht KV-bezogen).
+INT4+tq3w ist schnellste Kombi weil INT4 weniger VRAM → mehr KV-Cache-Headroom.
+Archer TQ3 Gewichte produzieren Müll — cos=0.63 zu niedrig für korrekte Inference.
 
 ### Kernel-Level Profiling (CUDA Event Timing, B=1, D=256, 40 Layers)
 
