@@ -710,25 +710,23 @@ class MultiQuantImpl:
                 )
                 skv_kernel = _load_splitkv_decode_kernel()
                 if skv_kernel is not None:
-                    # num_splits: aim for ~8 positions per split
                     NUM_SPLITS = 8
                     num_qh = num_decode * self.num_heads
-                    # Pre-allocate split buffer (once, max size)
-                    buf_key = (num_qh, NUM_SPLITS, D)
-                    if not hasattr(self, '_split_buf') or \
-                            getattr(self, '_split_buf_key', None) != buf_key:
-                        max_qh = max(num_qh, 256 * self.num_heads)
+                    # Pre-allocate ONCE. Max 32 batch × heads to limit memory.
+                    # Larger batches fall through to original kernel.
+                    MAX_DECODE_QH = 32 * self.num_heads
+                    if not hasattr(self, '_split_buf'):
                         self._split_buf = torch.empty(
-                            max_qh, NUM_SPLITS, D + 2,
+                            MAX_DECODE_QH, NUM_SPLITS, D + 2,
                             dtype=torch.float32, device=device)
-                        self._split_buf_key = buf_key
-                    split_buf = self._split_buf[:num_qh]
-                    skv_kernel.tq_wht_splitkv_decode(
-                        dq, kv_cache, bt, sl,
-                        split_buf, out_3d,
-                        D, self._mse_bits, self.scale,
-                        s_b, s_kv, s_s, s_h, NUM_SPLITS)
-                    splitkv_ok = True
+                    if num_qh <= MAX_DECODE_QH:
+                        split_buf = self._split_buf[:num_qh]
+                        skv_kernel.tq_wht_splitkv_decode(
+                            dq, kv_cache, bt, sl,
+                            split_buf, out_3d,
+                            D, self._mse_bits, self.scale,
+                            s_b, s_kv, s_s, s_h, NUM_SPLITS)
+                        splitkv_ok = True
 
             if not splitkv_ok:
                 # Fallback: original single-block kernel
