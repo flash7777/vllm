@@ -411,38 +411,67 @@ class MultiQuantImpl:
                     n_valid, n_zero,
                     sm[:8].tolist(), fc_info)
 
-        # Pack K/V
+        # Pack K/V and write to KV cache
         k_flat = key.reshape(-1, D)
         v_flat = value.reshape(-1, D)
+        s_b = kv_cache.stride(0)
+        s_kv = kv_cache.stride(1)
+        s_s = kv_cache.stride(2)
+        s_h = kv_cache.stride(3)
+        # slot_mapping must be int32 for CUDA kernels
+        sm32 = slot_mapping.int() if slot_mapping.dtype != torch.int32 \
+            else slot_mapping
+
         if self._is_wht:
             pi_blocks = self._get_pi_blocks(layer, device)
-            # Max-buffer: allocate once for max batch, slice for current
-            N_vecs = k_flat.shape[0]
-            ps = self._packed_size
-            if not hasattr(self, '_pack_k_buf') or \
-                    self._pack_k_buf.shape[0] < N_vecs:
-                max_n = max(N_vecs, 256 * self.num_kv_heads)
-                self._pack_k_buf = torch.empty(
-                    max_n, ps, dtype=torch.uint8, device=device)
-                self._pack_v_buf = torch.empty(
-                    max_n, ps, dtype=torch.uint8, device=device)
-            k_packed = self._pack_k_buf[:N_vecs]
-            v_packed = self._pack_v_buf[:N_vecs]
 
+            # Try fused pack-to-cache (1 kernel = pack + scatter, no temp buffer)
+            fused_ok = False
             if self._is_block_rot:
-                # Block-rotation CUDA pack kernel
                 from vllm.v1.attention.ops.triton_mq_fused_decode import (
                     _load_blockrot_pack_kernel,
                 )
-                brot_pack = _load_blockrot_pack_kernel()
-                if brot_pack is not None:
-                    brot_pack.tq_blockrot_pack(k_flat, pi_blocks, k_packed)
-                    brot_pack.tq_blockrot_pack(v_flat, pi_blocks, v_packed)
+                pk = _load_blockrot_pack_kernel()
+                if pk is not None and hasattr(pk, 'tq_blockrot_pack_to_cache'):
+                    pk.tq_blockrot_pack_to_cache(
+                        key, pi_blocks, kv_cache, sm32, 0,
+                        s_b, s_kv, s_s, s_h)
+                    pk.tq_blockrot_pack_to_cache(
+                        value, pi_blocks, kv_cache, sm32, 1,
+                        s_b, s_kv, s_s, s_h)
+                    fused_ok = True
+            else:
+                from vllm.v1.attention.ops.triton_mq_fused_decode import (
+                    _load_wht_pack_kernel,
+                )
+                pk = _load_wht_pack_kernel()
+                if pk is not None and hasattr(pk, 'tq_wht_pack_to_cache'):
+                    pk.tq_wht_pack_to_cache(
+                        key, kv_cache, sm32, 0, s_b, s_kv, s_s, s_h)
+                    pk.tq_wht_pack_to_cache(
+                        value, kv_cache, sm32, 1, s_b, s_kv, s_s, s_h)
+                    fused_ok = True
+
+            if not fused_ok:
+                # Fallback: pack to buffer + scatter
+                N_vecs = k_flat.shape[0]
+                ps = self._packed_size
+                if not hasattr(self, '_pack_k_buf') or \
+                        self._pack_k_buf.shape[0] < N_vecs:
+                    max_n = max(N_vecs, 256 * self.num_kv_heads)
+                    self._pack_k_buf = torch.empty(
+                        max_n, ps, dtype=torch.uint8, device=device)
+                    self._pack_v_buf = torch.empty(
+                        max_n, ps, dtype=torch.uint8, device=device)
+                k_packed = self._pack_k_buf[:N_vecs]
+                v_packed = self._pack_v_buf[:N_vecs]
+                if self._is_block_rot and pk is not None:
+                    pk.tq_blockrot_pack(k_flat, pi_blocks, k_packed)
+                    pk.tq_blockrot_pack(v_flat, pi_blocks, v_packed)
+                elif not self._is_block_rot and pk is not None:
+                    pk.tq_wht_pack(k_flat, k_packed)
+                    pk.tq_wht_pack(v_flat, v_packed)
                 else:
-                    if not hasattr(self, '_brot_pack_fallback_logged'):
-                        self._brot_pack_fallback_logged = True
-                        logger.warning("block-rot pack: CUDA unavailable, "
-                                       "Python fallback")
                     from vllm.multiquant.turboquant.wht_quantizer import (
                         pack_wht,
                     )
@@ -450,47 +479,34 @@ class MultiQuantImpl:
                         k_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
                     v_packed = pack_wht(
                         v_flat.float(), self._tq_config, Pi_blocks=pi_blocks)
-            else:
-                # WHT CUDA pack kernel
-                from vllm.v1.attention.ops.triton_mq_fused_decode import (
-                    _load_wht_pack_kernel,
-                )
-                wht_pack = _load_wht_pack_kernel()
-                if wht_pack is not None:
-                    wht_pack.tq_wht_pack(k_flat, k_packed)
-                    wht_pack.tq_wht_pack(v_flat, v_packed)
-                else:
-                    if not hasattr(self, '_wht_pack_fallback_logged'):
-                        self._wht_pack_fallback_logged = True
-                        logger.warning("WHT pack: CUDA unavailable, "
-                                       "Python fallback")
-                    from vllm.multiquant.turboquant.wht_quantizer import (
-                        pack_wht,
-                    )
-                    k_packed = pack_wht(k_flat.float(), self._tq_config)
-                    v_packed = pack_wht(v_flat.float(), self._tq_config)
+
+                k_packed = k_packed.reshape(num_tokens, num_heads, -1)
+                v_packed = v_packed.reshape(num_tokens, num_heads, -1)
+                slots_clamped = slot_mapping.clamp(min=0)
+                bi = slots_clamped // block_size
+                bo = slots_clamped % block_size
+                kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed
+                kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed
         elif torch.cuda.is_current_stream_capturing():
             k_packed = self._torch_pack(k_flat, Pi, S, centroids, D, device)
             v_packed = self._torch_pack(v_flat, Pi, S, centroids, D, device)
+            k_packed = k_packed.reshape(num_tokens, num_heads, -1)
+            v_packed = v_packed.reshape(num_tokens, num_heads, -1)
+            slots_clamped = slot_mapping.clamp(min=0)
+            bi = slots_clamped // block_size
+            bo = slots_clamped % block_size
+            kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed
+            kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed
         else:
             k_packed = self._pack_batch(k_flat, Pi, S, centroids, D)
             v_packed = self._pack_batch(v_flat, Pi, S, centroids, D)
-
-        if _mq_dbg and _kv_cnt < 3:
-            logger.info("[MQ_KV] L%02d packed: k=%s v=%s ps=%d",
-                        _lid, list(k_packed.shape), list(v_packed.shape),
-                        self._packed_size)
-
-        k_packed = k_packed.reshape(num_tokens, num_heads, -1)
-        v_packed = v_packed.reshape(num_tokens, num_heads, -1)
-
-        # Write to cache via slot_mapping (graph-safe: no boolean indexing)
-        # Clamp -1 slots to 0 (writes to block 0, offset 0 — harmless padding)
-        slots_clamped = slot_mapping.clamp(min=0)
-        bi = slots_clamped // block_size
-        bo = slots_clamped % block_size
-        kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed
-        kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed
+            k_packed = k_packed.reshape(num_tokens, num_heads, -1)
+            v_packed = v_packed.reshape(num_tokens, num_heads, -1)
+            slots_clamped = slot_mapping.clamp(min=0)
+            bi = slots_clamped // block_size
+            bo = slots_clamped % block_size
+            kv_cache[bi, 0, bo, :, :self._packed_size] = k_packed
+            kv_cache[bi, 1, bo, :, :self._packed_size] = v_packed
 
         if _mq_dbg and _kv_cnt < 3:
             # Verify: read back what we just wrote
