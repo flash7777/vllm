@@ -53,6 +53,19 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
+// 2-bit thresholds and outermost centroid
+__constant__ float WHT_THRESHOLDS_2BIT[3] = {-0.9816f, 0.0f, 0.9816f};
+static constexpr float WHT_OUTERMOST_2BIT = 1.5104f;
+
+// 2-bit threshold quantization: returns index 0-3
+__device__ __forceinline__ int threshold_quantize_2bit(float x) {
+    int idx = 0;
+    if (x > WHT_THRESHOLDS_2BIT[0]) idx = 1;
+    if (x > WHT_THRESHOLDS_2BIT[1]) idx = 2;
+    if (x > WHT_THRESHOLDS_2BIT[2]) idx = 3;
+    return idx;
+}
+
 // 3-bit threshold quantization: returns index 0-7
 __device__ __forceinline__ int threshold_quantize_3bit(float x) {
     int idx = 0;
@@ -143,66 +156,63 @@ __global__ void tq_wht_pack_kernel(
 // Same quantization as above, but writes directly to KV cache via slot_mapping.
 // Eliminates the separate scatter tensor op.
 // Grid: (num_tokens, D/32), each token processes all its heads sequentially.
-template <int HEAD_DIM, int BLOCK_SIZE = 32>
+template <int HEAD_DIM, int MSE_BITS, int BLOCK_SIZE = 32>
 __global__ void tq_wht_pack_to_cache_kernel(
     const __nv_bfloat16* __restrict__ input,  // [num_tokens, num_heads, D] bf16
-    uint8_t* __restrict__ kv_cache,            // flat KV cache
-    const int* __restrict__ slot_mapping,      // [num_tokens] int32
+    uint8_t* __restrict__ kv_cache,
+    const int* __restrict__ slot_mapping,
     int num_tokens,
     int num_heads,
-    int kv_idx,           // 0=K, 1=V
-    int block_size_kv,    // KV cache block size (e.g. 16)
-    int packed_size,      // bytes per head
-    // KV cache strides (in elements, not bytes)
-    int stride_block,     // stride for cache block dimension
-    int stride_kv,        // stride for K/V dimension
-    int stride_slot,      // stride for slot-within-block
-    int stride_head       // stride for head dimension
+    int kv_idx,
+    int block_size_kv,
+    int packed_size,
+    int stride_block,
+    int stride_kv,
+    int stride_slot,
+    int stride_head
 ) {
-    constexpr int BYTES_PER_BLOCK = 14;
+    constexpr int BYTES_PER_BLOCK = (MSE_BITS == 2) ? 10 : (MSE_BITS == 3) ? 14 : 18;
+    constexpr float OUTERMOST = (MSE_BITS == 2) ? 1.5104f : (MSE_BITS == 3) ? 2.1519f : 2.7326f;
 
     int token_idx = blockIdx.x;
     int wht_block = blockIdx.y;
     int lane = threadIdx.x;
 
     if (token_idx >= num_tokens) return;
-
     int slot = slot_mapping[token_idx];
-    if (slot < 0) return;  // padding slot
+    if (slot < 0) return;
 
     int bi = slot / block_size_kv;
     int bo = slot % block_size_kv;
 
-    // Process each head sequentially
     for (int head = 0; head < num_heads; head++) {
-        // Load bf16 input
         float val = __bfloat162float(
             input[(token_idx * num_heads + head) * HEAD_DIM
                   + wht_block * BLOCK_SIZE + lane]);
 
-        // WHT forward
         val = warp_wht_forward(val, lane);
 
-        // Per-block amax
         float amax = warp_reduce_max(fabsf(val));
         amax = fmaxf(amax, 1e-10f);
 
-        // Gamma + normalize + quantize
-        float gamma = amax / 2.1519f;
+        float gamma = amax / OUTERMOST;
         float normalized = val / gamma;
-        int idx = threshold_quantize_3bit(normalized);
 
-        // Write directly to KV cache
+        int idx;
+        if constexpr (MSE_BITS == 2) {
+            idx = threshold_quantize_2bit(normalized);
+        } else {
+            idx = threshold_quantize_3bit(normalized);
+        }
+
         uint8_t* out = kv_cache
-            + bi * stride_block
-            + kv_idx * stride_kv
-            + bo * stride_slot
-            + head * stride_head
+            + bi * stride_block + kv_idx * stride_kv
+            + bo * stride_slot + head * stride_head
             + wht_block * BYTES_PER_BLOCK;
 
-        // Bitpack (identical to original)
-        int low2 = idx & 0x3;
-        {
+        if constexpr (MSE_BITS == 2) {
+            // 2-bit: 4 indices per byte → 8 bytes for 32 values + 2 gamma
+            int low2 = idx & 0x3;
             int base = (lane / 4) * 4;
             int b0 = __shfl_sync(0xffffffff, low2, base);
             int b1 = __shfl_sync(0xffffffff, low2, base + 1);
@@ -210,23 +220,39 @@ __global__ void tq_wht_pack_to_cache_kernel(
             int b3 = __shfl_sync(0xffffffff, low2, base + 3);
             if (lane % 4 == 0)
                 out[lane / 4] = (uint8_t)(b0 | (b1 << 2) | (b2 << 4) | (b3 << 6));
-        }
-
-        int hi1 = (idx >> 2) & 1;
-        {
-            int base = (lane / 8) * 8;
-            int byte_val = 0;
-            for (int k = 0; k < 8; k++)
-                byte_val |= (__shfl_sync(0xffffffff, hi1, base + k) << k);
-            if (lane % 8 == 0)
-                out[8 + lane / 8] = (uint8_t)(byte_val & 0xFF);
-        }
-
-        if (lane == 0) {
-            __half gamma_h = __float2half(gamma);
-            uint16_t gamma_u16 = *reinterpret_cast<uint16_t*>(&gamma_h);
-            out[12] = (uint8_t)(gamma_u16 & 0xFF);
-            out[13] = (uint8_t)((gamma_u16 >> 8) & 0xFF);
+            if (lane == 0) {
+                __half gamma_h = __float2half(gamma);
+                uint16_t gamma_u16 = *reinterpret_cast<uint16_t*>(&gamma_h);
+                out[8] = (uint8_t)(gamma_u16 & 0xFF);
+                out[9] = (uint8_t)((gamma_u16 >> 8) & 0xFF);
+            }
+        } else if constexpr (MSE_BITS == 3) {
+            // 3-bit: qs[8] + qr[4] + gamma[2] = 14 bytes
+            int low2 = idx & 0x3;
+            {
+                int base = (lane / 4) * 4;
+                int b0 = __shfl_sync(0xffffffff, low2, base);
+                int b1 = __shfl_sync(0xffffffff, low2, base + 1);
+                int b2 = __shfl_sync(0xffffffff, low2, base + 2);
+                int b3 = __shfl_sync(0xffffffff, low2, base + 3);
+                if (lane % 4 == 0)
+                    out[lane / 4] = (uint8_t)(b0 | (b1 << 2) | (b2 << 4) | (b3 << 6));
+            }
+            int hi1 = (idx >> 2) & 1;
+            {
+                int base = (lane / 8) * 8;
+                int byte_val = 0;
+                for (int k = 0; k < 8; k++)
+                    byte_val |= (__shfl_sync(0xffffffff, hi1, base + k) << k);
+                if (lane % 8 == 0)
+                    out[8 + lane / 8] = (uint8_t)(byte_val & 0xFF);
+            }
+            if (lane == 0) {
+                __half gamma_h = __float2half(gamma);
+                uint16_t gamma_u16 = *reinterpret_cast<uint16_t*>(&gamma_h);
+                out[12] = (uint8_t)(gamma_u16 & 0xFF);
+                out[13] = (uint8_t)((gamma_u16 >> 8) & 0xFF);
+            }
         }
     }
 }
@@ -272,7 +298,8 @@ void tq_wht_pack_to_cache(
     int stride_block,
     int stride_kv,
     int stride_slot,
-    int stride_head
+    int stride_head,
+    int mse_bits                 // 2 or 3
 ) {
     TORCH_CHECK(input.dim() == 3, "input must be 3D [tokens, heads, D]");
     TORCH_CHECK(input.dtype() == torch::kBFloat16, "input must be bfloat16");
@@ -282,25 +309,29 @@ void tq_wht_pack_to_cache(
     int num_heads = input.size(1);
     int D = input.size(2);
     int block_size_kv = kv_cache.size(2);
-    int packed_size = (D / 32) * 14;
+    int bpb = (mse_bits == 2) ? 10 : (mse_bits == 3) ? 14 : 18;
+    int packed_size = (D / 32) * bpb;
 
     dim3 grid(num_tokens, D / 32);
     dim3 block(32);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    #define PACK_CACHE_LAUNCH(HD) \
-        tq_wht_pack_to_cache_kernel<HD><<<grid, block, 0, stream>>>( \
+    #define PACK_CACHE_LAUNCH(HD, MB) \
+        tq_wht_pack_to_cache_kernel<HD, MB><<<grid, block, 0, stream>>>( \
             reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()), \
             kv_cache.data_ptr<uint8_t>(), \
             slot_mapping.data_ptr<int>(), \
             num_tokens, num_heads, kv_idx, block_size_kv, packed_size, \
             stride_block, stride_kv, stride_slot, stride_head)
 
-    if (D == 256) { PACK_CACHE_LAUNCH(256); }
-    else if (D == 128) { PACK_CACHE_LAUNCH(128); }
-    else if (D == 64) { PACK_CACHE_LAUNCH(64); }
-    else if (D == 512) { PACK_CACHE_LAUNCH(512); }
-    else { TORCH_CHECK(false, "tq_wht_pack_to_cache: unsupported D=", D); }
+    if (D == 256 && mse_bits == 2) { PACK_CACHE_LAUNCH(256, 2); }
+    else if (D == 256 && mse_bits == 3) { PACK_CACHE_LAUNCH(256, 3); }
+    else if (D == 128 && mse_bits == 2) { PACK_CACHE_LAUNCH(128, 2); }
+    else if (D == 128 && mse_bits == 3) { PACK_CACHE_LAUNCH(128, 3); }
+    else if (D == 64 && mse_bits == 2) { PACK_CACHE_LAUNCH(64, 2); }
+    else if (D == 64 && mse_bits == 3) { PACK_CACHE_LAUNCH(64, 3); }
+    else { TORCH_CHECK(false, "tq_wht_pack_to_cache: unsupported D=", D,
+                        " mse_bits=", mse_bits); }
     #undef PACK_CACHE_LAUNCH
 }
 

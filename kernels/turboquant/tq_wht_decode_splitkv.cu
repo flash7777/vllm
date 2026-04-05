@@ -30,6 +30,10 @@ __constant__ float SKV_WHT_SIGNS[32] = {
     +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1,
 };
 
+__constant__ float SKV_CENTROIDS_2BIT[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f,
+};
+
 __constant__ float SKV_CENTROIDS_3BIT[8] = {
     -2.1519f, -1.3439f, -0.7560f, -0.2451f,
      0.2451f,  0.7560f,  1.3439f,  2.1519f,
@@ -106,7 +110,7 @@ __global__ void tq_wht_splitkv_stage1(
     const int tid = threadIdx.x;
     constexpr int D = HEAD_DIM;
     constexpr int N_BLOCKS_WHT = D / BLOCK_SIZE;
-    constexpr int BYTES_PER_BLOCK = (MSE_BITS == 3) ? 14 : (MSE_BITS == 4) ? 18 : 0;
+    constexpr int BYTES_PER_BLOCK = (MSE_BITS == 2) ? 10 : (MSE_BITS == 3) ? 14 : (MSE_BITS == 4) ? 18 : 0;
     constexpr int SPLIT_STRIDE = D + 2;  // v_acc[D] + m + d
 
     const int warp_id = tid / WARP_SIZE;
@@ -142,7 +146,8 @@ __global__ void tq_wht_splitkv_stage1(
         my_q_wht = skv_warp_wht_forward(my_q_wht, lane);
     }
 
-    const float* centroids = (MSE_BITS == 3) ? SKV_CENTROIDS_3BIT : SKV_CENTROIDS_4BIT;
+    const float* centroids = (MSE_BITS == 2) ? SKV_CENTROIDS_2BIT :
+                             (MSE_BITS == 3) ? SKV_CENTROIDS_3BIT : SKV_CENTROIDS_4BIT;
 
     // Online softmax state (local to this split)
     float m_prev = -INFINITY;
@@ -171,7 +176,12 @@ __global__ void tq_wht_splitkv_stage1(
             const uint8_t* k_block = kv_cache + k_base + wht_block * BYTES_PER_BLOCK;
 
             int idx;
-            if constexpr (MSE_BITS == 3) {
+            if constexpr (MSE_BITS == 2) {
+                // 2-bit: 4 indices per byte, 8 bytes for 32 values
+                int byte_idx = lane / 4;
+                int shift = (lane % 4) * 2;
+                idx = (k_block[byte_idx] >> shift) & 0x3;
+            } else if constexpr (MSE_BITS == 3) {
                 int qs_byte = lane / 4;
                 int qs_shift = (lane % 4) * 2;
                 int low2 = (k_block[qs_byte] >> qs_shift) & 0x3;
@@ -226,7 +236,11 @@ __global__ void tq_wht_splitkv_stage1(
             const uint8_t* v_block = kv_cache + v_base + wht_block * BYTES_PER_BLOCK;
 
             int v_idx;
-            if constexpr (MSE_BITS == 3) {
+            if constexpr (MSE_BITS == 2) {
+                int byte_idx = lane / 4;
+                int shift = (lane % 4) * 2;
+                v_idx = (v_block[byte_idx] >> shift) & 0x3;
+            } else if constexpr (MSE_BITS == 3) {
                 int qs_byte = lane / 4;
                 int qs_shift = (lane % 4) * 2;
                 int low2 = (v_block[qs_byte] >> qs_shift) & 0x3;
@@ -355,10 +369,13 @@ void tq_wht_splitkv_decode(
                 stride_block, stride_kv, stride_slot, stride_head, \
                 num_splits);
 
-        if (head_dim == 256 && mse_bits == 3) { LAUNCH_S1(256, 3); }
-        else if (head_dim == 128 && mse_bits == 3) { LAUNCH_S1(128, 3); }
+        if (head_dim == 256 && mse_bits == 2) { LAUNCH_S1(256, 2); }
+        else if (head_dim == 256 && mse_bits == 3) { LAUNCH_S1(256, 3); }
         else if (head_dim == 256 && mse_bits == 4) { LAUNCH_S1(256, 4); }
+        else if (head_dim == 128 && mse_bits == 2) { LAUNCH_S1(128, 2); }
+        else if (head_dim == 128 && mse_bits == 3) { LAUNCH_S1(128, 3); }
         else if (head_dim == 128 && mse_bits == 4) { LAUNCH_S1(128, 4); }
+        else if (head_dim == 64 && mse_bits == 2) { LAUNCH_S1(64, 2); }
         else if (head_dim == 64 && mse_bits == 3) { LAUNCH_S1(64, 3); }
         else if (head_dim == 64 && mse_bits == 4) { LAUNCH_S1(64, 4); }
         else {

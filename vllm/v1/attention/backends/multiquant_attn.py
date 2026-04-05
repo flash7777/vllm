@@ -61,7 +61,7 @@ class MultiQuantAttentionBackend(AttentionBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "tq3", "tq4", "tq3w", "tq4w", "tq3r", "tq4r", "rq2", "rq3", "rq4",
+        "tq3", "tq4", "tq2w", "tq3w", "tq4w", "tq3r", "tq4r", "rq2", "rq3", "rq4",
     ]
 
     @staticmethod
@@ -447,9 +447,11 @@ class MultiQuantImpl:
                 pk = _load_wht_pack_kernel()
                 if pk is not None and hasattr(pk, 'tq_wht_pack_to_cache'):
                     pk.tq_wht_pack_to_cache(
-                        key, kv_cache, sm32, 0, s_b, s_kv, s_s, s_h)
+                        key, kv_cache, sm32, 0,
+                        s_b, s_kv, s_s, s_h, self._mse_bits)
                     pk.tq_wht_pack_to_cache(
-                        value, kv_cache, sm32, 1, s_b, s_kv, s_s, s_h)
+                        value, kv_cache, sm32, 1,
+                        s_b, s_kv, s_s, s_h, self._mse_bits)
                     fused_ok = True
 
             if not fused_ok:

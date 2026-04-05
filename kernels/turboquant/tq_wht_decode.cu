@@ -75,6 +75,11 @@ __device__ __forceinline__ float warp_wht_inverse(float val, int lane) {
     return val;
 }
 
+// 2-bit centroids for N(0,1) Lloyd-Max
+__constant__ float WHT_CENTROIDS_2BIT[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f,
+};
+
 // 3-bit centroids for N(0,1) Lloyd-Max (must match Python)
 __constant__ float WHT_CENTROIDS_3BIT[8] = {
     -2.1519f, -1.3439f, -0.7560f, -0.2451f,
@@ -124,7 +129,7 @@ __global__ void tq_wht_fused_decode_kernel(
     const int tid = threadIdx.x;
     constexpr int D = HEAD_DIM;
     constexpr int N_BLOCKS_WHT = D / BLOCK_SIZE;  // number of WHT blocks per vector
-    constexpr int BYTES_PER_BLOCK = (MSE_BITS == 3) ? 14 : (MSE_BITS == 4) ? 18 : 0;
+    constexpr int BYTES_PER_BLOCK = (MSE_BITS == 2) ? 10 : (MSE_BITS == 3) ? 14 : (MSE_BITS == 4) ? 18 : 0;
 
     // Which WHT block and lane within that block
     const int warp_id = tid / WARP_SIZE;
@@ -148,7 +153,8 @@ __global__ void tq_wht_fused_decode_kernel(
     }
 
     // Centroids pointer
-    const float* centroids = (MSE_BITS == 3) ? WHT_CENTROIDS_3BIT : WHT_CENTROIDS_4BIT;
+    const float* centroids = (MSE_BITS == 2) ? WHT_CENTROIDS_2BIT :
+                             (MSE_BITS == 3) ? WHT_CENTROIDS_3BIT : WHT_CENTROIDS_4BIT;
 
     // Online softmax state
     float m_prev = -INFINITY;
@@ -175,7 +181,11 @@ __global__ void tq_wht_fused_decode_kernel(
 
             // Unpack index for this lane
             int idx;
-            if constexpr (MSE_BITS == 3) {
+            if constexpr (MSE_BITS == 2) {
+                int byte_idx = lane / 4;
+                int shift = (lane % 4) * 2;
+                idx = (k_block[byte_idx] >> shift) & 0x3;
+            } else if constexpr (MSE_BITS == 3) {
                 // 3-bit split: lower 2 bits in qs[8], upper 1 bit in qr[4]
                 int qs_byte = lane / 4;
                 int qs_shift = (lane % 4) * 2;
@@ -243,7 +253,11 @@ __global__ void tq_wht_fused_decode_kernel(
 
             // Unpack V index
             int v_idx;
-            if constexpr (MSE_BITS == 3) {
+            if constexpr (MSE_BITS == 2) {
+                int byte_idx = lane / 4;
+                int shift = (lane % 4) * 2;
+                v_idx = (v_block[byte_idx] >> shift) & 0x3;
+            } else if constexpr (MSE_BITS == 3) {
                 int qs_byte = lane / 4;
                 int qs_shift = (lane % 4) * 2;
                 int low2 = (v_block[qs_byte] >> qs_shift) & 0x3;
@@ -328,16 +342,16 @@ void tq_wht_fused_decode_attention(
             max_blocks, attn_scale, \
             stride_block, stride_kv, stride_slot, stride_head);
 
-    // HEAD_DIM=128
-    if (head_dim == 128 && mse_bits == 3) { LAUNCH_WHT(128, 3); }
+    if (head_dim == 128 && mse_bits == 2) { LAUNCH_WHT(128, 2); }
+    else if (head_dim == 128 && mse_bits == 3) { LAUNCH_WHT(128, 3); }
     else if (head_dim == 128 && mse_bits == 4) { LAUNCH_WHT(128, 4); }
-    // HEAD_DIM=256
+    else if (head_dim == 256 && mse_bits == 2) { LAUNCH_WHT(256, 2); }
     else if (head_dim == 256 && mse_bits == 3) { LAUNCH_WHT(256, 3); }
     else if (head_dim == 256 && mse_bits == 4) { LAUNCH_WHT(256, 4); }
-    // HEAD_DIM=64
+    else if (head_dim == 64 && mse_bits == 2) { LAUNCH_WHT(64, 2); }
     else if (head_dim == 64 && mse_bits == 3) { LAUNCH_WHT(64, 3); }
     else if (head_dim == 64 && mse_bits == 4) { LAUNCH_WHT(64, 4); }
-    // HEAD_DIM=512
+    else if (head_dim == 512 && mse_bits == 2) { LAUNCH_WHT(512, 2); }
     else if (head_dim == 512 && mse_bits == 3) { LAUNCH_WHT(512, 3); }
     else if (head_dim == 512 && mse_bits == 4) { LAUNCH_WHT(512, 4); }
     else {

@@ -43,6 +43,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "tq3": torch.uint8,
     "tq4": torch.uint8,
+    "tq2w": torch.uint8,
     "tq3w": torch.uint8,
     "tq4w": torch.uint8,
     "tq3r": torch.uint8,
