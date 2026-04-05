@@ -729,7 +729,7 @@ class MultiQuantImpl:
                         splitkv_ok = True
 
             if not splitkv_ok:
-                # Fallback: original single-block kernel
+                # Fallback: original single-block CUDA kernel
                 kernel = None
                 if self._is_block_rot:
                     from vllm.v1.attention.ops.triton_mq_fused_decode import (
@@ -753,16 +753,19 @@ class MultiQuantImpl:
                             dq, kv_cache, bt, sl,
                             out_3d, D, self._mse_bits, self.scale,
                             s_b, s_kv, s_s, s_h)
-            else:
-                if not hasattr(self, '_wht_torch_logged'):
-                    self._wht_torch_logged = True
-                    mode = "block-rot" if self._is_block_rot else "WHT"
-                    logger.warning("%s decode: using PyTorch fallback", mode)
-                decode_out = self._wht_decode_torch(
-                    dq, kv_cache, attn_metadata, num_decode,
-                    block_size, D, device)
-                output[:num_decode] = decode_out.reshape(
-                    num_decode, -1).to(output.dtype)
+                else:
+                    # Last resort: Python fallback
+                    if not hasattr(self, '_wht_torch_logged'):
+                        self._wht_torch_logged = True
+                        mode = "block-rot" if self._is_block_rot \
+                            else "WHT"
+                        logger.warning("%s decode: PyTorch fallback",
+                                       mode)
+                    decode_out = self._wht_decode_torch(
+                        dq, kv_cache, attn_metadata, num_decode,
+                        block_size, D, device)
+                    output[:num_decode] = decode_out.reshape(
+                        num_decode, -1).to(output.dtype)
             return
 
         if self._is_rq:
