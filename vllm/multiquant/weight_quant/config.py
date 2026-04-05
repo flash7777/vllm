@@ -40,6 +40,9 @@ class ArcherConfig(QuantizationConfig):
         act_dtype: str = "bf16",
         seed: int = 42,
     ):
+        import os
+        method = os.environ.get("ARCHER_METHOD", method)
+        bits = int(os.environ.get("ARCHER_BITS", str(bits)))
         if method not in self.VALID_METHODS:
             raise ValueError(
                 f"Archer method must be one of {self.VALID_METHODS}, "
