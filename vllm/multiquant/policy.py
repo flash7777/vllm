@@ -188,12 +188,23 @@ class MultiQuantPolicyRegistry:
             model_method = model_quant_config.get("quant_method", "")
             model_bits = model_quant_config.get("bits", 16)
             model_gs = model_quant_config.get("group_size", 0)
+            extra_config = model_quant_config.get("extra_config", {})
 
-            if model_method in ("gptq", "awq"):
+            if model_method in ("gptq", "awq", "auto-round"):
                 w_dtype = f"int{model_bits}"
-                for w_cls in [WEIGHTS_SHARED, WEIGHTS_ROUTED, WEIGHTS_ATTN]:
+                # Default: all weights at model bits
+                for w_cls in [WEIGHTS_ROUTED, WEIGHTS_ATTN]:
                     reg.set(w_cls, w_dtype, "model", model_gs)
-            elif model_method == "fp8":
+                # Check extra_config for mixed-precision (shared experts BF16)
+                has_bf16_shared = any(
+                    "shared_expert" in k and v.get("bits", 0) >= 16
+                    for k, v in extra_config.items()
+                )
+                if has_bf16_shared:
+                    reg.set(WEIGHTS_SHARED, "bf16", "model")
+                else:
+                    reg.set(WEIGHTS_SHARED, w_dtype, "model", model_gs)
+            elif model_method in ("fp8", "compressed-tensors"):
                 for w_cls in [WEIGHTS_SHARED, WEIGHTS_ROUTED, WEIGHTS_ATTN]:
                     reg.set(w_cls, "fp8", "model")
 
