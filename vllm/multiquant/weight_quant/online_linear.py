@@ -329,7 +329,8 @@ class ArcherOnlineLinearMethod(QuantizeMethodBase):
         layer._archer_packed = True
 
         logger.info(
-            "Archer: (%dx%d) → (%dx%d) uint8, %.1f%% of BF16",
+            "Archer %s%d: (%dx%d) → (%dx%d) uint8, %.1f%% of BF16",
+            self.method.upper(), mse_bits,
             out_features, in_features,
             out_features, packed_size,
             100.0 * packed_size / (in_features * 2),

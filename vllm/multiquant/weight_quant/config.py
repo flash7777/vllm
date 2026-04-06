@@ -41,8 +41,12 @@ class ArcherConfig(QuantizationConfig):
         seed: int = 42,
     ):
         import os
-        method = os.environ.get("ARCHER_METHOD", method)
-        bits = int(os.environ.get("ARCHER_BITS", str(bits)))
+        env_method = os.environ.get("ARCHER_METHOD")
+        env_bits = os.environ.get("ARCHER_BITS")
+        if env_method:
+            method = env_method
+        if env_bits:
+            bits = int(env_bits)
         if method not in self.VALID_METHODS:
             raise ValueError(
                 f"Archer method must be one of {self.VALID_METHODS}, "
