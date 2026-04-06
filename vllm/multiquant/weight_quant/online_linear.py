@@ -61,16 +61,17 @@ def _archer_apply_impl(
         except Exception:
             pass
 
-    # Try CUDA unpack — graph-safe (uses getCurrentCUDAStream)
+    # Try CUDA unpack (TQ only — RQ uses Python fallback for safety)
     result = None
-    try:
-        from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
-        result = cuda_unpack(packed_weight, in_features, mse_bits)
-        if result is not None:
-            idx, signs, row_norms, res_norms = result
-            idx = idx.long()
-    except Exception:
-        result = None
+    if not is_rq:
+        try:
+            from vllm.multiquant.weight_quant.archer_ops import cuda_unpack
+            result = cuda_unpack(packed_weight, in_features, mse_bits)
+            if result is not None:
+                idx, signs, row_norms, res_norms = result
+                idx = idx.long()
+        except Exception:
+            result = None
 
     if result is None:
         # Python fallback — NOT graph-safe (Python loops).
