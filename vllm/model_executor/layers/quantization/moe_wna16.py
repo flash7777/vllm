@@ -347,10 +347,12 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
-        assert weight_bits == 4 or weight_bits == 8
+        assert weight_bits in [2, 3, 4, 8], \
+            f"Unsupported weight_bits={weight_bits} for MoE quant config"
+        # INT2 and INT3 use INT4 MoE config (sub-4-bit stored in 4-bit slots)
         config_builder = (
             int4_w4a16_moe_quant_config
-            if weight_bits == 4
+            if weight_bits <= 4
             else int8_w8a16_moe_quant_config
         )
 
@@ -472,7 +474,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 elif "zeros" in weight_name:
                     # add 1 to gptq qzeros to align with awq
                     loaded_weight = loaded_weight.view(torch.uint8)
-                    if layer.quant_config.weight_bits == 4:
+                    if layer.quant_config.weight_bits in [2, 3, 4]:
                         loaded_weight = convert_gptq_int4_qzeros(loaded_weight).T
                     else:
                         loaded_weight = loaded_weight.T + 1
