@@ -153,7 +153,7 @@ class MoeWNA16Config(QuantizationConfig):
 
         awq_min_capability = AWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [2, 3, 4, 8]
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
@@ -466,7 +466,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 else:
                     loaded_weight = loaded_weight.T
             elif layer.quant_config.linear_quant_method == "gptq":
-                assert layer.quant_config.weight_bits in [4, 8]
+                assert layer.quant_config.weight_bits in [2, 3, 4, 8]
                 if "weight" in weight_name:
                     loaded_weight = loaded_weight.T.contiguous().view(torch.uint8)
                 elif "zeros" in weight_name:
