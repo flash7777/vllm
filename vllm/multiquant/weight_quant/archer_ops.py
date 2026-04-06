@@ -123,8 +123,10 @@ def cuda_unpack(
             indices, signs, row_norms, res_norms,
             head_size, mse_bits,
         )
-        # Note: no synchronize() here — kernel uses getCurrentCUDAStream()
-        # and synchronize breaks CUDA Graph capture.
+        # Sync needed: JIT kernel may run on different stream.
+        # Skip during CUDA Graph capture (would break capture).
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
         return indices, signs, row_norms, res_norms
     except Exception as e:
         logger.debug("Archer CUDA unpack failed: %s", e)
@@ -162,6 +164,8 @@ def cuda_decompress(
             head_size,
             n_centroids,
         )
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
         return W_out
     except Exception as e:
         logger.debug("Archer CUDA decompress failed: %s", e)
