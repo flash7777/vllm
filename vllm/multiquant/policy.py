@@ -225,7 +225,7 @@ class MultiQuantPolicyRegistry:
 
     def log_policy(self) -> None:
         """Log the full policy as startup banner."""
-        lines = ["MultiQuant Policy:"]
+        logger.info("MultiQuant Policy:")
         display = [
             ("K-Cache", K_CACHE),
             ("V-Cache", V_CACHE),
@@ -239,9 +239,9 @@ class MultiQuantPolicyRegistry:
             p = self._policies[cls]
             src = f" [{p.source}]" if p.source != "default" else ""
             gs = f", group={p.group_size}" if p.group_size > 0 else ""
-            lines.append(f"  {label:20s} {p.dtype:8s} "
-                         f"({p.description}{gs}){src}")
-        logger.info("\n".join(lines))
+            logger.info("  %s %s (%s%s)%s",
+                        f"{label:20s}", f"{p.dtype:8s}",
+                        p.description, gs, src)
 
     def needs_onthefly_quant(self, layer_type: str,
                              model_dtype: str) -> bool:
