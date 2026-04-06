@@ -446,11 +446,14 @@ class MultiQuantImpl:
                 )
                 pk = _load_wht_pack_kernel()
                 if pk is not None and hasattr(pk, 'tq_wht_pack_to_cache'):
+                    # Pack kernel expects bf16; cast if model uses fp16
+                    k_bf = key.to(torch.bfloat16) if key.dtype != torch.bfloat16 else key
+                    v_bf = value.to(torch.bfloat16) if value.dtype != torch.bfloat16 else value
                     pk.tq_wht_pack_to_cache(
-                        key, kv_cache, sm32, 0,
+                        k_bf, kv_cache, sm32, 0,
                         s_b, s_kv, s_s, s_h, self._mse_bits)
                     pk.tq_wht_pack_to_cache(
-                        value, kv_cache, sm32, 1,
+                        v_bf, kv_cache, sm32, 1,
                         s_b, s_kv, s_s, s_h, self._mse_bits)
                     fused_ok = True
 
