@@ -86,7 +86,16 @@ tq2w = **96% of FP8** mit **3.2× weniger KV**, tq3w = **95%** mit **2.3× wenig
 
 Math%: GLM-4.7 Prompt-Varianz bei n=10 (nicht KV-bezogen).
 INT4+tq3w ist schnellste Kombi weil INT4 weniger VRAM → mehr KV-Cache-Headroom.
-Archer TQ3 Gewichte produzieren Müll — cos=0.63 zu niedrig für korrekte Inference.
+
+### Archer Weight Quantization — NICHT BRAUCHBAR
+
+| Archer Methode | cos (Unit-Test) | Modell-Test | Status |
+|---------------|-----------------|-------------|--------|
+| TQ3 | 0.63 | 7×8=10.12 (Müll) | ✗ Qualität zu niedrig |
+| RQ3 | 0.92 | CUDA Assert in Clifford | ✗ Dimensions-Bug (D nicht durch 3 teilbar) |
+
+Archer Gewichtskompression funktioniert nicht für GLM-4.7-Flash.
+KV-Cache WHT (tq2w/tq3w) bleibt die einzige funktionierende Kompression.
 
 ### Kernel-Level Profiling (CUDA Event Timing, B=1, D=256, 40 Layers)
 
