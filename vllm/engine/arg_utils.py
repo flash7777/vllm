@@ -392,6 +392,13 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    # MultiQuant per-class overrides (optional)
+    k_dtype: str | None = None
+    v_dtype: str | None = None
+    weight_dtype: str | None = None
+    weight_dtype_shared: str | None = None
+    weight_dtype_routed: str | None = None
+    weight_dtype_attn: str | None = None
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -980,6 +987,25 @@ class EngineArgs:
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # MultiQuant per-class dtype overrides
+        cache_group.add_argument(
+            "--k-dtype", type=str, default=None,
+            help="Override K-cache dtype (overrides --kv-cache-dtype for K)")
+        cache_group.add_argument(
+            "--v-dtype", type=str, default=None,
+            help="Override V-cache dtype (overrides --kv-cache-dtype for V)")
+        cache_group.add_argument(
+            "--weight-dtype", type=str, default=None,
+            help="On-the-fly weight quantization: BF16/FP8 → target dtype")
+        cache_group.add_argument(
+            "--weight-dtype-shared", type=str, default=None,
+            help="Weight dtype for shared experts only")
+        cache_group.add_argument(
+            "--weight-dtype-routed", type=str, default=None,
+            help="Weight dtype for routed experts only")
+        cache_group.add_argument(
+            "--weight-dtype-attn", type=str, default=None,
+            help="Weight dtype for attention weights only")
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1552,6 +1578,26 @@ class EngineArgs:
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
         )
+
+        # Build and log MultiQuant Policy Registry
+        from vllm.multiquant.policy import MultiQuantPolicyRegistry
+        model_qc = getattr(
+            model_config.hf_config, "quantization_config", None)
+        if isinstance(model_qc, dict):
+            _mqc = model_qc
+        else:
+            _mqc = None
+        self._mq_policy = MultiQuantPolicyRegistry.from_cli(
+            kv_cache_dtype=resolved_cache_dtype,
+            k_dtype=self.k_dtype,
+            v_dtype=self.v_dtype,
+            weight_dtype=self.weight_dtype,
+            weight_dtype_shared=self.weight_dtype_shared,
+            weight_dtype_routed=self.weight_dtype_routed,
+            weight_dtype_attn=self.weight_dtype_attn,
+            model_quant_config=_mqc,
+        )
+        self._mq_policy.log_policy()
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
