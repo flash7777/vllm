@@ -676,7 +676,7 @@ __global__ void Marlin(
   // (without column-wise case)
   constexpr int num_col_threads = 8;
   constexpr int num_row_threads = 4;
-  constexpr int num_ints_per_thread = 8 / pack_factor;
+  constexpr int num_ints_per_thread = (8 / pack_factor) > 0 ? (8 / pack_factor) : 1;
   int zp_sh_rd;
   if constexpr (has_zp) {
     if constexpr (is_zp_float) {
