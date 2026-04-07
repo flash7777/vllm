@@ -81,22 +81,22 @@ class GPTQInt2LinearMethod(QuantizeMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         pack_factor = 32 // self.bits
 
-        # Simple parameters — loaded directly from safetensors
-        # No Marlin repack, no special weight_loader
         n_groups = input_size_per_partition // self.group_size
         zp_packed_n = (output_size_per_partition + pack_factor - 1) // pack_factor
 
-        layer.register_parameter("qweight", torch.nn.Parameter(
-            torch.empty(input_size_per_partition // pack_factor,
-                        output_size_per_partition, dtype=torch.int32),
-            requires_grad=False))
-        layer.register_parameter("scales", torch.nn.Parameter(
-            torch.empty(n_groups, output_size_per_partition,
-                        dtype=torch.float16),
-            requires_grad=False))
-        layer.register_parameter("qzeros", torch.nn.Parameter(
-            torch.empty(n_groups, zp_packed_n, dtype=torch.int32),
-            requires_grad=False))
+        def _default_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+
+        for name, shape, dtype in [
+            ("qweight", (input_size_per_partition // pack_factor,
+                         output_size_per_partition), torch.int32),
+            ("scales", (n_groups, output_size_per_partition), torch.float16),
+            ("qzeros", (n_groups, zp_packed_n), torch.int32),
+        ]:
+            p = torch.nn.Parameter(
+                torch.empty(*shape, dtype=dtype), requires_grad=False)
+            p.weight_loader = _default_loader
+            layer.register_parameter(name, p)
 
         # Store config on layer for apply()
         layer._gptq_bits = self.bits
