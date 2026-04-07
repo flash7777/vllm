@@ -1613,6 +1613,9 @@ def fused_experts(
 
     assert not inplace or not disable_inplace()
 
+    # Extract w_bit_width for sub-4-bit kernels
+    _wbw = quant_config.w_bit_width if hasattr(quant_config, 'w_bit_width') else 4
+
     return dispatch_fused_experts_func(inplace)(
         hidden_states=hidden_states,
         w1=w1,
