@@ -665,26 +665,18 @@ def invoke_fused_moe_wna16_triton_kernel(
     assert block_shape is not None and block_shape[0] == 0
 
     # Infer weight bit width from pack ratio (K / packed_k)
-    # After uint8 reinterpret: B.size(2) is in uint8 units (4× int32)
-    # INT4: K/8 int32 = K/2 uint8 → ratio = K / (B.size(2)) = 2 → bits=4
-    # INT2: K/16 int32 = K/4 uint8 → ratio = K / (B.size(2)) = 4 → bits=2
-    # INT8: K/4 int32 = K uint8 → ratio = 1 → bits=8
+    # INT4: K/8 packed → ratio=8 → bits=4
+    # INT2: K/16 packed → ratio=16 → bits=2
     w_bit_width = 4  # default
     if use_int4_w4a16:
         K_full = A.size(1)
-        K_packed_u8 = B.size(2)  # B is [E, N, K_packed] in uint8
-        if K_packed_u8 > 0:
-            # Convert to int32 equivalent: K_packed_i32 = K_packed_u8 / 4
-            # Then pack_factor = K_full / K_packed_i32
-            # bits = 32 / pack_factor
-            K_packed_i32 = K_packed_u8 // 4
-            if K_packed_i32 > 0:
-                pack_factor = K_full // K_packed_i32
-                if pack_factor >= 2:
-                    w_bit_width = 32 // pack_factor
-                    # Clamp to valid range
-                    if w_bit_width not in (2, 3, 4):
-                        w_bit_width = 4
+        K_packed = B.size(2)  # B is [E, N, K_packed]
+        if K_packed > 0:
+            ratio = K_full // K_packed
+            if ratio == 16:
+                w_bit_width = 2
+            elif ratio == 8:
+                w_bit_width = 4
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -750,8 +742,8 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
-        **{**config,
-           "w_bit_width": w_bit_width if use_int4_w4a16 else 4},
+        w_bit_width=w_bit_width if use_int4_w4a16 else 4,
+        **config,
     )
 
 
@@ -901,24 +893,12 @@ def dispatch_fused_moe_kernel(
     ):
         assert B_bias is None
 
-        # Infer actual bit width for sub-4-bit
-        K_full = A.size(1)
-        K_packed_u8 = B.size(2)
-        K_packed_i32 = K_packed_u8 // 4
-        _actual_bit = 32 // (K_full // K_packed_i32) if K_packed_i32 > 0 and K_full // K_packed_i32 >= 2 else 4
-        if _actual_bit not in (2, 3, 4, 8):
-            _actual_bit = 4
-
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
             group_size=block_shape[1],
             num_experts=B.size(0),
-            bit=_actual_bit,
+            bit=4 if use_int4_w4a16 else 8,
         )
-
-        # CUDA MoE kernel only supports INT4/INT8. For INT2/INT3, force Triton.
-        if _actual_bit < 4:
-            use_moe_wna16_cuda = False
 
         if use_moe_wna16_cuda:
             invoke_fused_moe_wna16_cuda_kernel(
@@ -1625,9 +1605,6 @@ def fused_experts(
 
     assert not inplace or not disable_inplace()
 
-    # Extract w_bit_width for sub-4-bit kernels
-    _wbw = quant_config.w_bit_width if hasattr(quant_config, 'w_bit_width') else 4
-
     return dispatch_fused_experts_func(inplace)(
         hidden_states=hidden_states,
         w1=w1,
@@ -1718,8 +1695,15 @@ def fused_experts_impl(
 
     # Check constraints.
     if use_int4_w4a16:
-        # Flexible: accept any valid pack ratio (INT4=8, INT2=16, uint8 repack=4)
-        pass
+        # INT4: pack_factor=8, so K/8 elements in packed dim → K = w1*8, K//2 = w1*4
+        # INT2: pack_factor=16, so K/16 elements → K = w1*16, K//2 = w1*8 (FAILS)
+        # Use flexible check: hidden_states.size(1) == w1.size(2) * pack_factor
+        # where pack_factor is inferred from shape ratio
+        K_hidden = hidden_states.size(1)
+        K_packed = w1.size(2)
+        inferred_pack = K_hidden // K_packed if K_packed > 0 else 0
+        assert inferred_pack in (8, 16, 32), \
+            f"Hidden size mismatch: K={K_hidden}, packed={K_packed}, ratio={inferred_pack}"
     elif ocp_mx_scheme is not None:
         if ocp_mx_scheme.startswith("w_mxfp4"):
             # 16bit activation and fp4x2 packed weight
