@@ -26,34 +26,85 @@ def dequant_gptq_sub4(
 ) -> torch.Tensor:
     """Dequantize GPTQ sub-4-bit packed weights to float16.
 
-    Supports bits=2 (pack_factor=16) and bits=3 (pack_factor=10).
+    Supports:
+    - bits=2: pack_factor=16, simple shift+mask (16 values per int32)
+    - bits=3: bit-stream packing (ceil(K*3/32) int32 per column)
+
     Returns: [N, K] float16 weight matrix (ready for F.linear).
     """
     K_packed, N = qweight.shape
-    pack_factor = 32 // bits
-    K = K_packed * pack_factor
-    n_groups = K // group_size
     mask = (1 << bits) - 1
 
-    # Unpack quantized values: [K_packed, N] int32 → [K, N]
-    shifts = torch.arange(0, 32, bits, device=qweight.device,
-                          dtype=torch.int32)[:pack_factor]
-    expanded = qweight.unsqueeze(1).expand(-1, pack_factor, -1)
-    unpacked = ((expanded >> shifts.view(1, -1, 1)) & mask).reshape(K, N)
+    if bits == 2:
+        # Simple: 16 values per int32
+        pack_factor = 16
+        K = K_packed * pack_factor
+        shifts = torch.arange(0, 32, 2, device=qweight.device,
+                              dtype=torch.int32)
+        expanded = qweight.unsqueeze(1).expand(-1, pack_factor, -1)
+        unpacked = ((expanded >> shifts.view(1, -1, 1)) & mask).reshape(K, N)
+    elif bits == 3:
+        # Bit-stream: K = K_packed * 32 / 3 (rounded)
+        K = (K_packed * 32) // 3
+        # Unpack via bit manipulation
+        # Flatten to 1D per column, extract 3-bit values
+        unpacked_list = []
+        for col in range(N):
+            col_data = qweight[:, col].cpu().tolist()
+            vals = []
+            bit_buf = 0
+            bits_in_buf = 0
+            for word in col_data:
+                bit_buf |= (word & 0xFFFFFFFF) << bits_in_buf
+                bits_in_buf += 32
+                while bits_in_buf >= 3 and len(vals) < K:
+                    vals.append(bit_buf & 0x7)
+                    bit_buf >>= 3
+                    bits_in_buf -= 3
+            while len(vals) < K:
+                vals.append(0)
+            unpacked_list.append(vals[:K])
+        unpacked = torch.tensor(unpacked_list, device=qweight.device,
+                                dtype=torch.int32).T  # [K, N]
+    else:
+        raise ValueError(f"Unsupported bits={bits}")
 
-    # Unpack zero points (same packing)
-    zp_pack_factor = 32 // bits
-    zp_shifts = torch.arange(0, 32, bits, device=qzeros.device,
-                             dtype=torch.int32)[:zp_pack_factor]
-    zp_expanded = qzeros.unsqueeze(1).expand(-1, zp_pack_factor, -1)
-    zp_all = ((zp_expanded >> zp_shifts.view(1, -1, 1)) & mask)
-    zp_all = zp_all.reshape(n_groups, -1)[:, :N]  # [n_groups, N]
+    n_groups = K // group_size
+
+    # Unpack zero points (same bit-packing as weights)
+    if bits == 2:
+        zp_shifts = torch.arange(0, 32, 2, device=qzeros.device,
+                                 dtype=torch.int32)
+        zp_expanded = qzeros.unsqueeze(1).expand(-1, 16, -1)
+        zp_all = ((zp_expanded >> zp_shifts.view(1, -1, 1)) & mask)
+        zp_all = zp_all.reshape(n_groups, -1)[:, :N]
+    elif bits == 3:
+        # Zero points also bit-packed
+        zp_packed_n = qzeros.shape[1]
+        zp_K = (zp_packed_n * 32) // 3
+        zp_list = []
+        for g in range(n_groups):
+            row = qzeros[g].cpu().tolist()
+            vals = []
+            bit_buf = 0
+            bits_in_buf = 0
+            for word in row:
+                bit_buf |= (word & 0xFFFFFFFF) << bits_in_buf
+                bits_in_buf += 32
+                while bits_in_buf >= 3 and len(vals) < N:
+                    vals.append(bit_buf & 0x7)
+                    bit_buf >>= 3
+                    bits_in_buf -= 3
+            while len(vals) < N:
+                vals.append(0)
+            zp_list.append(vals[:N])
+        zp_all = torch.tensor(zp_list, device=qzeros.device,
+                              dtype=torch.int32)  # [n_groups, N]
 
     # Dequant: weight = scale * (qval - zero_point)
     group_idx = torch.arange(K, device=qweight.device) // group_size
     w = scales[group_idx] * (unpacked.float() - zp_all[group_idx].float())
 
-    # Return as [N, K] for F.linear (W @ x.T)
     return w.T.contiguous().to(torch.float16)
 
 
