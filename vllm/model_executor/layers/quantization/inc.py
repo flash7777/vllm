@@ -263,18 +263,21 @@ class INCConfig(QuantizationConfig):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return MQSub4LinearMethod(gptq_cfg)
             if isinstance(layer, FusedMoE):
+                # MoE sub-4-bit: use MoeWNA16 for loading but override apply()
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
-                config = {
+                moe_cfg = MoeWNA16Config.from_config({
                     "quant_method": "gptq",
                     "bits": weight_bits,
                     "group_size": group_size,
                     "sym": sym,
                     "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix)
+                })
+                from vllm.multiquant.weight_quant.mq_sub4_moe import (
+                    MQSub4MoEMethod,
+                )
+                return MQSub4MoEMethod(moe_cfg, layer.moe_config)
             return None
 
         if backend == "auto" or "marlin" in backend:
@@ -382,15 +385,17 @@ class INCConfig(QuantizationConfig):
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
-                config = {
+                moe_cfg = MoeWNA16Config.from_config({
                     "quant_method": "gptq",
                     "bits": weight_bits,
                     "group_size": group_size,
                     "sym": sym,
                     "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix)
+                })
+                from vllm.multiquant.weight_quant.mq_sub4_moe import (
+                    MQSub4MoEMethod,
+                )
+                return MQSub4MoEMethod(moe_cfg, layer.moe_config)
             return None
 
         if backend == "auto" or "marlin" in backend:
