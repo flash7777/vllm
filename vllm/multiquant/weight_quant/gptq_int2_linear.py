@@ -1,73 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPTQ INT2 Linear — direct dequant without Marlin repack.
+"""GPTQ INT2/INT3 Linear — direct dequant without Marlin repack.
 
-AutoRound INT2 models use standard GPTQ format (qweight/scales/qzeros)
-with pack_factor=16 (16 x 2-bit values per int32). Marlin doesn't
-support INT2 natively, so we dequant on-the-fly and use F.linear.
-
-This is analogous to Archer but reads GPTQ format directly.
+AutoRound INT2/INT3 models use standard GPTQ format (qweight/scales/qzeros).
+Marlin doesn't support sub-4-bit natively, so we dequant on-the-fly.
 """
 
 import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizeMethodBase,
+)
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    ModelWeightParameter,
+)
 
 logger = init_logger(__name__)
 
 
-def dequant_gptq_int2(
-    qweight: torch.Tensor,    # [K_packed, N] int32, 16 values per int32
+def dequant_gptq_sub4(
+    qweight: torch.Tensor,    # [K_packed, N] int32
     scales: torch.Tensor,      # [n_groups, N] float16
     qzeros: torch.Tensor,      # [n_groups, N_zp_packed] int32
-    group_size: int = 128,
+    group_size: int,
+    bits: int,
 ) -> torch.Tensor:
-    """Dequantize GPTQ INT2 packed weights to float16.
+    """Dequantize GPTQ sub-4-bit packed weights to float16.
 
-    Returns: [K, N] float16 weight matrix.
+    Supports bits=2 (pack_factor=16) and bits=3 (pack_factor=10).
+    Returns: [N, K] float16 weight matrix (ready for F.linear).
     """
     K_packed, N = qweight.shape
-    K = K_packed * 16  # 16 x 2-bit per int32
+    pack_factor = 32 // bits
+    K = K_packed * pack_factor
     n_groups = K // group_size
+    mask = (1 << bits) - 1
 
-    # Unpack 2-bit values: [K_packed, N] int32 → [K, N] uint8
-    # Each int32 has 16 x 2-bit values, packed LSB-first
-    shifts = torch.arange(0, 32, 2, device=qweight.device, dtype=torch.int32)
-    # Reshape for broadcasting: [K_packed, 1, N] and [16] → [K_packed, 16, N]
-    expanded = qweight.unsqueeze(1).expand(-1, 16, -1)
-    shifted = (expanded >> shifts.view(1, 16, 1)) & 0x3
-    unpacked = shifted.reshape(K, N)  # [K, N] values 0-3
+    # Unpack quantized values: [K_packed, N] int32 → [K, N]
+    shifts = torch.arange(0, 32, bits, device=qweight.device,
+                          dtype=torch.int32)[:pack_factor]
+    expanded = qweight.unsqueeze(1).expand(-1, pack_factor, -1)
+    unpacked = ((expanded >> shifts.view(1, -1, 1)) & mask).reshape(K, N)
 
-    # Unpack zero points: same 2-bit packing
-    zp_shifts = torch.arange(0, 32, 2, device=qzeros.device, dtype=torch.int32)
-    zp_expanded = qzeros.unsqueeze(1).expand(-1, 16, -1)
-    zp_shifted = (zp_expanded >> zp_shifts.view(1, 16, 1)) & 0x3
-    zp_unpacked = zp_shifted.reshape(n_groups, -1)  # [n_groups, N_zp_unpacked]
-    # Slice to N columns (may have padding)
-    zp = zp_unpacked[:, :N]  # [n_groups, N]
+    # Unpack zero points (same packing)
+    zp_pack_factor = 32 // bits
+    zp_shifts = torch.arange(0, 32, bits, device=qzeros.device,
+                             dtype=torch.int32)[:zp_pack_factor]
+    zp_expanded = qzeros.unsqueeze(1).expand(-1, zp_pack_factor, -1)
+    zp_all = ((zp_expanded >> zp_shifts.view(1, -1, 1)) & mask)
+    zp_all = zp_all.reshape(n_groups, -1)[:, :N]  # [n_groups, N]
 
     # Dequant: weight = scale * (qval - zero_point)
-    # Group assignment: group_idx = k // group_size
     group_idx = torch.arange(K, device=qweight.device) // group_size
-    w = scales[group_idx] * (unpacked.float() - zp[group_idx].float())
+    w = scales[group_idx] * (unpacked.float() - zp_all[group_idx].float())
 
-    return w.to(torch.float16)
+    # Return as [N, K] for F.linear (W @ x.T)
+    return w.T.contiguous().to(torch.float16)
 
 
-class GPTQInt2LinearMethod:
-    """Linear method for GPTQ INT2 without Marlin.
+class GPTQInt2LinearMethod(QuantizeMethodBase):
+    """Linear method for GPTQ INT2/INT3 without Marlin.
 
     Dequantizes on-the-fly per forward pass.
-    Slower than Marlin but correct for INT2.
+    Slower than Marlin but correct for sub-4-bit.
     """
 
-    def __init__(self, group_size: int = 128):
+    def __init__(self, group_size: int = 128, bits: int = 2):
         self.group_size = group_size
+        self.bits = bits
 
-    def apply(self, x: torch.Tensor, layer: torch.nn.Module) -> torch.Tensor:
-        """x @ dequant(W).T"""
-        W = dequant_gptq_int2(
-            layer.qweight, layer.scales, layer.qzeros,
-            self.group_size,
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        pack_factor = 32 // self.bits
+
+        # Packed quantized weights
+        qweight = ModelWeightParameter(
+            data=torch.empty(
+                input_size_per_partition // pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=pack_factor,
         )
-        return F.linear(x, W)
+        layer.register_parameter("qweight", qweight)
+
+        # Scales per group
+        n_groups = input_size_per_partition // self.group_size
+        scales = BasevLLMParameter(
+            data=torch.empty(
+                n_groups, output_size_per_partition,
+                dtype=torch.float16,
+            ),
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+        )
+        layer.register_parameter("scales", scales)
+
+        # Zero points (packed same as qweight)
+        zp_packed_n = (output_size_per_partition + pack_factor - 1) // pack_factor
+        qzeros = BasevLLMParameter(
+            data=torch.empty(
+                n_groups, zp_packed_n,
+                dtype=torch.int32,
+            ),
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+        )
+        layer.register_parameter("qzeros", qzeros)
+
+        # Store config on layer for apply()
+        layer._gptq_bits = self.bits
+        layer._gptq_group_size = self.group_size
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        W = dequant_gptq_sub4(
+            layer.qweight.data,
+            layer.scales.data,
+            layer.qzeros.data,
+            layer._gptq_group_size,
+            layer._gptq_bits,
+        )
+        out = F.linear(x, W, bias)
+        return out

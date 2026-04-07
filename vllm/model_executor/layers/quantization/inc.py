@@ -245,10 +245,18 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
+        if weight_bits < 4:
+            from vllm.multiquant.weight_quant.gptq_int2_linear import (
+                GPTQInt2LinearMethod,
+            )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return GPTQInt2LinearMethod(group_size)
+            # MoE: unquantized fallback for now
+            return None
+
         if backend == "auto" or "marlin" in backend:
             AWQ_TYPE_MAP = {
-                2: scalar_types.uint2b2,
-                3: scalar_types.uint3b4,
                 4: scalar_types.uint4,
                 8: scalar_types.uint8,
             }
@@ -333,10 +341,17 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
+        if weight_bits < 4:
+            from vllm.multiquant.weight_quant.gptq_int2_linear import (
+                GPTQInt2LinearMethod,
+            )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return GPTQInt2LinearMethod(group_size)
+            return None
+
         if backend == "auto" or "marlin" in backend:
             GPTQ_TYPE_MAP = {
-                (2, True): scalar_types.uint2b2,
-                (3, True): scalar_types.uint3b4,
                 (4, True): scalar_types.uint4b8,
                 (8, True): scalar_types.uint8b128,
             }
