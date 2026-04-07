@@ -245,13 +245,29 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): dequant at load time → unquantized model
-        # The autoround_loader in default_loader.py handles the dequant.
-        # All layers get normal FP16 weights, no special quant method needed.
+        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
         if weight_bits < 4:
+            from vllm.multiquant.weight_quant.gptq_int2_linear import (
+                GPTQInt2LinearMethod,
+            )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            return None  # MoE: handled by default FusedMoE (FP16 weights)
+                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+            if isinstance(layer, FusedMoE):
+                # MoE sub-4-bit: route through MoeWNA16 which handles
+                # GPTQ format loading. Dequant happens in Triton kernel.
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                config = {
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "sym": sym,
+                    "lm_head": False,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix)
+            return None
 
         if backend == "auto" or "marlin" in backend:
             AWQ_TYPE_MAP = {
@@ -339,10 +355,26 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): dequant at load time → unquantized model
+        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
         if weight_bits < 4:
+            from vllm.multiquant.weight_quant.gptq_int2_linear import (
+                GPTQInt2LinearMethod,
+            )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
+                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+            if isinstance(layer, FusedMoE):
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                config = {
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "sym": sym,
+                    "lm_head": False,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix)
             return None
 
         if backend == "auto" or "marlin" in backend:

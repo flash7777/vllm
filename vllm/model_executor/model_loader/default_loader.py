@@ -377,26 +377,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        # Sub-4-bit AutoRound: dequant qweight→FP16 at load time
-        _qc = getattr(model_config.hf_config, "quantization_config", None)
-        _qc = _qc if isinstance(_qc, dict) else {}
-        _ar_bits = _qc.get("bits", 16)
-        _ar_method = _qc.get("quant_method", "")
-        if _ar_bits < 4 and _ar_method in ("auto-round", "gptq"):
-            from vllm.multiquant.weight_quant.autoround_loader import (
-                load_autoround_as_fp16,
-            )
-            from vllm.logger import init_logger as _il
-            _il(__name__).info(
-                "AutoRound sub-4-bit: dequant INT%d → FP16 at load time",
-                _ar_bits)
-            weights_iter = load_autoround_as_fp16(
-                model_config.model, device="cpu")
-        else:
-            weights_iter = self.get_all_weights(model_config, model)
-
         weights_to_load = {name for name, _ in model.named_parameters()}
-        loaded_weights = model.load_weights(weights_iter)
+        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
