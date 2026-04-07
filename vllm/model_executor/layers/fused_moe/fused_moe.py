@@ -750,8 +750,8 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
-        w_bit_width=w_bit_width if use_int4_w4a16 else 4,
         **config,
+        w_bit_width=w_bit_width if use_int4_w4a16 else 4,
     )
 
 
