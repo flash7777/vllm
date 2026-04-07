@@ -9,7 +9,6 @@ from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
-    int2_w2a16_moe_quant_config,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
@@ -350,9 +349,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
         has_zp = self.quant_config.has_zp
         assert weight_bits in [2, 3, 4, 8], \
             f"Unsupported weight_bits={weight_bits} for MoE quant config"
-        if weight_bits == 2:
-            config_builder = int2_w2a16_moe_quant_config
-        elif weight_bits <= 4:
+        if weight_bits <= 4:
             config_builder = int4_w4a16_moe_quant_config
         else:
             config_builder = int8_w8a16_moe_quant_config
