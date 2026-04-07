@@ -52,25 +52,28 @@ def _dequant_column(qweight: torch.Tensor, scales: torch.Tensor,
         unpacked = ((expanded >> shifts.view(1, 16, 1)) & mask).reshape(K, N)
     elif bits == 3:
         K = (K_packed * 32) // 3
-        # Bit-stream unpack on CPU (cross-boundary extraction)
-        unpacked_cols = []
-        qw_cpu = qweight.cpu()
-        for col in range(N):
-            words = qw_cpu[:, col].tolist()
-            vals = []
-            buf = 0
-            buf_bits = 0
-            for w in words:
-                buf |= (w & 0xFFFFFFFF) << buf_bits
-                buf_bits += 32
-                while buf_bits >= 3 and len(vals) < K:
-                    vals.append(buf & 0x7)
-                    buf >>= 3
-                    buf_bits -= 3
-            vals.extend([0] * (K - len(vals)))
-            unpacked_cols.append(vals[:K])
-        unpacked = torch.tensor(unpacked_cols, device=qweight.device,
-                                dtype=torch.int32).T
+        # Vectorized 3-bit unpack: treat int32 as bit-stream
+        # Expand each int32 into individual bits, then regroup as 3-bit
+        qw = qweight.to(torch.int64)  # avoid sign issues
+        # Create bit array: [K_packed, 32, N] → [K_packed*32, N]
+        bit_shifts = torch.arange(32, device=qweight.device, dtype=torch.int64)
+        bits_2d = ((qw.unsqueeze(1) >> bit_shifts.view(1, 32, 1)) & 1)
+        bits_flat = bits_2d.reshape(-1, N)  # [K_packed*32, N] = [total_bits, N]
+        # Regroup into 3-bit values: take bits [3i, 3i+1, 3i+2]
+        total_bits = K_packed * 32
+        n_vals = total_bits // 3
+        if n_vals > K:
+            n_vals = K
+        idx = torch.arange(n_vals, device=qweight.device)
+        b0 = bits_flat[idx * 3]
+        b1 = bits_flat[idx * 3 + 1]
+        b2 = bits_flat[idx * 3 + 2]
+        unpacked = (b0 | (b1 << 1) | (b2 << 2)).to(torch.int32)
+        # Pad if needed
+        if n_vals < K:
+            pad = torch.zeros(K - n_vals, N, device=qweight.device,
+                              dtype=torch.int32)
+            unpacked = torch.cat([unpacked, pad], dim=0)
     elif bits == 4:
         K = K_packed * 8
         shifts = torch.arange(0, 32, 4, device=qweight.device,
@@ -91,24 +94,24 @@ def _dequant_column(qweight: torch.Tensor, scales: torch.Tensor,
         zp_all = ((zp_exp >> zp_shifts.view(1, -1, 1)) & mask)
         zp_all = zp_all.reshape(n_groups, -1)[:, :N]
     elif bits == 3:
-        zp_list = []
-        qz_cpu = qzeros.cpu()
-        for g in range(n_groups):
-            words = qz_cpu[g].tolist()
-            vals = []
-            buf = 0
-            buf_bits = 0
-            for w in words:
-                buf |= (w & 0xFFFFFFFF) << buf_bits
-                buf_bits += 32
-                while buf_bits >= 3 and len(vals) < N:
-                    vals.append(buf & 0x7)
-                    buf >>= 3
-                    buf_bits -= 3
-            vals.extend([0] * (N - len(vals)))
-            zp_list.append(vals[:N])
-        zp_all = torch.tensor(zp_list, device=qzeros.device,
-                              dtype=torch.int32)
+        # Vectorized 3-bit zero-point unpack
+        qz = qzeros.to(torch.int64)
+        zp_bits_shifts = torch.arange(32, device=qzeros.device,
+                                      dtype=torch.int64)
+        # [n_groups, zp_packed, 32] → [n_groups, zp_packed*32]
+        zp_bits = ((qz.unsqueeze(2) >> zp_bits_shifts.view(1, 1, 32)) & 1)
+        zp_flat = zp_bits.reshape(n_groups, -1)  # [n_groups, total_zp_bits]
+        total_zp_bits = zp_flat.shape[1]
+        n_zp = min(total_zp_bits // 3, N)
+        zp_idx = torch.arange(n_zp, device=qzeros.device)
+        zp_b0 = zp_flat[:, zp_idx * 3]
+        zp_b1 = zp_flat[:, zp_idx * 3 + 1]
+        zp_b2 = zp_flat[:, zp_idx * 3 + 2]
+        zp_all = (zp_b0 | (zp_b1 << 1) | (zp_b2 << 2)).to(torch.int32)
+        if n_zp < N:
+            zp_pad = torch.zeros(n_groups, N - n_zp, device=qzeros.device,
+                                 dtype=torch.int32)
+            zp_all = torch.cat([zp_all, zp_pad], dim=1)
 
     group_idx = torch.arange(K, device=qweight.device) // group_size
     w = scales[group_idx] * (unpacked.float() - zp_all[group_idx].float())
