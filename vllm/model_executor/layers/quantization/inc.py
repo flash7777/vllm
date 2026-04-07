@@ -245,16 +245,23 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): MultiQuant Marlin path
-        # Dequant + cuBLAS GEMM (reconstruct path, not fused yet)
+        # Sub-4-bit (INT2/INT3): use GPTQ (non-Marlin) path directly.
+        # GPTQLinearMethod handles Fraction pack_factor, shard-fusing,
+        # and calls the existing gptq_3bit/2bit kernel in q_gemm.cu.
         if weight_bits < 4:
-            from vllm.multiquant.weight_quant.mq_marlin3 import (
-                MultiQuantSub4LinearMethod,
+            from vllm.model_executor.layers.quantization.gptq import (
+                GPTQConfig, GPTQLinearMethod,
+            )
+            gptq_cfg = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                desc_act=False,
+                lm_head_quantized=False,
+                dynamic={},
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return MultiQuantSub4LinearMethod(weight_bits, group_size)
+                return GPTQLinearMethod(gptq_cfg)
             if isinstance(layer, FusedMoE):
-                # MoE: use MoeWNA16 for GPTQ format loading
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
@@ -355,13 +362,20 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): MultiQuant Marlin path
+        # Sub-4-bit (INT2/INT3): use GPTQ (non-Marlin) path
         if weight_bits < 4:
-            from vllm.multiquant.weight_quant.mq_marlin3 import (
-                MultiQuantSub4LinearMethod,
+            from vllm.model_executor.layers.quantization.gptq import (
+                GPTQConfig, GPTQLinearMethod,
+            )
+            gptq_cfg = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                desc_act=False,
+                lm_head_quantized=False,
+                dynamic={},
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return MultiQuantSub4LinearMethod(weight_bits, group_size)
+                return GPTQLinearMethod(gptq_cfg)
             if isinstance(layer, FusedMoE):
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
