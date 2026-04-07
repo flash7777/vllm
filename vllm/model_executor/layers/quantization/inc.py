@@ -251,8 +251,22 @@ class INCConfig(QuantizationConfig):
                 GPTQInt2LinearMethod,
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return GPTQInt2LinearMethod(group_size)
-            # MoE: unquantized fallback for now
+                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+            if isinstance(layer, FusedMoE):
+                # MoE sub-4-bit: route through MoeWNA16 which handles
+                # GPTQ format loading. Dequant happens in Triton kernel.
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                config = {
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "zero_point": not sym,
+                    "lm_head": False,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix)
             return None
 
         if backend == "auto" or "marlin" in backend:
@@ -347,7 +361,20 @@ class INCConfig(QuantizationConfig):
                 GPTQInt2LinearMethod,
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return GPTQInt2LinearMethod(group_size)
+                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+            if isinstance(layer, FusedMoE):
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                config = {
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "zero_point": not sym,
+                    "lm_head": False,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix)
             return None
 
         if backend == "auto" or "marlin" in backend:
