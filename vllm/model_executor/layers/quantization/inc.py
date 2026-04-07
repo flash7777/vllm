@@ -245,16 +245,16 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
+        # Sub-4-bit (INT2/INT3): MultiQuant Marlin path
+        # Dequant + cuBLAS GEMM (reconstruct path, not fused yet)
         if weight_bits < 4:
-            from vllm.multiquant.weight_quant.gptq_int2_linear import (
-                GPTQInt2LinearMethod,
+            from vllm.multiquant.weight_quant.mq_marlin3 import (
+                MultiQuantSub4LinearMethod,
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+                return MultiQuantSub4LinearMethod(weight_bits, group_size)
             if isinstance(layer, FusedMoE):
-                # MoE sub-4-bit: route through MoeWNA16 which handles
-                # GPTQ format loading. Dequant happens in Triton kernel.
+                # MoE: use MoeWNA16 for GPTQ format loading
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
@@ -355,13 +355,13 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        # Sub-4-bit (INT2/INT3): use MultiQuant direct dequant
+        # Sub-4-bit (INT2/INT3): MultiQuant Marlin path
         if weight_bits < 4:
-            from vllm.multiquant.weight_quant.gptq_int2_linear import (
-                GPTQInt2LinearMethod,
+            from vllm.multiquant.weight_quant.mq_marlin3 import (
+                MultiQuantSub4LinearMethod,
             )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return GPTQInt2LinearMethod(group_size, bits=weight_bits)
+                return MultiQuantSub4LinearMethod(weight_bits, group_size)
             if isinstance(layer, FusedMoE):
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
