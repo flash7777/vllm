@@ -665,18 +665,26 @@ def invoke_fused_moe_wna16_triton_kernel(
     assert block_shape is not None and block_shape[0] == 0
 
     # Infer weight bit width from pack ratio (K / packed_k)
-    # INT4: K/8 packed → ratio=8 → bits=4
-    # INT2: K/16 packed → ratio=16 → bits=2
+    # After uint8 reinterpret: B.size(2) is in uint8 units (4× int32)
+    # INT4: K/8 int32 = K/2 uint8 → ratio = K / (B.size(2)) = 2 → bits=4
+    # INT2: K/16 int32 = K/4 uint8 → ratio = K / (B.size(2)) = 4 → bits=2
+    # INT8: K/4 int32 = K uint8 → ratio = 1 → bits=8
     w_bit_width = 4  # default
     if use_int4_w4a16:
         K_full = A.size(1)
-        K_packed = B.size(2)  # B is [E, N, K_packed]
-        if K_packed > 0:
-            ratio = K_full // K_packed
-            if ratio == 16:
-                w_bit_width = 2
-            elif ratio == 8:
-                w_bit_width = 4
+        K_packed_u8 = B.size(2)  # B is [E, N, K_packed] in uint8
+        if K_packed_u8 > 0:
+            # Convert to int32 equivalent: K_packed_i32 = K_packed_u8 / 4
+            # Then pack_factor = K_full / K_packed_i32
+            # bits = 32 / pack_factor
+            K_packed_i32 = K_packed_u8 // 4
+            if K_packed_i32 > 0:
+                pack_factor = K_full // K_packed_i32
+                if pack_factor >= 2:
+                    w_bit_width = 32 // pack_factor
+                    # Clamp to valid range
+                    if w_bit_width not in (2, 3, 4):
+                        w_bit_width = 4
 
     M = A.size(0)
     num_tokens = M * top_k
