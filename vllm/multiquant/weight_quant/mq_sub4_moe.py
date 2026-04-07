@@ -11,9 +11,7 @@ Only apply() is overridden.
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
 
 logger = init_logger(__name__)
@@ -26,9 +24,9 @@ class MQSub4MoEMethod(MoeWNA16Method):
     Overrides apply() to use mq_gemm_int2/mq_gemm_int3 per expert.
     """
 
-    def get_fused_moe_quant_config(self, layer) -> FusedMoEQuantConfig | None:
-        # Return None — we handle the forward ourselves, not via fused_experts
-        return None
+    # Inherit get_fused_moe_quant_config from MoeWNA16Method
+    # This ensures qweight/scales/qzeros are properly allocated and loaded.
+    # We only override apply() to use our fused GEMM instead of Triton.
 
     def apply(
         self,
