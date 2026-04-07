@@ -12,10 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
-from vllm.model_executor.parameter import (
-    BasevLLMParameter,
-    ModelWeightParameter,
-)
+from vllm.model_executor.parameter import ModelWeightParameter
 
 logger = init_logger(__name__)
 
@@ -84,41 +81,22 @@ class GPTQInt2LinearMethod(QuantizeMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         pack_factor = 32 // self.bits
 
-        # Packed quantized weights
-        qweight = ModelWeightParameter(
-            data=torch.empty(
-                input_size_per_partition // pack_factor,
-                output_size_per_partition,
-                dtype=torch.int32,
-            ),
-            input_dim=0,
-            output_dim=1,
-            packed_dim=0,
-            packed_factor=pack_factor,
-        )
-        layer.register_parameter("qweight", qweight)
-
-        # Scales per group
+        # Simple parameters — loaded directly from safetensors
+        # No Marlin repack, no special weight_loader
         n_groups = input_size_per_partition // self.group_size
-        scales = BasevLLMParameter(
-            data=torch.empty(
-                n_groups, output_size_per_partition,
-                dtype=torch.float16,
-            ),
-            weight_loader=extra_weight_attrs.get("weight_loader"),
-        )
-        layer.register_parameter("scales", scales)
-
-        # Zero points (packed same as qweight)
         zp_packed_n = (output_size_per_partition + pack_factor - 1) // pack_factor
-        qzeros = BasevLLMParameter(
-            data=torch.empty(
-                n_groups, zp_packed_n,
-                dtype=torch.int32,
-            ),
-            weight_loader=extra_weight_attrs.get("weight_loader"),
-        )
-        layer.register_parameter("qzeros", qzeros)
+
+        layer.register_parameter("qweight", torch.nn.Parameter(
+            torch.empty(input_size_per_partition // pack_factor,
+                        output_size_per_partition, dtype=torch.int32),
+            requires_grad=False))
+        layer.register_parameter("scales", torch.nn.Parameter(
+            torch.empty(n_groups, output_size_per_partition,
+                        dtype=torch.float16),
+            requires_grad=False))
+        layer.register_parameter("qzeros", torch.nn.Parameter(
+            torch.empty(n_groups, zp_packed_n, dtype=torch.int32),
+            requires_grad=False))
 
         # Store config on layer for apply()
         layer._gptq_bits = self.bits
