@@ -84,7 +84,7 @@ class GPTQInt2LinearMethod(QuantizeMethodBase):
         n_groups = input_size_per_partition // self.group_size
         zp_packed_n = (output_size_per_partition + pack_factor - 1) // pack_factor
 
-        def _default_loader(param, loaded_weight):
+        def _default_loader(param, loaded_weight, *args):
             param.data.copy_(loaded_weight)
 
         for name, shape, dtype in [
