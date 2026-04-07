@@ -901,12 +901,24 @@ def dispatch_fused_moe_kernel(
     ):
         assert B_bias is None
 
+        # Infer actual bit width for sub-4-bit
+        K_full = A.size(1)
+        K_packed_u8 = B.size(2)
+        K_packed_i32 = K_packed_u8 // 4
+        _actual_bit = 32 // (K_full // K_packed_i32) if K_packed_i32 > 0 and K_full // K_packed_i32 >= 2 else 4
+        if _actual_bit not in (2, 3, 4, 8):
+            _actual_bit = 4
+
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
             group_size=block_shape[1],
             num_experts=B.size(0),
-            bit=4 if use_int4_w4a16 else 8,
+            bit=_actual_bit,
         )
+
+        # CUDA MoE kernel only supports INT4/INT8. For INT2/INT3, force Triton.
+        if _actual_bit < 4:
+            use_moe_wna16_cuda = False
 
         if use_moe_wna16_cuda:
             invoke_fused_moe_wna16_cuda_kernel(
