@@ -262,7 +262,7 @@ class INCConfig(QuantizationConfig):
                     "quant_method": "gptq",
                     "bits": weight_bits,
                     "group_size": group_size,
-                    "zero_point": not sym,
+                    "sym": sym,
                     "lm_head": False,
                 }
                 return MoeWNA16Config.from_config(config).get_quant_method(
@@ -370,7 +370,7 @@ class INCConfig(QuantizationConfig):
                     "quant_method": "gptq",
                     "bits": weight_bits,
                     "group_size": group_size,
-                    "zero_point": not sym,
+                    "sym": sym,
                     "lm_head": False,
                 }
                 return MoeWNA16Config.from_config(config).get_quant_method(
