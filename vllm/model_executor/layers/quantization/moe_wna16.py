@@ -9,6 +9,8 @@ from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
+    int2_w2a16_moe_quant_config,
+    int3_w3a16_moe_quant_config,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
@@ -51,7 +53,10 @@ class MoeWNA16Config(QuantizationConfig):
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.has_zp = has_zp
-        self.bit8_pack_factor = 8 // self.weight_bits
+        # For power-of-2 bits (2,4,8): clean division
+        # For 3-bit: use Fraction for correct packed size
+        from fractions import Fraction
+        self.bit8_pack_factor = Fraction(8, self.weight_bits)
         self.lm_head_quantized = lm_head_quantized
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
@@ -349,7 +354,11 @@ class MoeWNA16Method(FusedMoEMethodBase):
         has_zp = self.quant_config.has_zp
         assert weight_bits in [2, 3, 4, 8], \
             f"Unsupported weight_bits={weight_bits} for MoE quant config"
-        if weight_bits <= 4:
+        if weight_bits == 2:
+            config_builder = int2_w2a16_moe_quant_config
+        elif weight_bits == 3:
+            config_builder = int3_w3a16_moe_quant_config
+        elif weight_bits <= 4:
             config_builder = int4_w4a16_moe_quant_config
         else:
             config_builder = int8_w8a16_moe_quant_config
