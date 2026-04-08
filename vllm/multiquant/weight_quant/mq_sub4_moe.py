@@ -73,17 +73,27 @@ class MQSub4MoEMethod(MoeWNA16Method):
 
                 # Gate+Up: x[b] @ W13[expert]
                 x_row = x[b:b+1].to(torch.float16)  # [1, K]
-                w13_q = layer.w13_qweight[expert_id]   # [K_packed, N_inter]
-                w13_s = layer.w13_scales[expert_id]     # [n_groups, N_inter]
-                w13_z = layer.w13_qzeros[expert_id]     # [n_groups, N_zp]
+                # MoE stores as uint8, our kernel needs int32 — reinterpret
+                w13_q = layer.w13_qweight[expert_id].view(torch.int32)
+                w13_s = layer.w13_scales[expert_id].to(torch.float16)
+                w13_z = layer.w13_qzeros[expert_id].view(torch.int32)
 
-                gate_up = torch.zeros(1, N_intermediate, dtype=torch.float16,
+                # w13_q is [N_inter, K_packed_u8] after MoE transpose
+                # Our kernel expects [K_packed_i32, N_inter]
+                # Need to figure out the layout...
+                # MoE stores: [N, K_packed_u8] uint8 (transposed from GPTQ)
+                # Reinterpret: [N, K_packed_u8] u8 → [N, K_packed_u8/4] i32
+                w13_q_i32 = w13_q.reshape(w13_q.shape[0], -1)  # [N, K_packed_i32]
+                w13_q_i32 = w13_q_i32.T.contiguous()  # [K_packed_i32, N]
+                w13_z_i32 = w13_z.reshape(w13_z.shape[0], -1)  # [n_groups, Nzp_i32]
+
+                gate_up = torch.zeros(1, w13_q_i32.shape[1], dtype=torch.float16,
                                       device=x.device)
                 if bits == 2:
-                    kernel.mq_gemm_int2(x_row, w13_q, w13_s, w13_z,
+                    kernel.mq_gemm_int2(x_row, w13_q_i32, w13_s, w13_z_i32,
                                         gate_up, group_size)
                 elif bits == 3:
-                    kernel.mq_gemm_int3(x_row, w13_q, w13_s, w13_z,
+                    kernel.mq_gemm_int3(x_row, w13_q_i32, w13_s, w13_z_i32,
                                         gate_up, K, group_size)
 
                 # SiLU activation: gate * silu(up)
@@ -95,18 +105,20 @@ class MQSub4MoEMethod(MoeWNA16Method):
 
                 # Down: activated @ W2[expert]
                 act_row = activated.unsqueeze(0)  # [1, half_n]
-                w2_q = layer.w2_qweight[expert_id]
-                w2_s = layer.w2_scales[expert_id]
-                w2_z = layer.w2_qzeros[expert_id]
+                w2_q = layer.w2_qweight[expert_id].view(torch.int32)
+                w2_s = layer.w2_scales[expert_id].to(torch.float16)
+                w2_z = layer.w2_qzeros[expert_id].view(torch.int32)
+                w2_q_i32 = w2_q.reshape(w2_q.shape[0], -1).T.contiguous()
+                w2_z_i32 = w2_z.reshape(w2_z.shape[0], -1)
 
-                down = torch.zeros(1, N_down_out, dtype=torch.float16,
+                down = torch.zeros(1, w2_q_i32.shape[1], dtype=torch.float16,
                                    device=x.device)
                 if bits == 2:
-                    kernel.mq_gemm_int2(act_row, w2_q, w2_s, w2_z,
+                    kernel.mq_gemm_int2(act_row, w2_q_i32, w2_s, w2_z_i32,
                                         down, group_size)
                 elif bits == 3:
                     K_down = act_row.shape[1]
-                    kernel.mq_gemm_int3(act_row, w2_q, w2_s, w2_z,
+                    kernel.mq_gemm_int3(act_row, w2_q_i32, w2_s, w2_z_i32,
                                         down, K_down, group_size)
 
                 output[b] += weight * down[0].to(output.dtype)
