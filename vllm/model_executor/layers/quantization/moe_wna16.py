@@ -309,7 +309,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
 
-        if self.quant_config.has_zp:
+        # Sub-4-bit GPTQ always has qzeros in safetensor (even with sym=True)
+        _alloc_zp = self.quant_config.has_zp or self.quant_config.weight_bits < 4
+        if _alloc_zp:
             w13_qzeros = torch.nn.Parameter(
                 torch.zeros(
                     num_experts,
@@ -338,7 +340,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             # some param are unused, but we need to init them in order to
             # load weights
             invalid_param_keys = ["w13_g_idx", "w2_g_idx"]
-            if not self.quant_config.has_zp:
+            if not _alloc_zp:
                 invalid_param_keys += ["w13_qzeros", "w2_qzeros"]
             for key in invalid_param_keys:
                 param = torch.nn.Parameter(
