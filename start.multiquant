@@ -15,6 +15,10 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────
 KV_DTYPE="tq3"
 WEIGHTS=""               # tq3 | tq4 | rq3 | rq4 (Archer online-quant, leer=keine)
+ROUTED=""                # Per-class: int2 int3 int4 tq3 tq4 rq3 rq4 (leer=vom Modell)
+SHARED=""                # Per-class: bf16 int4 (leer=vom Modell)
+ATTN=""                  # Per-class: int4 bf16 (leer=vom Modell)
+WMTP=""                  # Per-class: bf16 int4 (leer=bf16)
 MODEL_DIR="/data/tensordata"
 MODEL=""
 MTP=false
@@ -41,6 +45,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --kv)       KV_DTYPE="$2"; shift 2 ;;
         --weights)  WEIGHTS="$2"; shift 2 ;;
+        --routed)   ROUTED="$2"; shift 2 ;;
+        --shared)   SHARED="$2"; shift 2 ;;
+        --attn)     ATTN="$2"; shift 2 ;;
+        --wmtp)     WMTP="$2"; shift 2 ;;
         --model)    MODEL="$2"; shift 2 ;;
         --tp)       TP="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
@@ -62,6 +70,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 auto (default: tq3)"
             echo "  --tp N           Tensor Parallelism (default: 1)"
             echo "  --weights TYPE   Archer online-quant: tq3 tq4 rq3 rq4 (leer=keine)"
+            echo ""
+            echo "  Per-Class Gewichte (RTN quant-on-load, nur fuer BF16-Modelle):"
+            echo "  --routed TYPE    Routed Experts: int2 int3 int4 (leer=vom Modell)"
+            echo "  --shared TYPE    Shared Experts: bf16 int4 (leer=vom Modell)"
+            echo "  --attn TYPE      Attention: int4 bf16 (leer=vom Modell)"
+            echo "  --wmtp TYPE      MTP Layers: bf16 int4 (leer=bf16)"
             echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
@@ -104,13 +118,27 @@ MODEL_NAME=$(basename "$MODEL_PATH")
 QUANT_ARGS=()
 QUANT_ENV=()
 
+# Determine if any RTN quantization is requested
+_ANY_RTN=false
+[[ -n "$WEIGHTS" || -n "$ROUTED" || -n "$SHARED" || -n "$ATTN" || -n "$WMTP" ]] && _ANY_RTN=true
+
 if [[ -n "$WEIGHTS" ]]; then
     # Archer online-quant: BF16/FP8 → compressed at load time
     QUANT_ARGS+=("--quantization" "multiquant")
     QUANT_LABEL="Archer ${WEIGHTS^^}"
+elif $_ANY_RTN; then
+    # Per-class RTN: BF16 → GPTQ at load time
+    QUANT_ARGS+=("--quantization" "autoround_rtn")
+    QUANT_LABEL="RTN per-class"
 else
     QUANT_LABEL="(vom Modell)"
 fi
+
+# Per-class weight dtype overrides
+[[ -n "$ROUTED" ]] && QUANT_ARGS+=("--weight-dtype-routed" "$ROUTED")
+[[ -n "$SHARED" ]] && QUANT_ARGS+=("--weight-dtype-shared" "$SHARED")
+[[ -n "$ATTN" ]]   && QUANT_ARGS+=("--weight-dtype-attn" "$ATTN")
+[[ -n "$WMTP" ]]   && QUANT_ARGS+=("--weight-dtype-mtp" "$WMTP")
 
 # ── MTP ───────────────────────────────────────────────────
 MTP_LABEL="aus"
@@ -152,6 +180,12 @@ printf "║  MultiQuant Serve                                    ║\n"
 printf "╠══════════════════════════════════════════════════════╣\n"
 printf "║  Modell:   %-40s ║\n" "$MODEL_NAME"
 printf "║  Gewichte: %-40s ║\n" "$QUANT_LABEL"
+if $_ANY_RTN && [[ -z "$WEIGHTS" ]]; then
+printf "║    Routed: %-40s ║\n" "${ROUTED:-vom Modell}"
+printf "║    Shared: %-40s ║\n" "${SHARED:-vom Modell}"
+printf "║    Attn:   %-40s ║\n" "${ATTN:-vom Modell}"
+printf "║    MTP:    %-40s ║\n" "${WMTP:-bf16}"
+fi
 printf "║  KV-Cache: %-40s ║\n" "$KV_DTYPE"
 printf "║  TP:       %-40s ║\n" "$TP"
 printf "║  MTP:      %-40s ║\n" "$MTP_LABEL"
@@ -222,5 +256,6 @@ echo "  Beispiele:"
 echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound"
 echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4"
 echo "    ./start.multiquant --model GLM-4.7-Flash --weights tq3"
+echo "    ./start.multiquant --model GLM-4.7-Flash --routed int3 --kv tq3"
+echo "    ./start.multiquant --model GLM-4.7-Flash --routed int4 --attn int4 --shared bf16"
 echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp"
-echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --riy /data/tensordata/riy_profile_397b.json"
