@@ -399,6 +399,7 @@ class EngineArgs:
     weight_dtype_shared: str | None = None
     weight_dtype_routed: str | None = None
     weight_dtype_attn: str | None = None
+    weight_dtype_mtp: str | None = None
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1587,6 +1588,8 @@ class EngineArgs:
             _mqc = model_qc
         else:
             _mqc = None
+        _hf_text = getattr(model_config, "hf_text_config",
+                           getattr(model_config, "hf_config", None))
         self._mq_policy = MultiQuantPolicyRegistry.from_cli(
             kv_cache_dtype=resolved_cache_dtype,
             k_dtype=self.k_dtype,
@@ -1595,7 +1598,9 @@ class EngineArgs:
             weight_dtype_shared=self.weight_dtype_shared,
             weight_dtype_routed=self.weight_dtype_routed,
             weight_dtype_attn=self.weight_dtype_attn,
+            weight_dtype_mtp=getattr(self, "weight_dtype_mtp", None),
             model_quant_config=_mqc,
+            hf_config=_hf_text,
         )
         self._mq_policy.log_policy()
 
