@@ -137,7 +137,16 @@ class MultiQuantPolicyRegistry:
 
     Built at startup from CLI args + model config.
     Immutable after construction.
+
+    Singleton: the active instance is accessible via ``get_active()``.
     """
+
+    _active: Optional["MultiQuantPolicyRegistry"] = None
+
+    @classmethod
+    def get_active(cls) -> Optional["MultiQuantPolicyRegistry"]:
+        """Return the active policy registry (set by from_cli)."""
+        return cls._active
 
     def __init__(self):
         # Default: everything bf16
@@ -412,6 +421,7 @@ class MultiQuantPolicyRegistry:
         if weight_dtype_mtp is not None:
             reg.set(MTP, weight_dtype_mtp, "cli")
 
+        cls._active = reg
         return reg
 
     def log_policy(self) -> None:

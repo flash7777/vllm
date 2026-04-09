@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AutoRound RTN online linear method — BF16 → INT4 packed at load time.
+"""AutoRound RTN online linear method — BF16 → GPTQ format at load time.
 
-Simple: load BF16 normally, quantize in process_weights_after_loading,
-store packed int32, decompress on-the-fly in apply().
+Loads BF16 normally, packs to GPTQ int32 in process_weights_after_loading,
+then delegates inference to MQSub4LinearMethod (INT2/INT3) or Marlin (INT4).
+
+Same storage format as pre-quantized AutoRound/GPTQ models → same kernels.
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -25,12 +26,19 @@ logger = init_logger(__name__)
 
 
 class AutoRoundRTNLinearMethod(QuantizeMethodBase):
-    """BF16 → INT4 symmetric RTN at load time."""
+    """BF16 → GPTQ-format INT2/INT3/INT4 at load time.
+
+    After packing, delegates apply() to MQSub4LinearMethod (INT2/3)
+    or uses the packed format directly for INT4 (Marlin-compatible).
+    """
 
     uses_meta_device: bool = False
 
-    def __init__(self, quant_config: AutoRoundRTNConfig):
+    def __init__(self, quant_config: "AutoRoundRTNConfig",
+                 bits: int = 4, group_size: int = 128):
         self.quant_config = quant_config
+        self.bits = bits
+        self.group_size = group_size
 
     def create_weights(
         self,
@@ -56,106 +64,100 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """BF16 → packed INT4 int32."""
+        """BF16 → GPTQ int32 packed format."""
         if getattr(layer, "_rtn_packed", False):
             return
 
-        W = layer.weight.data.float()
-        out_features, in_features = W.shape
+        from vllm.multiquant.autoround.rtn_pack import rtn_pack_gptq
+
+        W = layer.weight.data  # [N, K] (out_features, in_features)
+        N, K = W.shape
         device = W.device
-        bits = self.quant_config.bits
-        group_size = self.quant_config.group_size
-        n_levels = 2 ** bits
 
-        if group_size <= 0 or group_size > in_features:
-            group_size = in_features
-        n_groups = (in_features + group_size - 1) // group_size
+        qweight, scales, qzeros = rtn_pack_gptq(
+            W.float(), self.bits, self.group_size)
 
-        # Per-group symmetric RTN
-        scales = torch.zeros(n_groups, out_features, dtype=torch.float32,
-                             device=device)
-        W_int = torch.zeros_like(W, dtype=torch.int32)
+        # Replace BF16 weight with GPTQ tensors
+        del layer.weight
+        layer.qweight = nn.Parameter(qweight.to(device), requires_grad=False)
+        layer.scales = nn.Parameter(scales.to(device), requires_grad=False)
+        layer.qzeros = nn.Parameter(qzeros.to(device), requires_grad=False)
+        layer.g_idx = nn.Parameter(
+            torch.empty(0, dtype=torch.int32, device=device),
+            requires_grad=False)
 
-        for g in range(n_groups):
-            start = g * group_size
-            end = min(start + group_size, in_features)
-            group = W[:, start:end]
-            max_val = group.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-            scale = max_val / (n_levels // 2 - 1)
-            scales[g] = scale.squeeze(-1)
-            q = torch.clamp(
-                torch.round(group / scale),
-                -(n_levels // 2), n_levels // 2 - 1,
-            ).to(torch.int32)
-            W_int[:, start:end] = q
-
-        # Pack into int32
-        pack_factor = 32 // bits
-        W_unsigned = (W_int + n_levels // 2).to(torch.int32)
-        packed_cols = (in_features + pack_factor - 1) // pack_factor
-        packed_w = torch.zeros(out_features, packed_cols,
-                               dtype=torch.int32, device=device)
-        for k in range(pack_factor):
-            cols = torch.arange(k, in_features, pack_factor, device=device)
-            packed_w[:, :len(cols)] |= (
-                (W_unsigned[:, cols] & ((1 << bits) - 1)) << (k * bits)
-            )
-
-        # Replace weight
-        layer.weight = nn.Parameter(packed_w, requires_grad=False)
-        layer.register_buffer("_rtn_scales",
-                              scales.T.contiguous().half(), persistent=False)
         layer._rtn_packed = True
-        layer._rtn_in_features = in_features
-        layer._rtn_bits = bits
-        layer._rtn_group_size = group_size
+        layer._rtn_bits = self.bits
 
         logger.info(
-            "RTN: %s (%dx%d) → INT%d packed, %.1f%% of BF16",
-            getattr(layer, "layer_name", "?"),
-            out_features, in_features, bits,
-            100.0 * packed_w.numel() * 4 / (out_features * in_features * 2),
+            "RTN: %s (%dx%d) → INT%d GPTQ, %.1f%% of BF16",
+            getattr(layer, "layer_name", "?"), N, K, self.bits,
+            100.0 * qweight.numel() * 4 / (N * K * 2),
         )
 
-    @torch.compiler.disable
     def apply(
         self,
         layer: nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if getattr(layer, "_rtn_packed", False):
-            W = self._decompress(layer).to(x.dtype)
-            return F.linear(x, W, bias)
-        return F.linear(x, layer.weight, bias)
+        """Delegate to MQSub4LinearMethod for INT2/INT3 fused GEMM."""
+        if not getattr(layer, "_rtn_packed", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
+        bits = layer._rtn_bits
+        if bits in (2, 3):
+            # Use MQSub4LinearMethod's apply (fused GEMM kernels)
+            from vllm.multiquant.weight_quant.mq_sub4_linear import (
+                _load_mq_gemm,
+            )
+            kernel = _load_mq_gemm(bits)
+            if kernel is None:
+                raise RuntimeError(
+                    f"mq_gemm_int{bits} kernel not available")
+
+            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+            reshaped_x = x.reshape(-1, x.shape[-1]).to(torch.float16)
+            M = reshaped_x.shape[0]
+            N = layer.qweight.shape[1]
+
+            C = torch.zeros(M, N, dtype=torch.float16, device=x.device)
+            if bits == 2:
+                kernel.mq_gemm_int2(
+                    reshaped_x, layer.qweight, layer.scales,
+                    layer.qzeros, C, self.group_size)
+            else:
+                K = reshaped_x.shape[1]
+                kernel.mq_gemm_int3(
+                    reshaped_x, layer.qweight, layer.scales,
+                    layer.qzeros, C, K, self.group_size)
+
+            if bias is not None:
+                C.add_(bias)
+            return C.reshape(out_shape)
+
+        # INT4: decompress + F.linear (TODO: Marlin integration)
+        W = self._decompress_int4(layer).to(x.dtype)
+        return torch.nn.functional.linear(x, W, bias)
 
     @torch.compiler.disable
-    def _decompress(self, layer: nn.Module) -> torch.Tensor:
-        packed = layer.weight.data
-        out_features = packed.shape[0]
-        in_features = layer._rtn_in_features
-        bits = layer._rtn_bits
-        group_size = layer._rtn_group_size
-        scales = layer._rtn_scales.float()  # (out, n_groups)
-        device = packed.device
+    def _decompress_int4(self, layer: nn.Module) -> torch.Tensor:
+        """Fallback INT4 decompress for non-Marlin path."""
+        qw = layer.qweight  # [K/8, N]
+        scales = layer.scales  # [n_groups, N]
+        K_packed, N = qw.shape
+        K = K_packed * 8
+        device = qw.device
 
-        n_levels = 2 ** bits
-        pack_factor = 32 // bits
+        W = torch.zeros(K, N, dtype=torch.float32, device=device)
+        for i in range(8):
+            vals = ((qw >> (i * 4)) & 0xF).float()
+            W[torch.arange(K_packed, device=device) * 8 + i] = vals
 
-        W_float = torch.zeros(out_features, in_features,
-                              dtype=torch.float32, device=device)
-        for k in range(pack_factor):
-            cols = torch.arange(k, in_features, pack_factor, device=device)
-            W_float[:, cols] = (
-                ((packed[:, :len(cols)] >> (k * bits))
-                 & ((1 << bits) - 1)).float() - n_levels // 2
-            )
+        n_groups = scales.shape[0]
+        gs = self.group_size
+        gi = torch.arange(K, device=device) // gs
+        gi = gi.clamp(max=n_groups - 1)
+        W = scales[gi].float() * (W - 8.0)  # zp=8 for INT4
 
-        # Apply per-group scales
-        n_groups = scales.shape[1]
-        for g in range(n_groups):
-            start = g * group_size
-            end = min(start + group_size, in_features)
-            W_float[:, start:end] *= scales[:, g].unsqueeze(-1)
-
-        return W_float
+        return W.T  # [N, K] for F.linear
