@@ -117,8 +117,10 @@ class AutoRoundRTNConfig(QuantizationConfig):
                 from vllm.multiquant.autoround.online_moe import (
                     AutoRoundRTNMoEMethod,
                 )
-                return AutoRoundRTNMoEMethod(self, bits=bits,
-                                             group_size=group_size)
+                moe_config = getattr(layer, "moe_config", None)
+                return AutoRoundRTNMoEMethod(
+                    self, bits=bits, group_size=group_size,
+                    moe_config=moe_config)
         except ImportError:
             pass
 

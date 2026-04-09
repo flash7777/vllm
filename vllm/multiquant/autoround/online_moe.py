@@ -16,27 +16,31 @@ import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizeMethodBase,
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
 )
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.multiquant.autoround.config import AutoRoundRTNConfig
 
 logger = init_logger(__name__)
 
 
-class AutoRoundRTNMoEMethod(QuantizeMethodBase):
+class AutoRoundRTNMoEMethod(FusedMoEMethodBase):
     """BF16 MoE → GPTQ-format INT2/INT3/INT4 at load time.
 
-    Inherits weight allocation from the default MoE method.
+    Inherits weight allocation from UnquantizedFusedMoEMethod.
     process_weights_after_loading packs each expert via rtn_pack_gptq,
     then transforms to kernel format via MQSub4MoEMethod logic.
-    apply() delegates to MQSub4MoEMethod.
+    apply() delegates to per-expert fused GEMM.
     """
 
     def __init__(self, quant_config: "AutoRoundRTNConfig",
-                 bits: int = 4, group_size: int = 128):
+                 bits: int = 4, group_size: int = 128,
+                 moe_config: "FusedMoEConfig | None" = None):
+        if moe_config is not None:
+            super().__init__(moe_config)
         self.quant_config = quant_config
         self.bits = bits
         self.group_size = group_size
@@ -51,11 +55,10 @@ class AutoRoundRTNMoEMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Allocate BF16 weights — standard FusedMoE allocation."""
-        # Use default unquantized MoE weight allocation
-        from vllm.model_executor.layers.fused_moe.layer import (
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
             UnquantizedFusedMoEMethod,
         )
-        self._unquant = UnquantizedFusedMoEMethod()
+        self._unquant = UnquantizedFusedMoEMethod(self.moe)
         self._unquant.create_weights(
             layer, num_experts, hidden_size,
             intermediate_size_per_partition, params_dtype,
