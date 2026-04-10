@@ -78,13 +78,6 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         N, K = W.shape
         device = W.device
 
-        # Debug: verify weight is loaded (not zeros)
-        w_mean = W.float().mean().item()
-        w_std = W.float().std().item()
-        w_zero = W.eq(0).all().item()
-        logger.info("RTN pwl: %s W=[%d,%d] mean=%.6f std=%.6f allzero=%s",
-                     getattr(layer, "layer_name", "?"), N, K,
-                     w_mean, w_std, w_zero)
 
         qweight, scales, qzeros = rtn_pack_gptq(
             W.float(), self.bits, self.group_size)
@@ -199,8 +192,9 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
                 C.add_(bias)
             return C.reshape(out_shape)
 
-        # INT4: dequant+cache then F.linear (debug path)
-        # TODO: switch to Marlin once mixed-quant dtype issue is resolved
+        # INT4: dequant+cache then F.linear
+        # TODO: Marlin repack produces garbage in mixed-quant mode,
+        # needs investigation. Dequant-cache is correct but slower.
         return self._apply_int4_dequant(layer, x, bias)
 
     def _apply_marlin(self, layer: nn.Module,
@@ -213,10 +207,6 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         )
 
         input_dtype = x.dtype
-        if not hasattr(self, '_logged_apply'):
-            logger.info("RTN apply: x.dtype=%s x.shape=%s N=%d K=%d",
-                        x.dtype, x.shape, layer._rtn_N, layer._rtn_K)
-            self._logged_apply = True
         result = apply_gptq_marlin_linear(
             input=x,
             weight=layer.marlin_qweight,
