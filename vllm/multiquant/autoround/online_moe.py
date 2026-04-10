@@ -45,6 +45,10 @@ class AutoRoundRTNMoEMethod(FusedMoEMethodBase):
         self.bits = bits
         self.group_size = group_size
 
+    def get_fused_moe_quant_config(self, layer):
+        """No special quant config — we handle packing ourselves."""
+        return None
+
     def create_weights(
         self,
         layer: nn.Module,

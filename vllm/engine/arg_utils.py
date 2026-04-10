@@ -1604,6 +1604,22 @@ class EngineArgs:
         )
         self._mq_policy.log_policy()
 
+        # Inject policy into quantization_config so it survives Engine Core
+        # process fork (AutoRoundRTNConfig.from_config reads it back)
+        # Uses dtype strings (not just bits) for future-proofing:
+        # int4, nf4, mxfp4 all have 4 bits but need different kernels.
+        if self.quantization == "autoround_rtn":
+            qc = getattr(model_config.hf_config, "quantization_config", None)
+            if qc is None:
+                qc = {}
+            qc["_mq_class_dtype"] = {
+                k: p.dtype for k, p in self._mq_policy._policies.items()
+            }
+            qc["_mq_class_gs"] = {
+                k: p.group_size for k, p in self._mq_policy._policies.items()
+            }
+            model_config.hf_config.quantization_config = qc
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
