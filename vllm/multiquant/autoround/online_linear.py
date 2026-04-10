@@ -95,20 +95,20 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             torch.empty(0, dtype=W.dtype, device=device),
             requires_grad=False)
 
+        # Always store raw GPTQ tensors (needed for dequant fallback and INT2/3)
+        layer.qweight = nn.Parameter(
+            qweight.to(device), requires_grad=False)
+        layer.scales = nn.Parameter(
+            scales.to(device), requires_grad=False)
+        layer.qzeros = nn.Parameter(
+            qzeros.to(device), requires_grad=False)
+        layer.g_idx = nn.Parameter(
+            torch.empty(0, dtype=torch.int32, device=device),
+            requires_grad=False)
+
         if self.bits == 4:
-            # Marlin repack for fused INT4 dequant+GEMM
+            # Additionally repack for Marlin fused kernel
             self._setup_marlin(layer, qweight, scales, N, K, device)
-        else:
-            # INT2/INT3: raw GPTQ format for mq_gemm kernels
-            layer.qweight = nn.Parameter(
-                qweight.to(device), requires_grad=False)
-            layer.scales = nn.Parameter(
-                scales.to(device), requires_grad=False)
-            layer.qzeros = nn.Parameter(
-                qzeros.to(device), requires_grad=False)
-            layer.g_idx = nn.Parameter(
-                torch.empty(0, dtype=torch.int32, device=device),
-                requires_grad=False)
 
         layer._rtn_packed = True
         layer._rtn_bits = self.bits
