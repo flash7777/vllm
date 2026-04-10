@@ -82,11 +82,8 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         qweight, scales, qzeros = rtn_pack_gptq(
             W.float(), self.bits, self.group_size)
 
-        # Replace BF16 weight — keep a tiny dummy to avoid breaking
-        # vLLM's parameter tracking (del can break weight sharing/references)
-        layer.weight = nn.Parameter(
-            torch.empty(0, dtype=W.dtype, device=device),
-            requires_grad=False)
+        # Keep weight (Marlin repack may need it)
+        pass
 
         # Always store raw GPTQ tensors (needed for dequant fallback and INT2/3)
         layer.qweight = nn.Parameter(
@@ -99,9 +96,8 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             torch.empty(0, dtype=torch.int32, device=device),
             requires_grad=False)
 
-        if self.bits == 4:
-            # Additionally repack for Marlin fused kernel
-            self._setup_marlin(layer, qweight, scales, N, K, device)
+        # INT4: GPTQ tensors stored, dequant-cache in apply()
+        # TODO: Marlin repack for full speed
 
         layer._rtn_packed = True
         layer._rtn_bits = self.bits
@@ -115,41 +111,36 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             100.0 * qweight.numel() * 4 / (N * K * 2),
         )
 
-    def _setup_marlin(self, layer: nn.Module,
-                      qweight: torch.Tensor, scales: torch.Tensor,
-                      N: int, K: int, device: torch.device) -> None:
-        """Repack GPTQ weights to Marlin layout."""
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            marlin_make_workspace_new,
-            marlin_permute_scales,
-        )
+    def _setup_marlin_via_gptq(self, layer: nn.Module,
+                              N: int, K: int,
+                              device: torch.device) -> None:
+        """Let standard GPTQMarlin handle repack.
 
-        qweight = qweight.to(device)
-        scales = scales.to(device)
-
-        # Empty g_idx (no activation order)
-        g_idx = torch.empty(0, dtype=torch.int32, device=device)
-        g_idx_sort = torch.empty(0, dtype=torch.int32, device=device)
-
-        # Repack weights for Marlin kernel
-        marlin_qweight = ops.gptq_marlin_repack(
-            qweight, g_idx_sort, K, N, num_bits=4)
-
-        # Permute scales for Marlin's MMA layout
-        marlin_scales = marlin_permute_scales(
-            scales, K, N, self.group_size)
-
-        # Workspace for Marlin kernel
-        workspace = marlin_make_workspace_new(device)
-
-        layer.marlin_qweight = nn.Parameter(
-            marlin_qweight, requires_grad=False)
-        layer.marlin_scales = nn.Parameter(
-            marlin_scales, requires_grad=False)
-        layer.marlin_workspace = workspace  # buffer, not parameter
-        layer.marlin_g_idx = g_idx
-        layer.marlin_g_idx_sort = g_idx_sort
+        Creates a GPTQMarlinLinearMethod, calls its process_weights_after_loading
+        on our GPTQ tensors, and stores it for apply() delegation.
+        """
+        try:
+            from vllm.model_executor.layers.quantization.gptq_marlin import (
+                GPTQMarlinConfig,
+                GPTQMarlinLinearMethod,
+            )
+            gptq_config = GPTQMarlinConfig(
+                weight_bits=4,
+                group_size=self.group_size,
+                desc_act=False,
+                is_sym=True,
+                lm_head_quantized=False,
+                dynamic={},
+                full_config={},
+            )
+            marlin_method = gptq_config.get_quant_method(layer, prefix="")
+            if marlin_method is not None:
+                marlin_method.process_weights_after_loading(layer)
+                layer._marlin_method = marlin_method
+                logger.info("RTN: Marlin repack delegated to GPTQMarlinLinearMethod")
+        except Exception as e:
+            logger.warning("RTN: Marlin delegation failed (%s), "
+                           "using dequant-cache fallback", e)
 
     def apply(
         self,
@@ -192,9 +183,7 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
                 C.add_(bias)
             return C.reshape(out_shape)
 
-        # INT4: dequant+cache then F.linear
-        # TODO: Marlin repack produces garbage in mixed-quant mode,
-        # needs investigation. Dequant-cache is correct but slower.
+        # INT4: dequant-cache (Marlin delegation TODO)
         return self._apply_int4_dequant(layer, x, bias)
 
     def _apply_marlin(self, layer: nn.Module,
@@ -206,13 +195,11 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             apply_gptq_marlin_linear,
         )
 
-        input_dtype = x.dtype
-        result = apply_gptq_marlin_linear(
+        return apply_gptq_marlin_linear(
             input=x,
             weight=layer.marlin_qweight,
             weight_scale=layer.marlin_scales,
-            weight_zp=torch.empty(0, dtype=torch.int32,
-                                  device=x.device),
+            weight_zp=layer.marlin_zp,
             g_idx=layer.marlin_g_idx,
             g_idx_sort_indices=layer.marlin_g_idx_sort,
             workspace=layer.marlin_workspace,
@@ -221,12 +208,8 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             input_size_per_partition=layer._rtn_K,
             is_k_full=True,
             bias=bias,
+            input_dtype=x.dtype,
         )
-        # Marlin scales are fp16 → output may be fp16.
-        # Cast back to model dtype to avoid mixed-precision corruption.
-        if result.dtype != input_dtype:
-            result = result.to(input_dtype)
-        return result
 
     def _apply_int4_dequant(self, layer: nn.Module,
                             x: torch.Tensor,
