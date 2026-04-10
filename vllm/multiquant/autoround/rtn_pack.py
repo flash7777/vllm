@@ -68,18 +68,21 @@ def rtn_pack_gptq(
     W_unsigned = (W_int + zp).to(torch.int32)  # [N, K]
 
     # --- Pack into GPTQ format: [K_packed, N] int32 ---
-    scales_fp16 = scales.to(torch.float16)
+    # Keep scales in float16 for now — Marlin and mq_gemm both expect fp16.
+    # For bfloat16 models: Marlin handles the conversion internally,
+    # but scales MUST be float16 for the permutation to work correctly.
+    scales_out = scales.to(torch.float16)
 
     if bits in (2, 4):
-        qweight, qzeros = _pack_uniform(W_unsigned, scales_fp16,
+        qweight, qzeros = _pack_uniform(W_unsigned, scales_out,
                                          bits, n_groups, group_size,
                                          N, K, zp, device)
     else:
-        qweight, qzeros = _pack_int3(W_unsigned, scales_fp16,
+        qweight, qzeros = _pack_int3(W_unsigned, scales_out,
                                       n_groups, group_size,
                                       N, K, zp, device)
 
-    return qweight, scales_fp16, qzeros
+    return qweight, scales_out, qzeros
 
 
 def _pack_uniform(

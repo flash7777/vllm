@@ -78,11 +78,22 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         N, K = W.shape
         device = W.device
 
+        # Debug: verify weight is loaded (not zeros)
+        w_mean = W.float().mean().item()
+        w_std = W.float().std().item()
+        w_zero = W.eq(0).all().item()
+        logger.info("RTN pwl: %s W=[%d,%d] mean=%.6f std=%.6f allzero=%s",
+                     getattr(layer, "layer_name", "?"), N, K,
+                     w_mean, w_std, w_zero)
+
         qweight, scales, qzeros = rtn_pack_gptq(
             W.float(), self.bits, self.group_size)
 
-        # Replace BF16 weight with packed tensors
-        del layer.weight
+        # Replace BF16 weight — keep a tiny dummy to avoid breaking
+        # vLLM's parameter tracking (del can break weight sharing/references)
+        layer.weight = nn.Parameter(
+            torch.empty(0, dtype=W.dtype, device=device),
+            requires_grad=False)
 
         if self.bits == 4:
             # Marlin repack for fused INT4 dequant+GEMM
@@ -188,8 +199,9 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
                 C.add_(bias)
             return C.reshape(out_shape)
 
-        # INT4: Marlin fused dequant+GEMM kernel
-        return self._apply_marlin(layer, x, bias)
+        # INT4: dequant+cache then F.linear (debug path)
+        # TODO: switch to Marlin once mixed-quant dtype issue is resolved
+        return self._apply_int4_dequant(layer, x, bias)
 
     def _apply_marlin(self, layer: nn.Module,
                       x: torch.Tensor,
@@ -200,7 +212,12 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             apply_gptq_marlin_linear,
         )
 
-        return apply_gptq_marlin_linear(
+        input_dtype = x.dtype
+        if not hasattr(self, '_logged_apply'):
+            logger.info("RTN apply: x.dtype=%s x.shape=%s N=%d K=%d",
+                        x.dtype, x.shape, layer._rtn_N, layer._rtn_K)
+            self._logged_apply = True
+        result = apply_gptq_marlin_linear(
             input=x,
             weight=layer.marlin_qweight,
             weight_scale=layer.marlin_scales,
@@ -215,3 +232,23 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             is_k_full=True,
             bias=bias,
         )
+        # Marlin scales are fp16 → output may be fp16.
+        # Cast back to model dtype to avoid mixed-precision corruption.
+        if result.dtype != input_dtype:
+            result = result.to(input_dtype)
+        return result
+
+    def _apply_int4_dequant(self, layer: nn.Module,
+                            x: torch.Tensor,
+                            bias: torch.Tensor | None = None) -> torch.Tensor:
+        """INT4 dequant+cache, then F.linear. Debug path."""
+        layer_id = id(layer)
+        if not hasattr(self, '_dequant_cache'):
+            self._dequant_cache = {}
+        if layer_id not in self._dequant_cache:
+            from vllm.multiquant.weight_quant.mq_marlin3 import _dequant_gptq
+            W = _dequant_gptq(layer.qweight, layer.scales, layer.qzeros,
+                              4, self.group_size)
+            self._dequant_cache[layer_id] = W
+        W = self._dequant_cache[layer_id]
+        return torch.nn.functional.linear(x, W.to(x.dtype), bias)
