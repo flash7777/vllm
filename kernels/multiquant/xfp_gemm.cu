@@ -42,30 +42,56 @@ __global__ void xfp_gemm_kernel(
         (BITS == 2) ? 16 : (BITS == 3) ? 10 : 8;
     constexpr uint32_t MASK = (1u << BITS) - 1u;
     constexpr int LUT_SIZE = (1 << BITS);
+    constexpr int BLOCK_COLS = XFP_BLOCK_N * 4;        // 128 N values per block
+    constexpr int SMEM_LUT_ELEMS = BLOCK_COLS * LUT_SIZE;
+
+    // Shared-memory staging of the codebook slice for the 128 N-columns
+    // this block owns. 128 * 2^BITS fp16 entries = 1/2/4 KB for BITS 2/3/4.
+    // All threads in the block hit the same LUT window repeatedly across
+    // the K loop, so moving it from L1/global to SMEM removes the per-MAC
+    // global traffic that dominated v1.
+    __shared__ half s_cb[SMEM_LUT_ELEMS];
 
     int tid = threadIdx.x;
-    int n_base = blockIdx.x * XFP_BLOCK_N * 4;
+    int n_base = blockIdx.x * BLOCK_COLS;
     int m_base = blockIdx.y * M_COUNT;
     int kw_start = blockIdx.z * XFP_WORDS_PER_BLOCK;
     int kw_end = kw_start + XFP_WORDS_PER_BLOCK;
     if (kw_end > K_packed) kw_end = K_packed;
 
+    // Cooperative load: the 32 threads in this block together pull
+    // BLOCK_COLS * LUT_SIZE fp16 entries from global codebook into s_cb.
+    // Each thread handles (BLOCK_COLS * LUT_SIZE / 32) entries.
+    for (int idx = tid; idx < SMEM_LUT_ELEMS; idx += XFP_BLOCK_N) {
+        int n_local = idx / LUT_SIZE;
+        int entry = idx % LUT_SIZE;
+        int n_global = n_base + n_local;
+        s_cb[idx] = (n_global < N)
+            ? codebook[n_global * LUT_SIZE + entry]
+            : __float2half(0.0f);
+    }
+    __syncthreads();
+
     int n = n_base + tid * 4;
     if (n >= N || m_base >= M) return;
 
-    // Per-column codebook pointers (register cached).
-    const half* cb0 = (n + 0 < N) ? (codebook + (n + 0) * LUT_SIZE) : nullptr;
-    const half* cb1 = (n + 1 < N) ? (codebook + (n + 1) * LUT_SIZE) : nullptr;
-    const half* cb2 = (n + 2 < N) ? (codebook + (n + 2) * LUT_SIZE) : nullptr;
-    const half* cb3 = (n + 3 < N) ? (codebook + (n + 3) * LUT_SIZE) : nullptr;
+    // Per-column pointers into shared memory. cheap bounds check on n.
+    const half* cb0 = s_cb + (tid * 4 + 0) * LUT_SIZE;
+    const half* cb1 = s_cb + (tid * 4 + 1) * LUT_SIZE;
+    const half* cb2 = s_cb + (tid * 4 + 2) * LUT_SIZE;
+    const half* cb3 = s_cb + (tid * 4 + 3) * LUT_SIZE;
+    bool v0 = (n + 0 < N);
+    bool v1 = (n + 1 < N);
+    bool v2_ = (n + 2 < N);
+    bool v3_ = (n + 3 < N);
 
     float acc[M_COUNT][4] = {};
 
     for (int kw = kw_start; kw < kw_end; kw++) {
-        uint32_t w0 = cb0 ? B_packed[kw * N + n + 0] : 0u;
-        uint32_t w1 = cb1 ? B_packed[kw * N + n + 1] : 0u;
-        uint32_t w2 = cb2 ? B_packed[kw * N + n + 2] : 0u;
-        uint32_t w3 = cb3 ? B_packed[kw * N + n + 3] : 0u;
+        uint32_t w0 = v0 ? B_packed[kw * N + n + 0] : 0u;
+        uint32_t w1 = v1 ? B_packed[kw * N + n + 1] : 0u;
+        uint32_t w2 = v2_ ? B_packed[kw * N + n + 2] : 0u;
+        uint32_t w3 = v3_ ? B_packed[kw * N + n + 3] : 0u;
 
         int k_base = kw * VALS_PER_WORD;
         int vals_this_word = VALS_PER_WORD;
@@ -81,10 +107,11 @@ __global__ void xfp_gemm_kernel(
             int i2 = (int)((w2 >> (i * BITS)) & MASK);
             int i3 = (int)((w3 >> (i * BITS)) & MASK);
 
-            float wv0 = cb0 ? __half2float(cb0[i0]) : 0.0f;
-            float wv1 = cb1 ? __half2float(cb1[i1]) : 0.0f;
-            float wv2 = cb2 ? __half2float(cb2[i2]) : 0.0f;
-            float wv3 = cb3 ? __half2float(cb3[i3]) : 0.0f;
+            // SMEM LUT lookups replace v1's global codebook reads.
+            float wv0 = __half2float(cb0[i0]);
+            float wv1 = __half2float(cb1[i1]);
+            float wv2 = __half2float(cb2[i2]);
+            float wv3 = __half2float(cb3[i3]);
 
             #pragma unroll
             for (int m = 0; m < M_COUNT; m++) {
@@ -103,13 +130,13 @@ __global__ void xfp_gemm_kernel(
     for (int m = 0; m < M_COUNT; m++) {
         int mi = m_base + m;
         if (mi >= M) break;
-        if (cb0) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 0]),
-                           __float2half(acc[m][0]));
-        if (cb1) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 1]),
-                           __float2half(acc[m][1]));
-        if (cb2) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 2]),
+        if (v0) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 0]),
+                          __float2half(acc[m][0]));
+        if (v1) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 1]),
+                          __float2half(acc[m][1]));
+        if (v2_) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 2]),
                            __float2half(acc[m][2]));
-        if (cb3) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 3]),
+        if (v3_) atomicAdd(reinterpret_cast<half*>(&C[mi * N + n + 3]),
                            __float2half(acc[m][3]));
     }
 }

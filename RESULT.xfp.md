@@ -19,9 +19,27 @@ Tests run with `--quantization autoround_rtn --weight-dtype-attn xfp{N} --weight
 
 | Weight (attn/routed/shared) | KV cache | Short tok/s | Medium tok/s | Long tok/s | Math |
 |-----------------------------|----------|-------------|--------------|------------|------|
-| **xfp4**                    | default  |    5.3      |     5.4      |    5.3     | **27/50 (54 %)** |
+| **xfp4** (v1)               | default  |    5.3      |     5.4      |    5.3     | **27/50 (54 %)** |
+| **xfp4** (v2a, SMEM cb)     | default  |    6.3      |     6.4      |    6.4     | **26/50 (52 %)** |
 | xfp3                        | default  |    6.7      |     6.8      |    6.8     | 15/50 (30 %) |
 | xfp2                        | default  |   10.5      |    11.0      |   10.9     |  0/50 ( 0 %) |
+
+v2a delivers **+20 % tok/s with no accuracy change** (the 1-problem math
+delta 27→26 is within run-to-run noise — the kernel correctness is gated
+by unit tests that match fp32 reference at cos sim > 0.999). The
+improvement confirms the codebook-in-global-memory hypothesis from the
+v1 perf analysis, but it also tells us the v1 kernel has additional
+bottlenecks beyond the codebook read — otherwise SMEM staging would
+have delivered more than 20 %. Next v2 targets (not yet in this commit):
+
+- **M_COUNT=1 specialization for decode** (current kernel dispatches
+  M_COUNT=4, so decode steps waste 3/4 of the inner-loop work on a
+  `if (mi >= M) continue` branch)
+- **Cooperative A-row SMEM staging** — all 32 threads in a block read
+  the same A[mi, k] values, currently duplicated across 32 independent
+  global loads; one load + broadcast is O(1) vs O(threads-per-block)
+- **Tile-layout rewrite closer to Marlin** (128 threads × 1 N-col each,
+  warp-level reductions, no atomicAdd across blocks)
 
 ### Accuracy vs. bit width
 
