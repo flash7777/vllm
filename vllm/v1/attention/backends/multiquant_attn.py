@@ -260,8 +260,13 @@ class MultiQuantImpl:
             self._shifts_sign = torch.arange(8, device="cuda")
 
         # Pre-load decode kernel at init (not in forward — graph-safe)
-        decode_mode = "WHT-Python"  # default for WHT
-        if not self._is_wht:
+        if self._is_wht:
+            # WHT path: CUDA kernels loaded lazily in _forward_decode
+            # (tq_wht_splitkv_decode, tq_wht_fused_decode_attention or
+            #  tq_blockrot_fused_decode_attention). PyTorch fallback only
+            # triggers if the CUDA kernel fails to compile.
+            decode_mode = "block-rot-CUDA" if self._is_block_rot else "WHT-CUDA"
+        else:
             from vllm.v1.attention.ops.triton_mq_fused_decode import (
                 mq_fused_decode_attention, _load_cuda_kernel,
             )
