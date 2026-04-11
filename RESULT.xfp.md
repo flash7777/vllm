@@ -21,25 +21,54 @@ Tests run with `--quantization autoround_rtn --weight-dtype-attn xfp{N} --weight
 |-----------------------------|----------|-------------|--------------|------------|------|
 | **xfp4** (v1)               | default  |    5.3      |     5.4      |    5.3     | **27/50 (54 %)** |
 | **xfp4** (v2a, SMEM cb)     | default  |    6.3      |     6.4      |    6.4     | **26/50 (52 %)** |
+| xfp4 (v2b, + M=1 spec)      | default  |    6.2      |     6.4      |    6.3     | 25/50 (50 %) |
 | xfp3                        | default  |    6.7      |     6.8      |    6.8     | 15/50 (30 %) |
 | xfp2                        | default  |   10.5      |    11.0      |   10.9     |  0/50 ( 0 %) |
 
-v2a delivers **+20 % tok/s with no accuracy change** (the 1-problem math
-delta 27→26 is within run-to-run noise — the kernel correctness is gated
-by unit tests that match fp32 reference at cos sim > 0.999). The
-improvement confirms the codebook-in-global-memory hypothesis from the
-v1 perf analysis, but it also tells us the v1 kernel has additional
-bottlenecks beyond the codebook read — otherwise SMEM staging would
-have delivered more than 20 %. Next v2 targets (not yet in this commit):
+v2a delivers **+20 % tok/s with no accuracy change** (1-problem math
+delta 27→26 is within run-to-run noise — kernel correctness is gated by
+unit tests matching fp32 reference at cos sim > 0.999).
 
-- **M_COUNT=1 specialization for decode** (current kernel dispatches
-  M_COUNT=4, so decode steps waste 3/4 of the inner-loop work on a
-  `if (mi >= M) continue` branch)
-- **Cooperative A-row SMEM staging** — all 32 threads in a block read
-  the same A[mi, k] values, currently duplicated across 32 independent
-  global loads; one load + broadcast is O(1) vs O(threads-per-block)
-- **Tile-layout rewrite closer to Marlin** (128 threads × 1 N-col each,
-  warp-level reductions, no atomicAdd across blocks)
+**v2b (M_COUNT=1 specialization) is a null result.** The hypothesis was
+that M_COUNT=4 wastes 3/4 of the inner-loop work on decode (M=1) through
+the `if (mi >= M) continue` branch. Measured: same tok/s within noise
+(6.3 vs 6.4 long), same math accuracy within noise. Why this didn't
+help:
+
+- For M=1, `grid.y = ceil(M / M_COUNT) = 1` regardless of M_COUNT — no
+  change in block launch count
+- The CUDA compiler's constant propagation likely already eliminates
+  the dead branches for M_COUNT=4 when M is known small
+- The real bottleneck isn't in the M-dimension MACs; it's elsewhere
+  (likely the per-MAC `__half2float` conversions or the per-thread A
+  loads from global memory)
+
+The v2b change is kept in the codebase as infrastructure for future
+M-based tile tuning — it adds three template instantiations (M_COUNT
+∈ {1, 2, 4}) with zero-cost runtime dispatch, so later kernels can
+plug into the same launch path. It costs nothing and documents the
+null result.
+
+### Remaining optimization headroom (v3+ scope)
+
+- **Cooperative A-row SMEM staging**. All 32 threads in a block read
+  the same `A[mi, k]` values — currently 32 independent global loads
+  that L1 coalesces into one transaction, but still 32× the instructions.
+  One explicit cooperative load into SMEM + broadcast would remove the
+  instruction count.
+- **Tile-layout rewrite closer to Marlin**. The current (32 threads ×
+  4 N-cols) layout is a direct copy of `mq_gemm_int2.cu` and pays for
+  the generality of handling variable K-strides. A 128 threads × 1
+  N-col layout with warp-level reductions (no atomicAdd across gridDim.z)
+  would match Marlin's structure and unlock the rest of the gap.
+- **half2 FMA**. Replace the fp32 accumulator chain with `__hfma2` to
+  double arithmetic throughput where the codebook-decoded values are
+  paired. Requires the MAC loop to produce pairs of products, which is
+  cleaner with a tile-layout rewrite.
+
+These are the headline v3 targets. The v2 increment banks the SMEM
+codebook win as a committed baseline while documenting that M-dimension
+tuning is a dead end for the current tile structure.
 
 ### Accuracy vs. bit width
 

@@ -141,16 +141,11 @@ __global__ void xfp_gemm_kernel(
     }
 }
 
-template <int BITS>
-static void launch_xfp(
-    torch::Tensor A, torch::Tensor B_packed, torch::Tensor codebook,
-    torch::Tensor C, int K)
+template <int BITS, int M_COUNT>
+static inline void launch_xfp_mcount(
+    const half* A_ptr, const uint32_t* B_ptr, const half* cb_ptr,
+    half* C_ptr, int M, int N, int K, int K_packed)
 {
-    int M = A.size(0);
-    int N = B_packed.size(1);
-    int K_packed = B_packed.size(0);
-
-    constexpr int M_COUNT = 4;
     dim3 block(XFP_BLOCK_N);
     dim3 grid(
         (N + XFP_BLOCK_N * 4 - 1) / (XFP_BLOCK_N * 4),
@@ -160,11 +155,40 @@ static void launch_xfp(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     xfp_gemm_kernel<BITS, M_COUNT><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half*>(A.data_ptr()),
-        reinterpret_cast<const uint32_t*>(B_packed.data_ptr<int32_t>()),
-        reinterpret_cast<const half*>(codebook.data_ptr()),
-        reinterpret_cast<half*>(C.data_ptr()),
-        M, N, K, K_packed);
+        A_ptr, B_ptr, cb_ptr, C_ptr, M, N, K, K_packed);
+}
+
+template <int BITS>
+static void launch_xfp(
+    torch::Tensor A, torch::Tensor B_packed, torch::Tensor codebook,
+    torch::Tensor C, int K)
+{
+    int M = A.size(0);
+    int N = B_packed.size(1);
+    int K_packed = B_packed.size(0);
+
+    const half* A_ptr =
+        reinterpret_cast<const half*>(A.data_ptr());
+    const uint32_t* B_ptr =
+        reinterpret_cast<const uint32_t*>(B_packed.data_ptr<int32_t>());
+    const half* cb_ptr =
+        reinterpret_cast<const half*>(codebook.data_ptr());
+    half* C_ptr = reinterpret_cast<half*>(C.data_ptr());
+
+    // Pick M_COUNT based on actual M. Decode (M=1 per step) is the
+    // common path and suffers from 3/4 dead inner iterations with
+    // M_COUNT=4, so we specialize it. Prefill with M>=4 keeps the
+    // wider tile for per-block reuse of SMEM codebook and A reads.
+    if (M == 1) {
+        launch_xfp_mcount<BITS, 1>(
+            A_ptr, B_ptr, cb_ptr, C_ptr, M, N, K, K_packed);
+    } else if (M < 4) {
+        launch_xfp_mcount<BITS, 2>(
+            A_ptr, B_ptr, cb_ptr, C_ptr, M, N, K, K_packed);
+    } else {
+        launch_xfp_mcount<BITS, 4>(
+            A_ptr, B_ptr, cb_ptr, C_ptr, M, N, K, K_packed);
+    }
 }
 
 void xfp_gemm(
