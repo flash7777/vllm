@@ -126,6 +126,7 @@ class AutoRoundRTNMoEMethod(FusedMoEMethodBase):
 
         layer._rtn_moe_packed = True
         layer._rtn_moe_bits = bits
+        layer._rtn_moe_dtype = f"int{bits}"
 
         total_params = (w13.numel() + w2.numel())
         packed_bytes = sum(

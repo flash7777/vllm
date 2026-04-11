@@ -57,6 +57,13 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 __constant__ float WHT_THRESHOLDS_2BIT[3] = {-0.9816f, 0.0f, 0.9816f};
 static constexpr float WHT_OUTERMOST_2BIT = 1.5104f;
 
+// 4-bit thresholds for N(0,1) Lloyd-Max (15 boundaries)
+__constant__ float WHT_THRESHOLDS_4BIT[15] = {
+    -2.4008f, -1.8436f, -1.4372f, -1.0993f, -0.7996f, -0.5224f, -0.2582f,
+     0.0f,     0.2582f,  0.5224f,  0.7996f,  1.0993f,  1.4372f,  1.8436f,
+     2.4008f,
+};
+
 // 2-bit threshold quantization: returns index 0-3
 __device__ __forceinline__ int threshold_quantize_2bit(float x) {
     int idx = 0;
@@ -76,6 +83,16 @@ __device__ __forceinline__ int threshold_quantize_3bit(float x) {
     if (x > WHT_THRESHOLDS_3BIT[4]) idx = 5;
     if (x > WHT_THRESHOLDS_3BIT[5]) idx = 6;
     if (x > WHT_THRESHOLDS_3BIT[6]) idx = 7;
+    return idx;
+}
+
+// 4-bit threshold quantization: returns index 0-15
+__device__ __forceinline__ int threshold_quantize_4bit(float x) {
+    int idx = 0;
+    #pragma unroll
+    for (int i = 0; i < 15; i++) {
+        if (x > WHT_THRESHOLDS_4BIT[i]) idx = i + 1;
+    }
     return idx;
 }
 
@@ -201,8 +218,10 @@ __global__ void tq_wht_pack_to_cache_kernel(
         int idx;
         if constexpr (MSE_BITS == 2) {
             idx = threshold_quantize_2bit(normalized);
-        } else {
+        } else if constexpr (MSE_BITS == 3) {
             idx = threshold_quantize_3bit(normalized);
+        } else {
+            idx = threshold_quantize_4bit(normalized);
         }
 
         uint8_t* out = kv_cache
@@ -253,6 +272,23 @@ __global__ void tq_wht_pack_to_cache_kernel(
                 out[12] = (uint8_t)(gamma_u16 & 0xFF);
                 out[13] = (uint8_t)((gamma_u16 >> 8) & 0xFF);
             }
+        } else if constexpr (MSE_BITS == 4) {
+            // 4-bit: 16 bytes (2 indices per byte) + 2 gamma = 18 bytes
+            // Lane k writes to byte[k/2], nibble (k%2)*4 (matches decode layout)
+            int nibble = idx & 0xF;
+            {
+                int base = (lane / 2) * 2;
+                int n0 = __shfl_sync(0xffffffff, nibble, base);
+                int n1 = __shfl_sync(0xffffffff, nibble, base + 1);
+                if (lane % 2 == 0)
+                    out[lane / 2] = (uint8_t)(n0 | (n1 << 4));
+            }
+            if (lane == 0) {
+                __half gamma_h = __float2half(gamma);
+                uint16_t gamma_u16 = *reinterpret_cast<uint16_t*>(&gamma_h);
+                out[16] = (uint8_t)(gamma_u16 & 0xFF);
+                out[17] = (uint8_t)((gamma_u16 >> 8) & 0xFF);
+            }
         }
     }
 }
@@ -299,7 +335,7 @@ void tq_wht_pack_to_cache(
     int stride_kv,
     int stride_slot,
     int stride_head,
-    int mse_bits                 // 2 or 3
+    int mse_bits                 // 2, 3, or 4
 ) {
     TORCH_CHECK(input.dim() == 3, "input must be 3D [tokens, heads, D]");
     TORCH_CHECK(input.dtype() == torch::kBFloat16, "input must be bfloat16");
@@ -326,10 +362,13 @@ void tq_wht_pack_to_cache(
 
     if (D == 256 && mse_bits == 2) { PACK_CACHE_LAUNCH(256, 2); }
     else if (D == 256 && mse_bits == 3) { PACK_CACHE_LAUNCH(256, 3); }
+    else if (D == 256 && mse_bits == 4) { PACK_CACHE_LAUNCH(256, 4); }
     else if (D == 128 && mse_bits == 2) { PACK_CACHE_LAUNCH(128, 2); }
     else if (D == 128 && mse_bits == 3) { PACK_CACHE_LAUNCH(128, 3); }
+    else if (D == 128 && mse_bits == 4) { PACK_CACHE_LAUNCH(128, 4); }
     else if (D == 64 && mse_bits == 2) { PACK_CACHE_LAUNCH(64, 2); }
     else if (D == 64 && mse_bits == 3) { PACK_CACHE_LAUNCH(64, 3); }
+    else if (D == 64 && mse_bits == 4) { PACK_CACHE_LAUNCH(64, 4); }
     else { TORCH_CHECK(false, "tq_wht_pack_to_cache: unsupported D=", D,
                         " mse_bits=", mse_bits); }
     #undef PACK_CACHE_LAUNCH

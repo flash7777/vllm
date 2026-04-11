@@ -87,7 +87,7 @@ class AutoRoundRTNConfig(QuantizationConfig):
             instance._class_gs = mq_gs
             logger.info("RTN: policy loaded from config: %s",
                         {k: v for k, v in mq_dtype.items()
-                         if v not in ("bf16", "fp16", "auto")})
+                         if v not in ("bf16", "fp16")})
         return instance
 
     def _snapshot_policy(self) -> None:
@@ -109,7 +109,7 @@ class AutoRoundRTNConfig(QuantizationConfig):
             self._class_gs[cls] = p.group_size
         logger.info("RTN: policy snapshot captured: %s",
                     {k: v for k, v in self._class_dtype.items()
-                     if v not in ("bf16", "fp16", "auto")})
+                     if v not in ("bf16", "fp16")})
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -150,7 +150,7 @@ class AutoRoundRTNConfig(QuantizationConfig):
         if self._class_dtype:
             dtype = self._class_dtype.get(cls, "bf16")
             group_size = self._class_gs.get(cls, 0) or self.group_size
-            if dtype in ("bf16", "fp16", "fp32", "auto"):
+            if dtype in ("bf16", "fp16", "fp32"):
                 # 1:1, no quantization — return unquantized method
                 from vllm.model_executor.layers.linear import (
                     LinearBase,
@@ -162,6 +162,7 @@ class AutoRoundRTNConfig(QuantizationConfig):
             bits = DTYPE_BITS.get(dtype, self.bits)
         else:
             # Fallback: no policy data → use config defaults for all layers
+            dtype = f"int{self.bits}"
             bits = self.bits
             group_size = self.group_size
 
@@ -171,14 +172,14 @@ class AutoRoundRTNConfig(QuantizationConfig):
             from vllm.multiquant.autoround.online_linear import (
                 AutoRoundRTNLinearMethod,
             )
-            return AutoRoundRTNLinearMethod(self, bits=bits,
+            return AutoRoundRTNLinearMethod(self, dtype=dtype,
                                             group_size=group_size)
 
         # FusedMoE support (INT2/INT3 only — INT4 MoE uses standard path)
         try:
             from vllm.model_executor.layers.fused_moe import FusedMoE
             if isinstance(layer, FusedMoE):
-                if bits in (2, 3):
+                if dtype in ("int2", "int3"):
                     from vllm.multiquant.autoround.online_moe import (
                         AutoRoundRTNMoEMethod,
                     )

@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
             echo "Nutzung: $0 [Optionen]"
             echo ""
             echo "Optionen:"
-            echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 auto (default: tq3)"
+            echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 (default: tq3)"
             echo "  --tp N           Tensor Parallelism (default: 1)"
             echo "  --weights TYPE   Archer online-quant: tq3 tq4 rq3 rq4 (leer=keine)"
             echo ""

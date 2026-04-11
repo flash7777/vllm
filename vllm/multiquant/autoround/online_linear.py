@@ -25,19 +25,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _noop_weight_loader(param, loaded_weight, weight_name="",
+                        shard_id=None, expert_id=None):
+    """Dummy weight_loader for parameters created after loading."""
+    pass
+
+
 class AutoRoundRTNLinearMethod(QuantizeMethodBase):
     """BF16 → GPTQ-format INT2/INT3/INT4 at load time.
 
     After packing, delegates apply() to MQSub4LinearMethod (INT2/3)
-    or uses the packed format directly for INT4 (Marlin-compatible).
+    or Marlin kernel (INT4).
     """
 
     uses_meta_device: bool = False
 
     def __init__(self, quant_config: "AutoRoundRTNConfig",
-                 bits: int = 4, group_size: int = 128):
+                 dtype: str = "int4", group_size: int = 128):
+        from vllm.multiquant.policy import DTYPE_BITS
         self.quant_config = quant_config
-        self.bits = bits
+        self.dtype = dtype
+        self.bits = DTYPE_BITS.get(dtype, 4)
         self.group_size = group_size
 
     def create_weights(
@@ -62,11 +70,15 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
             weight_loader=extra_weight_attrs.get("weight_loader"),
         )
         layer.register_parameter("weight", weight)
+        # Store dimensions and dtype for Marlin setup
+        layer._rtn_input_size = input_size
+        layer._rtn_output_size = output_size
+        layer._rtn_params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """BF16 → GPTQ int32 packed format.
 
-        For INT4: additionally repack to Marlin layout for fused kernel.
+        For INT4: PackedvLLMParameter → MarlinLinearKernel (fused GEMM).
         For INT2/INT3: raw GPTQ format for mq_gemm kernels.
         """
         if getattr(layer, "_rtn_packed", False):
@@ -78,69 +90,98 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         N, K = W.shape
         device = W.device
 
-
         qweight, scales, qzeros = rtn_pack_gptq(
             W.float(), self.bits, self.group_size)
 
-        # Keep weight (Marlin repack may need it)
-        pass
+        if self.dtype == "int4":
+            self._setup_marlin(layer, qweight, scales, N, K, device)
+        else:
+            # INT2/INT3: store raw GPTQ tensors for mq_gemm kernels
+            layer.qweight = nn.Parameter(
+                qweight.to(device), requires_grad=False)
+            layer.scales = nn.Parameter(
+                scales.to(device), requires_grad=False)
+            layer.qzeros = nn.Parameter(
+                qzeros.to(device), requires_grad=False)
 
-        # Always store raw GPTQ tensors (needed for dequant fallback and INT2/3)
-        layer.qweight = nn.Parameter(
-            qweight.to(device), requires_grad=False)
-        layer.scales = nn.Parameter(
-            scales.to(device), requires_grad=False)
-        layer.qzeros = nn.Parameter(
-            qzeros.to(device), requires_grad=False)
-        layer.g_idx = nn.Parameter(
-            torch.empty(0, dtype=torch.int32, device=device),
-            requires_grad=False)
-
-        # INT4: GPTQ tensors stored, dequant-cache in apply()
-        # TODO: Marlin repack for full speed
+        # Free BF16 weight
+        del layer.weight
 
         layer._rtn_packed = True
-        layer._rtn_bits = self.bits
+        layer._rtn_dtype = self.dtype
         layer._rtn_K = K
         layer._rtn_N = N
 
         logger.info(
-            "RTN: %s (%dx%d) → INT%d %s, %.1f%% of BF16",
-            getattr(layer, "layer_name", "?"), N, K, self.bits,
-            "Marlin" if self.bits == 4 else "GPTQ",
+            "RTN: %s (%dx%d) → %s %s, %.1f%% of BF16",
+            getattr(layer, "layer_name", "?"), N, K, self.dtype,
+            "Marlin" if self.dtype == "int4" else "mq_gemm",
             100.0 * qweight.numel() * 4 / (N * K * 2),
         )
 
-    def _setup_marlin_via_gptq(self, layer: nn.Module,
-                              N: int, K: int,
-                              device: torch.device) -> None:
-        """Let standard GPTQMarlin handle repack.
+    def _setup_marlin(self, layer: nn.Module,
+                      qweight: torch.Tensor, scales: torch.Tensor,
+                      N: int, K: int, device: torch.device) -> None:
+        """Register PackedvLLMParameter + MarlinLinearKernel for INT4."""
+        from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+            MarlinLinearKernel,
+        )
+        from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+            MPLinearLayerConfig,
+        )
+        from vllm.model_executor.parameter import (
+            GroupQuantScaleParameter,
+            PackedvLLMParameter,
+        )
+        from vllm.scalar_type import scalar_types
 
-        Creates a GPTQMarlinLinearMethod, calls its process_weights_after_loading
-        on our GPTQ tensors, and stores it for apply() delegation.
-        """
-        try:
-            from vllm.model_executor.layers.quantization.gptq_marlin import (
-                GPTQMarlinConfig,
-                GPTQMarlinLinearMethod,
-            )
-            gptq_config = GPTQMarlinConfig(
-                weight_bits=4,
-                group_size=self.group_size,
-                desc_act=False,
-                is_sym=True,
-                lm_head_quantized=False,
-                dynamic={},
-                full_config={},
-            )
-            marlin_method = gptq_config.get_quant_method(layer, prefix="")
-            if marlin_method is not None:
-                marlin_method.process_weights_after_loading(layer)
-                layer._marlin_method = marlin_method
-                logger.info("RTN: Marlin repack delegated to GPTQMarlinLinearMethod")
-        except Exception as e:
-            logger.warning("RTN: Marlin delegation failed (%s), "
-                           "using dequant-cache fallback", e)
+        pack_factor = 8  # INT4: 8 values per int32
+        input_size = getattr(layer, "_rtn_input_size", K)
+        output_size = getattr(layer, "_rtn_output_size", N)
+        params_dtype = getattr(layer, "_rtn_params_dtype", torch.bfloat16)
+
+        # Register qweight as PackedvLLMParameter (Marlin needs metadata)
+        qw_param = PackedvLLMParameter(
+            data=qweight.to(device),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=pack_factor,
+            weight_loader=_noop_weight_loader,
+        )
+        layer.register_parameter("qweight", qw_param)
+
+        # Register scales as GroupQuantScaleParameter
+        sc_param = GroupQuantScaleParameter(
+            data=scales.to(device),
+            output_dim=1,
+            input_dim=0,
+            weight_loader=_noop_weight_loader,
+        )
+        layer.register_parameter("scales", sc_param)
+
+        # g_idx and qzeros: empty (symmetric, no desc_act)
+        # MarlinLinearKernel.process_weights_after_loading will set these
+
+        # Build config for MarlinLinearKernel
+        mp_config = MPLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=(K, N),
+            weight_type=scalar_types.uint4b8,
+            act_type=params_dtype,
+            group_size=self.group_size,
+            zero_points=False,
+            has_g_idx=False,
+        )
+
+        kernel = MarlinLinearKernel(
+            mp_config,
+            w_q_param_name="qweight",
+            w_s_param_name="scales",
+        )
+        # Marlin repack (permute_param_layout_ + gptq_marlin_repack)
+        kernel.process_weights_after_loading(layer)
+        layer._marlin_kernel = kernel
 
     def apply(
         self,
@@ -148,80 +189,42 @@ class AutoRoundRTNLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Delegate to MQSub4LinearMethod for INT2/INT3 fused GEMM."""
         if not getattr(layer, "_rtn_packed", False):
             return torch.nn.functional.linear(x, layer.weight, bias)
 
-        bits = layer._rtn_bits
-        if bits in (2, 3):
-            # Use MQSub4LinearMethod's apply (fused GEMM kernels)
-            from vllm.multiquant.weight_quant.mq_sub4_linear import (
-                _load_mq_gemm,
-            )
-            kernel = _load_mq_gemm(bits)
-            if kernel is None:
-                raise RuntimeError(
-                    f"mq_gemm_int{bits} kernel not available")
+        dtype = layer._rtn_dtype
+        if dtype == "int4":
+            return layer._marlin_kernel.apply_weights(layer, x, bias)
 
-            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
-            reshaped_x = x.reshape(-1, x.shape[-1]).to(torch.float16)
-            M = reshaped_x.shape[0]
-            N = layer.qweight.shape[1]
+        if dtype not in ("int2", "int3"):
+            raise RuntimeError(f"RTN: unsupported dtype {dtype!r}")
 
-            C = torch.zeros(M, N, dtype=torch.float16, device=x.device)
-            if bits == 2:
-                kernel.mq_gemm_int2(
-                    reshaped_x, layer.qweight, layer.scales,
-                    layer.qzeros, C, self.group_size)
-            else:
-                K = reshaped_x.shape[1]
-                kernel.mq_gemm_int3(
-                    reshaped_x, layer.qweight, layer.scales,
-                    layer.qzeros, C, K, self.group_size)
-
-            if bias is not None:
-                C.add_(bias)
-            return C.reshape(out_shape)
-
-        # INT4: dequant-cache (Marlin delegation TODO)
-        return self._apply_int4_dequant(layer, x, bias)
-
-    def _apply_marlin(self, layer: nn.Module,
-                      x: torch.Tensor,
-                      bias: torch.Tensor | None = None) -> torch.Tensor:
-        """INT4 inference via Marlin kernel."""
-        from vllm.scalar_type import scalar_types
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            apply_gptq_marlin_linear,
+        # INT2/INT3: fused mq_gemm kernels
+        from vllm.multiquant.weight_quant.mq_sub4_linear import (
+            _load_mq_gemm,
         )
+        bits = self.bits
+        kernel = _load_mq_gemm(bits)
+        if kernel is None:
+            raise RuntimeError(
+                f"mq_gemm_{dtype} kernel not available")
 
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=layer.marlin_qweight,
-            weight_scale=layer.marlin_scales,
-            weight_zp=layer.marlin_zp,
-            g_idx=layer.marlin_g_idx,
-            g_idx_sort_indices=layer.marlin_g_idx_sort,
-            workspace=layer.marlin_workspace,
-            wtype=scalar_types.uint4b8,
-            output_size_per_partition=layer._rtn_N,
-            input_size_per_partition=layer._rtn_K,
-            is_k_full=True,
-            bias=bias,
-            input_dtype=x.dtype,
-        )
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+        reshaped_x = x.reshape(-1, x.shape[-1]).to(torch.float16)
+        M = reshaped_x.shape[0]
+        N = layer.qweight.shape[1]
 
-    def _apply_int4_dequant(self, layer: nn.Module,
-                            x: torch.Tensor,
-                            bias: torch.Tensor | None = None) -> torch.Tensor:
-        """INT4 dequant+cache, then F.linear. Debug path."""
-        layer_id = id(layer)
-        if not hasattr(self, '_dequant_cache'):
-            self._dequant_cache = {}
-        if layer_id not in self._dequant_cache:
-            from vllm.multiquant.weight_quant.mq_marlin3 import _dequant_gptq
-            W = _dequant_gptq(layer.qweight, layer.scales, layer.qzeros,
-                              4, self.group_size)
-            self._dequant_cache[layer_id] = W
-        W = self._dequant_cache[layer_id]
-        return torch.nn.functional.linear(x, W.to(x.dtype), bias)
+        C = torch.zeros(M, N, dtype=torch.float16, device=x.device)
+        if dtype == "int2":
+            kernel.mq_gemm_int2(
+                reshaped_x, layer.qweight, layer.scales,
+                layer.qzeros, C, self.group_size)
+        else:
+            K = reshaped_x.shape[1]
+            kernel.mq_gemm_int3(
+                reshaped_x, layer.qweight, layer.scales,
+                layer.qzeros, C, K, self.group_size)
+
+        if bias is not None:
+            C.add_(bias)
+        return C.reshape(out_shape)

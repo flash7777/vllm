@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 @dataclass
 class QuantPolicy:
     """Quantization policy for a single component class."""
-    dtype: str = "auto"       # "bf16", "fp8", "fp16", "int2", "int3", "int4",
+    dtype: str = "bf16"       # "bf16", "fp8", "fp16", "int2", "int3", "int4",
                                # "tq2w", "tq3w", "tq4w", "tq3r", etc.
     bits: int = 16             # effective bit width (16=bf16, 8=fp8, 4=int4, etc.)
     source: str = "default"    # "cli", "model", "default"
@@ -127,7 +127,7 @@ def _desc_for_dtype(dtype: str) -> str:
         "tq3w": "WHT 3-bit (Lloyd-Max, block-32)",
         "tq4w": "WHT 4-bit (Lloyd-Max, block-32)",
         "tq3r": "Block-rot 3-bit (random orthogonal)",
-        "auto": "auto (from model)",
+        # no "auto" — always explicit
     }
     return descs.get(dtype, dtype)
 
@@ -153,14 +153,14 @@ class MultiQuantPolicyRegistry:
         self._policies: dict[str, QuantPolicy] = {
             K_CACHE: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
             V_CACHE: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
-            WEIGHTS_SHARED: QuantPolicy("auto", 16, "default", 0,
-                                        "auto (from model)"),
-            WEIGHTS_ROUTED: QuantPolicy("auto", 16, "default", 0,
-                                        "auto (from model)"),
-            WEIGHTS_ATTN: QuantPolicy("auto", 16, "default", 0,
-                                      "auto (from model)"),
-            WEIGHTS_DENSE: QuantPolicy("auto", 16, "default", 0,
-                                       "auto (from model)"),
+            WEIGHTS_SHARED: QuantPolicy("bf16", 16, "default", 0,
+                                        "bfloat16"),
+            WEIGHTS_ROUTED: QuantPolicy("bf16", 16, "default", 0,
+                                        "bfloat16"),
+            WEIGHTS_ATTN: QuantPolicy("bf16", 16, "default", 0,
+                                      "bfloat16"),
+            WEIGHTS_DENSE: QuantPolicy("bf16", 16, "default", 0,
+                                       "bfloat16"),
             MTP: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
             DELTANET: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
         }
@@ -342,7 +342,7 @@ class MultiQuantPolicyRegistry:
     @classmethod
     def from_cli(
         cls,
-        kv_cache_dtype: str = "auto",
+        kv_cache_dtype: Optional[str] = None,
         k_dtype: Optional[str] = None,
         v_dtype: Optional[str] = None,
         weight_dtype: Optional[str] = None,
@@ -361,7 +361,7 @@ class MultiQuantPolicyRegistry:
             reg._components = cls.analyze_model(hf_config, model_quant_config)
 
         # 1. KV-Cache: --kv-cache-dtype sets both K and V
-        if kv_cache_dtype != "auto":
+        if kv_cache_dtype is not None:
             reg.set(K_CACHE, kv_cache_dtype, "cli")
             reg.set(V_CACHE, kv_cache_dtype, "cli")
 
@@ -450,8 +450,7 @@ class MultiQuantPolicyRegistry:
             if c is not None and not c.exists:
                 continue  # skip components not in model
 
-            target = p.dtype if p.dtype != "auto" else (
-                c.current_dtype if c else "bf16")
+            target = p.dtype
 
             if has_components and c is not None:
                 current = c.current_dtype
@@ -487,7 +486,7 @@ class MultiQuantPolicyRegistry:
         policy = self.get_weight_policy(layer_type)
         if policy.source != "cli":
             return False  # no CLI override → load 1:1
-        if policy.dtype == "auto" or policy.dtype == model_dtype:
+        if policy.dtype == model_dtype:
             return False  # same format → no conversion
         # CLI requests lower precision than model has
         return _bits_for_dtype(policy.dtype) < _bits_for_dtype(model_dtype)
