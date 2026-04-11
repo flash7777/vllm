@@ -78,6 +78,8 @@ DTYPE_BITS = {
     "tq3r": 3, "tq4r": 4,
     "tq3": 3, "tq4": 4,
     "rq2": 2, "rq3": 3, "rq4": 4,
+    # XFP family (learned per-channel codebook, XFP.PAPER.md)
+    "xfp2": 2, "xfp3": 3, "xfp4": 4, "xfp5": 5, "xfp6": 6,
 }
 
 
@@ -127,6 +129,11 @@ def _desc_for_dtype(dtype: str) -> str:
         "tq3w": "WHT 3-bit (Lloyd-Max, block-32)",
         "tq4w": "WHT 4-bit (Lloyd-Max, block-32)",
         "tq3r": "Block-rot 3-bit (random orthogonal)",
+        "xfp2": "XFP2 (learned codebook, 4 entries)",
+        "xfp3": "XFP3 (learned codebook, 8 entries)",
+        "xfp4": "XFP4 (learned codebook, 16 entries)",
+        "xfp5": "XFP5 (learned codebook, 32 entries) [v3]",
+        "xfp6": "XFP6 (learned codebook, 64 entries) [v3]",
         # no "auto" — always explicit
     }
     return descs.get(dtype, dtype)
@@ -490,3 +497,158 @@ class MultiQuantPolicyRegistry:
             return False  # same format → no conversion
         # CLI requests lower precision than model has
         return _bits_for_dtype(policy.dtype) < _bits_for_dtype(model_dtype)
+
+    # ─── Stats collection (XFP pack quality) ──────────────────────
+
+    def _ensure_stats_storage(self) -> None:
+        if not hasattr(self, "_stats"):
+            self._stats: list[tuple[str, object]] = []
+            self._stats_logged: bool = False
+
+    def record_stats(self, layer_type: str, stats: object) -> None:
+        """Accumulate per-layer XFPPackStats for end-of-load summary."""
+        self._ensure_stats_storage()
+        self._stats.append((layer_type, stats))
+
+    def log_stats_summary(self) -> None:
+        """Aggregate accumulated XFP pack stats as a per-class banner.
+
+        Fires at most once per registry instance. Safe to call repeatedly
+        (guard on `_stats_logged`).
+        """
+        self._ensure_stats_storage()
+        if self._stats_logged or not self._stats:
+            return
+        self._stats_logged = True
+
+        # Group by layer_type
+        groups: dict[str, list[object]] = {}
+        for lt, st in self._stats:
+            groups.setdefault(lt, []).append(st)
+
+        logger.info(
+            "XFP Quantization Summary (%d layers across %d classes):",
+            len(self._stats), len(groups),
+        )
+        logger.info(
+            "  %-16s %6s %10s %8s %8s %s",
+            "Component", "Count", "mean mse", "cos",
+            "3σ %", "recommend (# could downgrade)",
+        )
+        logger.info("  " + "-" * 72)
+
+        for lt in sorted(groups):
+            items = groups[lt]
+            n = len(items)
+            mean_mse = sum(s.mse for s in items) / n
+            mean_cos = sum(s.cos_sim for s in items) / n
+            mean_k3 = 100.0 * sum(s.outlier_ratio_k3 for s in items) / n
+            # Count layers where recommended < chosen bits
+            downgrade = sum(
+                1 for s in items
+                if s.recommended_bits < s.bits
+            )
+            chosen_bits = set(s.bits for s in items)
+            chosen_str = ("xfp" + "/".join(str(b) for b in sorted(chosen_bits)))
+            logger.info(
+                "  %-16s %6d %10.4g %8.3f %8.1f %s (%d layers)",
+                lt, n, mean_mse, mean_cos, mean_k3, chosen_str, downgrade,
+            )
+
+
+# ─── Central weight-method dispatcher ──────────────────────────────
+
+def create_weight_method(
+    quant_config,
+    layer,
+    prefix: str,
+):
+    """Central dispatch: reads the active MultiQuantPolicyRegistry and
+    instantiates the correct weight quantization method for this layer.
+
+    Single source of truth for XFP, Archer TQ/RQ, AutoRound RTN, and
+    pass-through. Called by the thin `get_quant_method` wrappers of
+    `AutoRoundRTNConfig` (and optionally `ArcherConfig`, Phase 3b).
+
+    Returns a `QuantizeMethodBase` instance or `None`.
+    """
+    from vllm.model_executor.layers.linear import (
+        LinearBase, UnquantizedLinearMethod,
+    )
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        FusedMoE = None  # type: ignore
+
+    reg = MultiQuantPolicyRegistry.get_active()
+
+    # When no registry is active (shouldn't happen in production), fall
+    # through to a pass-through for LinearBase so model loads at least.
+    if reg is None:
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
+
+    layer_type = classify_layer(prefix)
+    policy = reg.get_weight_policy(layer_type)
+    dtype = policy.dtype
+
+    # Pass-through for unquantized dtypes
+    if dtype in ("bf16", "fp16", "fp32"):
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
+
+    # XFP family (learned codebook)
+    if dtype.startswith("xfp"):
+        if isinstance(layer, LinearBase):
+            from vllm.multiquant.xfp.online_linear import XFPLinearMethod
+            return XFPLinearMethod(quant_config, dtype=dtype)
+        if FusedMoE is not None and isinstance(layer, FusedMoE):
+            from vllm.multiquant.xfp.online_moe import XFPMoEMethod
+            return XFPMoEMethod(
+                quant_config,
+                dtype=dtype,
+                moe_config=getattr(layer, "moe_config", None),
+            )
+        return None
+
+    # Archer TurboQuant / RotorQuant (rotated + QJL)
+    if dtype.startswith("tq") or dtype.startswith("rq"):
+        if isinstance(layer, LinearBase):
+            from vllm.multiquant.weight_quant.online_linear import (
+                ArcherOnlineLinearMethod,
+            )
+            return ArcherOnlineLinearMethod(quant_config)
+        return None
+
+    # AutoRound linear RTN (INT2/INT3/INT4)
+    if dtype.startswith("int"):
+        if isinstance(layer, LinearBase):
+            from vllm.multiquant.autoround.online_linear import (
+                AutoRoundRTNLinearMethod,
+            )
+            return AutoRoundRTNLinearMethod(quant_config, dtype=dtype)
+        if FusedMoE is not None and isinstance(layer, FusedMoE):
+            # MoE RTN accepts dtypes int2/int3; int4 falls through to BF16.
+            if dtype in ("int2", "int3"):
+                from vllm.multiquant.autoround.online_moe import (
+                    AutoRoundRTNMoEMethod,
+                )
+                bits = DTYPE_BITS.get(dtype, 4)
+                return AutoRoundRTNMoEMethod(
+                    quant_config,
+                    bits=bits,
+                    group_size=getattr(quant_config, "group_size", 128),
+                    moe_config=getattr(layer, "moe_config", None),
+                )
+            return None
+        return None
+
+    # Unknown dtype — don't silently pass-through, surface as error upstream
+    logger.warning(
+        "create_weight_method: unknown dtype '%s' for layer %s (%s), "
+        "returning None — check DTYPE_BITS and classify_layer",
+        dtype, prefix, type(layer).__name__,
+    )
+    return None
