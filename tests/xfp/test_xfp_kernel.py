@@ -36,7 +36,7 @@ def test_xfp_gemm_matches_reference(bits: int, M: int, N_out: int, K: int) -> No
 
     # Construct a weight matrix, pack it, move to GPU
     W = torch.randn(N_out, K, dtype=torch.float32) * 0.1
-    packed_cpu, codebook_cpu, _ = xfp_pack(W, bits=bits)
+    packed_cpu, codebook_cpu, _, _, _ = xfp_pack(W, bits=bits)
     packed = packed_cpu.to(device)
     codebook = codebook_cpu.to(device)
 
@@ -70,7 +70,7 @@ def test_xfp_gemm_matches_reference(bits: int, M: int, N_out: int, K: int) -> No
 def test_xfp_gemm_rejects_bad_bits() -> None:
     device = "cuda"
     W = torch.randn(64, 128, dtype=torch.float32)
-    packed_cpu, codebook_cpu, _ = xfp_pack(W, bits=4)
+    packed_cpu, codebook_cpu, _, _, _ = xfp_pack(W, bits=4)
     packed = packed_cpu.to(device)
     codebook = codebook_cpu.to(device)
     x = torch.randn(2, 128, dtype=torch.float16, device=device)

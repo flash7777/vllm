@@ -61,6 +61,11 @@ class XFPPackStats:
     max_abs_err: float
     cos_sim: float
 
+    # Outlier split (0 when outlier extraction is disabled)
+    outlier_count: int = 0          # number of (row, col) pairs extracted
+    outlier_sigma: float = 0.0      # threshold used (0 = none)
+    outlier_fraction: float = 0.0   # count / numel
+
     # Candidate scoring — MSE at other bit widths (empty unless requested)
     mse_per_bits: dict[int, float] = field(default_factory=dict)
 
@@ -285,8 +290,16 @@ def xfp_pack(
     bits: int,
     lloyd_iters: int = 20,
     also_score_widths: tuple[int, ...] = (),
+    outlier_sigma: Optional[float] = None,
+    outlier_max_fraction: float = 0.02,
     seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, XFPPackStats]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    XFPPackStats,
+]:
     """Pack a weight matrix via per-channel Lloyd codebook + bit-packed indices.
 
     Args:
@@ -297,37 +310,116 @@ def xfp_pack(
         also_score_widths: additional bit widths to fit a codebook for and
             score only for MSE, without packing. Used to populate
             stats.mse_per_bits as a per-layer auto-size signal.
-        seed: random seed reserved for v2 outlier extraction. Ignored in v1.
+        outlier_sigma: if set, extract weights with |w - mean| > sigma * std
+            as sparse residuals BEFORE fitting the codebook. Paper §4 Step 2.
+            Typical values 3.0–4.0. None disables outlier extraction.
+            Based on GLM-4.7-Flash weight inspection (tests/xfp/inspect_
+            distribution.py), 4.0 is the sweet spot for MoE models: it
+            catches the 40σ attention outliers (kv_b_proj, q_b_proj) while
+            marking only ~0.01–0.8 % of weights, comfortably below the
+            15 % sparse-path threshold of Paper §4 Step 1.
+        outlier_max_fraction: safety cap. If the k-sigma threshold would
+            mark more than this fraction of weights as outliers (e.g. for
+            a broad-spectrum distribution where the split is counter-
+            productive), keep only the top-by-magnitude
+            `outlier_max_fraction * numel` weights and reclassify the rest
+            as bulk. Default 0.02 (= 2 %). Paper §4 says ratios above ~30 %
+            should drop sparse extraction entirely — we use a tighter
+            cap because v1 has no inline sparse kernel yet and larger
+            outlier sets hurt the apply-path throughput.
+        seed: random seed (reserved for future stochastic variants).
 
     Returns:
         packed: [K_packed, N_out] int32 (bit-identical to uint32)
         codebook: [N_out, 2^bits] fp16
+        outlier_indices: [n_outliers] int64 flat index (row*K + col), or None
+        outlier_values: [n_outliers] fp16 original weight values, or None
         stats: XFPPackStats
+
+    When `outlier_sigma` is None the two outlier tensors are None and the
+    returned pipeline matches the v1 bulk-only encoder exactly.
     """
     if bits not in (2, 3, 4):
         raise ValueError(f"xfp_pack: unsupported bits={bits}, must be in {{2,3,4}}")
     if W.dim() != 2:
         raise ValueError(f"xfp_pack: W must be 2D [N_out, K], got shape {tuple(W.shape)}")
 
-    del seed  # reserved for v2
+    del seed  # reserved
 
     W = W.to(torch.float32)
     N_out, K = W.shape
     n_centroids = 1 << bits
 
-    # 1. Lloyd codebook
-    codebook_fp32 = _lloyd_per_channel(W, n_centroids, lloyd_iters)
+    # Outlier split (Paper §4 Step 2) — optional. Runs BEFORE Lloyd so the
+    # codebook fits the cleaned bulk distribution.
+    outlier_indices: Optional[torch.Tensor] = None
+    outlier_values: Optional[torch.Tensor] = None
+    outlier_count = 0
+    outlier_fraction = 0.0
+    if outlier_sigma is not None and outlier_sigma > 0:
+        mu = W.mean()
+        sigma = W.std()
+        total_numel = W.numel()
+        centered_abs = (W - mu).abs()
+        threshold = float(outlier_sigma) * sigma
+        mask = centered_abs > threshold  # [N_out, K] bool
+        nnz = int(mask.sum().item())
+        max_allowed = int(outlier_max_fraction * total_numel)
 
-    # 2. Assign indices
-    idx = _assign_indices(W, codebook_fp32)
+        if nnz > max_allowed and max_allowed > 0:
+            # Safety cap: keep only the top-by-magnitude weights. Anything
+            # beyond outlier_max_fraction is clamped back into the bulk.
+            # Uses a top-k on the flattened abs-centered tensor.
+            flat_abs = centered_abs.reshape(-1)
+            _, top_flat_idx = torch.topk(
+                flat_abs, max_allowed, largest=True, sorted=False
+            )
+            mask = torch.zeros_like(flat_abs, dtype=torch.bool)
+            mask[top_flat_idx] = True
+            mask = mask.reshape_as(W)
+            nnz = max_allowed
 
-    # 3. Reconstruction (for MSE / cos sim)
-    W_rec = torch.gather(codebook_fp32, 1, idx)
+        if nnz > 0:
+            # Flat indices so the apply path can split (row, col) cheaply.
+            flat_mask = mask.reshape(-1)
+            outlier_indices = flat_mask.nonzero(as_tuple=False).squeeze(1).to(torch.int64)
+            outlier_values = W.reshape(-1)[outlier_indices].to(torch.float16)
+            # Replace outlier positions with the layer mean so Lloyd fits
+            # the bulk without being pulled by extreme values. Using mean
+            # (not zero) avoids creating a new cluster at zero that would
+            # consume a codebook entry.
+            W_bulk = W.clone()
+            W_bulk[mask] = mu
+            outlier_count = nnz
+            outlier_fraction = float(nnz) / float(total_numel)
+        else:
+            W_bulk = W
+    else:
+        W_bulk = W
+
+    # 1. Lloyd codebook on the (possibly cleaned) bulk
+    codebook_fp32 = _lloyd_per_channel(W_bulk, n_centroids, lloyd_iters)
+
+    # 2. Assign indices (still on the bulk — outlier positions will be
+    #    reconstructed via the scatter-add path at apply time, so their
+    #    codebook index is irrelevant)
+    idx = _assign_indices(W_bulk, codebook_fp32)
+
+    # 3. Reconstruction (for MSE / cos sim) — include outlier correction
+    #    so stats reflect the full XFP reconstruction, not just the bulk.
+    W_rec_bulk = torch.gather(codebook_fp32, 1, idx)
+    if outlier_indices is not None and outlier_values is not None:
+        W_rec = W_rec_bulk.clone()
+        flat_rec = W_rec.reshape(-1)
+        flat_rec[outlier_indices] = outlier_values.to(torch.float32)
+        W_rec = flat_rec.reshape(N_out, K)
+    else:
+        W_rec = W_rec_bulk
 
     # 4. Pack indices to word-aligned uint32
     packed = _pack_indices(idx, bits)
 
-    # 5. Stats
+    # 5. Stats — distribution stats use the ORIGINAL W (incl. outliers)
     w_mean, w_std, w_abs_max, k3, k4 = _distribution_stats(W)
     mse, max_abs_err, cos_sim = _reconstruction_stats(W, W_rec)
     rmse_rel = (mse ** 0.5) / max(w_std, 1e-12)
@@ -338,7 +430,7 @@ def xfp_pack(
             continue
         if b not in (2, 3, 4):
             continue
-        mse_per_bits[b] = _score_mse_only(W, b, lloyd_iters)
+        mse_per_bits[b] = _score_mse_only(W_bulk, b, lloyd_iters)
 
     # Recommendation: lowest MSE among scored widths, ties → prefer lower bits
     if mse_per_bits:
@@ -364,9 +456,18 @@ def xfp_pack(
         rmse_rel=rmse_rel,
         max_abs_err=max_abs_err,
         cos_sim=cos_sim,
+        outlier_count=outlier_count,
+        outlier_sigma=float(outlier_sigma or 0.0),
+        outlier_fraction=outlier_fraction,
         mse_per_bits=mse_per_bits,
         recommended_bits=recommended_bits,
         recommended_gap=recommended_gap,
     )
 
-    return packed, codebook_fp32.to(torch.float16), stats
+    return (
+        packed,
+        codebook_fp32.to(torch.float16),
+        outlier_indices,
+        outlier_values,
+        stats,
+    )

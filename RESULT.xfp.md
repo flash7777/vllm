@@ -22,8 +22,11 @@ Tests run with `--quantization autoround_rtn --weight-dtype-attn xfp{N} --weight
 | **xfp4** (v1)               | default  |    5.3      |     5.4      |    5.3     | **27/50 (54 %)** |
 | **xfp4** (v2a, SMEM cb)     | default  |    6.3      |     6.4      |    6.4     | **26/50 (52 %)** |
 | xfp4 (v2b, + M=1 spec)      | default  |    6.2      |     6.4      |    6.3     | 25/50 (50 %) |
-| xfp3                        | default  |    6.7      |     6.8      |    6.8     | 15/50 (30 %) |
-| xfp2                        | default  |   10.5      |    11.0      |   10.9     |  0/50 ( 0 %) |
+| **xfp4** (v3, + outliers)   | default  |    5.8      |     5.8      |    5.8     | **27/50 (54 %)** |
+| xfp3 (v1)                   | default  |    6.7      |     6.8      |    6.8     | 15/50 (30 %) |
+| **xfp3** (v3, + outliers)   | default  |    6.2      |     6.3      |    6.3     | **15/50 (30 %)** |
+| xfp2 (v1)                   | default  |   10.5      |    11.0      |   10.9     |  0/50 ( 0 %) |
+| **xfp2** (v3, + outliers)   | default  |    9.7      |    10.1      |   10.0     | **3/50 ( 6 %)** |
 
 v2a delivers **+20 % tok/s with no accuracy change** (1-problem math
 delta 27→26 is within run-to-run noise — kernel correctness is gated by
@@ -48,6 +51,69 @@ M-based tile tuning — it adds three template instantiations (M_COUNT
 ∈ {1, 2, 4}) with zero-cost runtime dispatch, so later kernels can
 plug into the same launch path. It costs nothing and documents the
 null result.
+
+### v3 — sparse outlier extraction
+
+Paper §4 Step 2: extract weights with `|w - μ| > k·σ` into a sparse
+residual before fitting the Lloyd codebook on the cleaned bulk. Default
+`k = 4.0`, safety cap at 2 % of weights per layer. Implemented in
+`xfp_pack` and wired through a second `direct_register_custom_op` for
+torch.compile compatibility (the first attempt triggered a multi-minute
+graph specialization per layer — see "setup issues" below).
+
+**Weight-distribution analysis that drove the design choices** —
+see `tests/xfp/inspect_distribution.py` and
+`tests/xfp/ab_per_expert.py`. Findings on GLM-4.7-Flash:
+
+Key distributional facts (summarized across ~600 tensors):
+
+- `attn_kva` (`kv_a_proj_with_mqa`): max|w| ≈ **1.63, or ~49σ** — these
+  are the dominant outliers. 1.02 % of weights sit above 4σ.
+- `attn_kvb` (`kv_b_proj`): max|w| ≈ 0.86, ~22σ. 0.35 % > 4σ.
+- All other attention projections: < 0.35 % > 4σ.
+- Dense MLP (single dense block): 0.03 % > 4σ — almost no outliers.
+- **Routed experts (95 % of model params): 0.007–0.008 % > 4σ.**
+  Practically flat tails.
+
+**Per-expert A/B reconstruction stats (XFP3, k=4):**
+
+| type | n | cos bulk | cos outlier | Δcos mean | Δcos max | MSE ratio p50 | MSE ratio p90 |
+|------|---|---------:|------------:|----------:|---------:|--------------:|--------------:|
+| `attn_kva` | 48 | 0.98070 | **0.98973** | +0.00903 | +0.01495 | **1.90×** | 2.26× |
+| `attn_kvb` | 48 | 0.98294 | 0.98654 | +0.00360 | +0.01051 | 1.24× | 1.36× |
+| `shared_gate_up` | 94 | 0.98114 | 0.98356 | +0.00242 | +0.00600 | 1.13× | 1.23× |
+| `shared_down` | 47 | 0.97964 | 0.98195 | +0.00231 | +0.00828 | 1.07× | 1.27× |
+| `attn_o` | 48 | 0.98212 | 0.98391 | +0.00179 | +0.00627 | 1.06× | 1.14× |
+| `attn_qb` | 48 | 0.98173 | 0.98336 | +0.00163 | +0.00964 | 1.06× | 1.17× |
+| `attn_qa` | 48 | 0.98191 | 0.98264 | +0.00073 | +0.00303 | 1.03× | 1.08× |
+| **`routed_down`** | **96** | **0.98238** | **0.98265** | **+0.00027** | **+0.00053** | **1.02×** | 1.02× |
+| **`routed_gate_up`** | **96** | **0.98237** | **0.98265** | **+0.00028** | **+0.00050** | **1.02×** | 1.02× |
+
+All top-10 expert-level wins come from `attn_kva` layers (layers 0, 28,
+38, 41–47) with Δcos up to +0.01495. MoE routed experts sit at +0.00027
+essentially flat — **the outlier extraction is structurally constrained
+by the MoE distribution**, which is too homogeneous to benefit.
+
+**E2E math accuracy changes v1 → v3 (with outliers k=4):**
+
+- XFP4: 54 % → 54 % (noise) — already at the ceiling for a learned codebook.
+- XFP3: 30 % → 30 % (noise) — the cos improvement (98.17 % → 98.50 %) is
+  real but concentrated in 5 % of the model by weight, while 95 % of the
+  model (routed experts) sees Δcos ≈ 0.0003. Not enough for math accuracy
+  to clear another threshold.
+- **XFP2: 0 % → 6 %** — genuine break-through. XFP2 v1 was total garbage;
+  the outlier path carries enough extra signal for the model to produce
+  minimally coherent arithmetic on 3 / 50 probes. Still far from usable,
+  but qualitatively different behavior.
+
+**Conclusion.** Outlier extraction is a **necessary but not sufficient**
+component for XFP3 and XFP2. To cross into usable accuracy at those bit
+widths we need, additionally, a smarter codebook construction (Hessian-
+weighted Lloyd à la GPTQ, or calibration-data-weighted RTN), or a
+per-layer-class bit-width policy (XFP4 on MoE, XFP2/3 only on attention
+where the codebook capacity matches the distribution). The v3 encoder
+writes the outlier split; the quality ceiling is now bounded by the
+codebook not by the tail.
 
 ### Remaining optimization headroom (v3+ scope)
 

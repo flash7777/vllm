@@ -106,13 +106,25 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # results back. This turns 2*E xfp_pack calls into exactly 2 and
         # makes MoE pack time proportional to the total row count, not
         # to E. Scales from O(E × Lloyd_chunk) to O(1 × Lloyd_chunk).
+        #
+        # MoE note: v3 outlier extraction runs over the flattened E*N row
+        # stack as a single matrix. This uses a shared mean/std estimate
+        # across experts. For GLM-4.7-Flash routed experts that's fine
+        # because distribution inspection shows routed_expert layers have
+        # <0.04 % of weights above 4σ — outlier extraction is a no-op in
+        # the expected case. If a future MoE model shows asymmetric expert
+        # distributions, this should be split per-expert; for now we keep
+        # it disabled on MoE to avoid cross-expert leakage.
         def _batched_pack(W_stack: torch.Tensor):
             """W_stack: [E, N, K] -> packed [E, K_packed, N], codebook [E, N, 2^b]."""
             E_ = int(W_stack.shape[0])
             N_ = int(W_stack.shape[1])
             K_ = int(W_stack.shape[2])
             W_flat = W_stack.reshape(E_ * N_, K_).float()
-            packed_flat, codebook_flat, stats = xfp_pack(W_flat, bits=bits)
+            # outlier_sigma=None → bulk-only path (MoE v3 scope)
+            packed_flat, codebook_flat, _o_idx, _o_val, stats = xfp_pack(
+                W_flat, bits=bits, outlier_sigma=None,
+            )
             # packed_flat is [K_packed, E*N]; reshape N dim
             k_packed = packed_flat.shape[0]
             packed = packed_flat.view(k_packed, E_, N_).permute(1, 0, 2).contiguous()

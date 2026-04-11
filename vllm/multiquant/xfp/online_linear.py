@@ -97,10 +97,64 @@ except Exception as e:
     _xfp_op = _xfp_apply_impl
 
 
+# Outlier scatter-add op — registered separately so torch.compile can
+# trace the full forward as a single graph with opaque operator boundary.
+# Without this wrapper, dynamo specializes on the dynamic outlier count
+# per layer and re-compiles for every weight matrix, causing a multi-minute
+# compile-time explosion.
+
+def _xfp_outlier_scatter_impl(
+    base_out: torch.Tensor,      # [M, N_out] output tensor to accumulate into
+    x: torch.Tensor,             # [M, K] input activations
+    outlier_row: torch.Tensor,   # [n_outliers] int64 output-channel indices
+    outlier_col: torch.Tensor,   # [n_outliers] int64 input-channel indices
+    outlier_val: torch.Tensor,   # [n_outliers] fp16 weight values
+) -> torch.Tensor:
+    """Real impl: base_out[:, row] += x[:, col] * val."""
+    x_cast = x.to(base_out.dtype)
+    x_cols = x_cast.index_select(1, outlier_col)   # [M, n_outliers]
+    contrib = x_cols * outlier_val.to(base_out.dtype)
+    rows = outlier_row.unsqueeze(0).expand(x.shape[0], -1)
+    return base_out.scatter_add(1, rows, contrib)
+
+
+def _xfp_outlier_scatter_fake(
+    base_out: torch.Tensor,
+    x: torch.Tensor,
+    outlier_row: torch.Tensor,
+    outlier_col: torch.Tensor,
+    outlier_val: torch.Tensor,
+) -> torch.Tensor:
+    """Fake impl: same shape as base_out."""
+    return torch.empty_like(base_out)
+
+
+try:
+    direct_register_custom_op(
+        op_name="xfp_outlier_scatter",
+        op_func=_xfp_outlier_scatter_impl,
+        fake_impl=_xfp_outlier_scatter_fake,
+    )
+    _xfp_outlier_op = torch.ops.vllm.xfp_outlier_scatter
+    logger.info("XFP outlier-scatter custom op registered")
+except Exception as e:
+    logger.warning(
+        "XFP outlier-scatter custom op registration failed: %s", e,
+    )
+    _xfp_outlier_op = _xfp_outlier_scatter_impl
+
+
 class XFPLinearMethod(QuantizeMethodBase):
     """Learned-codebook quantization (XFP2/XFP3/XFP4) at model load time."""
 
     uses_meta_device: bool = False
+
+    # Default outlier extraction settings (v3). Based on weight-distribution
+    # inspection of GLM-4.7-Flash (tests/xfp/inspect_distribution.py), k=4
+    # catches the 40σ attention outliers (kv_b_proj, q_b_proj) while
+    # marking only 0.01–0.8 % of weights per layer.
+    outlier_sigma: float = 4.0
+    outlier_max_fraction: float = 0.02
 
     def __init__(
         self,
@@ -168,10 +222,12 @@ class XFPLinearMethod(QuantizeMethodBase):
         # also_score_widths is a v3 feature (auto-size selection) — for
         # v1 it's disabled to keep load time proportional to one Lloyd
         # pass per layer instead of three.
-        packed, codebook, stats = xfp_pack(
+        packed, codebook, o_idx, o_val, stats = xfp_pack(
             W.float(),
             bits=self.bits,
             also_score_widths=(),
+            outlier_sigma=self.outlier_sigma,
+            outlier_max_fraction=self.outlier_max_fraction,
         )
 
         layer.xfp_packed = nn.Parameter(
@@ -180,9 +236,30 @@ class XFPLinearMethod(QuantizeMethodBase):
         layer.xfp_codebook = nn.Parameter(
             codebook.to(device), requires_grad=False
         )
+
+        # Outlier sparse residual (v3). Split the flat index back into
+        # (row, col) to make the apply path's scatter-add easy and
+        # torch.compile friendly (no runtime divmod in the hot path).
+        K = int(W.shape[1])
+        N_out = int(W.shape[0])
+        if o_idx is not None and o_val is not None and o_idx.numel() > 0:
+            o_idx_dev = o_idx.to(device)
+            layer.xfp_outlier_row = nn.Parameter(
+                (o_idx_dev // K).to(torch.int64), requires_grad=False
+            )
+            layer.xfp_outlier_col = nn.Parameter(
+                (o_idx_dev % K).to(torch.int64), requires_grad=False
+            )
+            layer.xfp_outlier_val = nn.Parameter(
+                o_val.to(device), requires_grad=False
+            )
+            layer._xfp_has_outliers = True
+        else:
+            layer._xfp_has_outliers = False
+
         layer._xfp_bits = self.bits
-        layer._xfp_K = int(W.shape[1])
-        layer._xfp_N = int(W.shape[0])
+        layer._xfp_K = K
+        layer._xfp_N = N_out
         layer._xfp_stats = stats
         layer._xfp_packed_done = True
 
@@ -200,12 +277,13 @@ class XFPLinearMethod(QuantizeMethodBase):
 
         logger.info(
             "XFP %s [%dx%d] -> %s | mse=%.3g cos=%.3f | "
-            "3sigma=%.1f%% | recommend=xfp%d (gap=%.2fx)",
+            "3sigma=%.1f%% | outliers=%.3f%% (k=%.1f)",
             getattr(layer, "layer_name", "?"),
             stats.shape[0], stats.shape[1],
             self.dtype, stats.mse, stats.cos_sim,
             100.0 * stats.outlier_ratio_k3,
-            stats.recommended_bits, stats.recommended_gap,
+            100.0 * stats.outlier_fraction,
+            stats.outlier_sigma,
         )
 
         # Free the BF16 weight
@@ -232,6 +310,21 @@ class XFPLinearMethod(QuantizeMethodBase):
             int(layer._xfp_K),
             int(layer._xfp_N),
         )
+
+        # Outlier correction (v3): add the sparse residual contribution
+        #   Y[:, row] += X[:, col] * val
+        # via a registered custom op so torch.compile sees it as an opaque
+        # boundary instead of specializing the graph on the per-layer
+        # outlier count (which would cause one recompile per Linear layer).
+        if getattr(layer, "_xfp_has_outliers", False):
+            C = _xfp_outlier_op(
+                C,
+                reshaped_x,
+                layer.xfp_outlier_row,
+                layer.xfp_outlier_col,
+                layer.xfp_outlier_val,
+            )
+
         if bias is not None:
             C = C + bias.to(C.dtype)
         return C.reshape(out_shape)
