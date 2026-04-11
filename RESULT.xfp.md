@@ -106,14 +106,82 @@ by the MoE distribution**, which is too homogeneous to benefit.
   minimally coherent arithmetic on 3 / 50 probes. Still far from usable,
   but qualitatively different behavior.
 
-**Conclusion.** Outlier extraction is a **necessary but not sufficient**
-component for XFP3 and XFP2. To cross into usable accuracy at those bit
-widths we need, additionally, a smarter codebook construction (Hessian-
-weighted Lloyd à la GPTQ, or calibration-data-weighted RTN), or a
-per-layer-class bit-width policy (XFP4 on MoE, XFP2/3 only on attention
-where the codebook capacity matches the distribution). The v3 encoder
-writes the outlier split; the quality ceiling is now bounded by the
-codebook not by the tail.
+**Conclusion (GLM-4.7-Flash).** Outlier extraction is a **necessary but
+not sufficient** component for XFP3 and XFP2. To cross into usable
+accuracy at those bit widths we need, additionally, a smarter codebook
+construction (Hessian-weighted Lloyd à la GPTQ, or calibration-data-
+weighted RTN), or a per-layer-class bit-width policy (XFP4 on MoE,
+XFP2/3 only on attention where the codebook capacity matches the
+distribution). The v3 encoder writes the outlier split; the quality
+ceiling is now bounded by the codebook not by the tail.
+
+### Cross-model comparison: Qwen3.5-35B-A3B
+
+The above analysis is GLM-4.7-Flash specific. To check whether the
+"outlier extraction is structurally constrained by MoE homogeneity"
+finding generalizes, the same A/B was run on Qwen3.5-35B-A3B
+(BF16 checkpoint, 256 routed experts × 40 layers, hidden 2048).
+
+**Distribution profile (mean over 3 samples per type):**
+
+| type | GLM 3σ % | Qwen 3σ % | GLM max\|w\| | Qwen max\|w\| |
+|------|---------:|----------:|------------:|-------------:|
+| `attn_k` | 1.48 | 0.94 | **1.63 (49σ)** | 0.22 (14σ) |
+| `attn_v` | — | 0.82 | — | 0.20 |
+| `dense_mlp` | 0.40 | **1.19** | 0.94 | 0.32 |
+| `routed_down` | 0.28 | **0.40** | 0.26 | 0.32 |
+| `shared_gate_up` | 0.54 | **1.02** | 0.49 | 0.13 |
+
+**Different family, different shape.** GLM has a few catastrophic
+40σ outliers concentrated in attention `kv_a_proj`; everything else
+is brave. Qwen has no catastrophic outliers but a more uniform
+distribution of 3σ-tails across attention, MLP, AND shared experts.
+
+**Per-expert XFP3 A/B on Qwen3.5-35B-A3B (n = 11–96 per type):**
+
+| type | n | cos bulk | cos out | Δcos mean | Δcos max | MSE ratio p50 | MSE ratio p90 |
+|------|---|---------:|--------:|----------:|---------:|--------------:|--------------:|
+| **`shared_gate_up`** | 96 | 0.96555 | **0.98279** | **+0.01724** | **+0.06805** | **1.39×** | **4.70×** |
+| `shared_down` | 41 | 0.97757 | 0.98220 | +0.00463 | +0.01780 | 1.24× | 1.29× |
+| `attn_other` | 33 | 0.97900 | 0.98431 | +0.00531 | +0.02224 | 1.21× | 1.46× |
+| `attn_o` | 11 | 0.97909 | 0.98302 | +0.00393 | +0.01109 | 1.17× | 1.28× |
+| **`routed_down`** | **96** | 0.98025 | 0.98207 | **+0.00182** | +0.01174 | **1.07×** | 1.20× |
+| **`routed_gate_up`** | **96** | 0.98059 | 0.98238 | **+0.00180** | +0.00963 | **1.08×** | 1.16× |
+
+The contrast with GLM is striking:
+
+- **Qwen routed experts gain 6× more from outliers than GLM routed**
+  (Δcos +0.00180 vs +0.00027). The volumetric majority of the model
+  is responsive to the sparse path on Qwen but flat on GLM.
+- **Qwen `shared_gate_up` gains 7× more than GLM** (+0.01724 vs
+  +0.00242), with individual layers showing Δcos up to +0.06805 and
+  MSE ratio 6.28× (e.g. layer 17's `shared_expert_gate`). All top-10
+  expert-level wins are mid-depth `shared_expert_gate` layers
+  (10–22) — these are the gating projections that route activations
+  through the MoE block, and they evidently sit in a regime where the
+  small bulk codebook can't represent them well at all without sparse
+  correction.
+- **GLM's catastrophic `attn_kva` outliers don't have a Qwen analog**.
+  The biggest GLM win class is the smallest Qwen win class.
+
+**Implication for the encoder defaults.** A single global `outlier_sigma
+= 4.0` works for both models because it's tuned by per-tensor σ, not by
+absolute magnitude. But the **expected accuracy gain from the outlier
+path is model-family-specific**: Qwen's broadly distributed tails make
+outlier extraction much more impactful across the whole model, while
+GLM benefits only on attention. A future XFP3 → XFP4 mixed-bit policy
+should probably look different on the two model families:
+
+- GLM: keep MoE on XFP4 (no benefit to extracting), use XFP3 only on
+  attention if needed.
+- Qwen: XFP3 + outliers on routed experts is viable; the dominant
+  failure mode is `shared_expert_gate` which needs full XFP4 or
+  higher.
+
+This is the kind of per-layer-class bit-width tuning the registry's
+`mse_per_bits` infrastructure was designed for. v1 collects the data,
+v3 confirms the data is informative, the auto-size selection itself
+is still v3+ scope.
 
 ### Remaining optimization headroom (v3+ scope)
 
