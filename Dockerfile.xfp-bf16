@@ -21,4 +21,10 @@ k = load(name='xfp_gemm', sources=['/opt/mq_kernels/xfp_gemm_v8.cu'], \
         '-gencode=arch=compute_120,code=sm_120', \
         '-gencode=arch=compute_121,code=sm_121', \
         '-diag-suppress=177,3288'], verbose=True); \
-print('XFP v8 bf16 kernel compiled:', k)"
+print('XFP v8 bf16 kernel compiled:', k); \
+k2 = load(name='xfp_moe_gemm', sources=['/opt/mq_kernels/xfp_moe_gemm.cu'], \
+    extra_cuda_cflags=['-O3', '-std=c++17', '--use_fast_math', \
+        '-gencode=arch=compute_120,code=sm_120', \
+        '-gencode=arch=compute_121,code=sm_121', \
+        '-diag-suppress=177,3288'], verbose=True); \
+print('XFP MoE fused kernel compiled:', k2)"

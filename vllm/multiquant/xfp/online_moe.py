@@ -1,17 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """XFP online MoE method — BF16 → per-expert learned codebook at load time.
 
-Pipeline:
-    create_weights                — delegate to UnquantizedFusedMoEMethod
-                                    (BF16 alloc for w13_weight / w2_weight)
-    process_weights_after_loading — per-expert xfp_pack + xfp_repack, stack
-                                    [E, ...] tensors, drop BF16, record stats
-    apply                         — grouped dispatch: sort tokens by expert
-                                    via moe_align_block_size, one xfp_gemm
-                                    per active expert (not per token)
-
-v2: grouped apply replaces the naive per-token loop. Reduces 184 kernel
-calls/token (B×topk) to ~4-8 (only active experts per layer).
+v3: fused CUDA MoE kernel. Single kernel launch per GEMM handles all experts
+via sorted_token_ids / expert_ids (Marlin pattern). No Python expert loop.
 """
 
 from __future__ import annotations
@@ -27,6 +18,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
 from vllm.multiquant.policy import DTYPE_BITS
 
 if TYPE_CHECKING:
@@ -41,9 +35,8 @@ logger = init_logger(__name__)
 class XFPMoEMethod(FusedMoEMethodBase):
     """Learned-codebook quant-on-load for FusedMoE layers.
 
-    Per-expert Lloyd codebook + word-aligned packed indices. Apply path
-    uses grouped dispatch — tokens sorted by expert, one xfp_gemm call
-    per active expert.
+    Per-expert Lloyd codebook + word-aligned packed indices.
+    Apply uses fused CUDA kernel — one launch per GEMM, all experts.
     """
 
     def __init__(
@@ -93,6 +86,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
 
         from vllm.multiquant.xfp.xfp_pack import xfp_pack, xfp_repack
         from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
+        from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
 
         bits = self.bits
         device = layer.w13_weight.device
@@ -100,41 +94,44 @@ class XFPMoEMethod(FusedMoEMethodBase):
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
         E = int(w13.shape[0])
 
-        # Eagerly compile kernel
         _load_xfp_gemm(bits)
+        _load_xfp_moe_gemm()
 
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
 
         def _batched_pack_and_repack(W_stack: torch.Tensor):
-            """W_stack: [E, N, K] -> repacked [E, flat], codebook [E, N, 2^b]."""
+            """W_stack: [E, N, K] -> flat packed [E*flat], flat codebook [E*N*lut]."""
             E_ = int(W_stack.shape[0])
             N_ = int(W_stack.shape[1])
             K_ = int(W_stack.shape[2])
             W_flat = W_stack.reshape(E_ * N_, K_).float()
-            packed_flat, codebook_flat, _o_idx, _o_val, stats = xfp_pack(
+            packed_flat, codebook_flat, _, _, stats = xfp_pack(
                 W_flat, bits=bits, outlier_sigma=None,
             )
-            # packed_flat is [K_packed, E*N]; reshape per expert
             k_packed = packed_flat.shape[0]
             packed = packed_flat.view(k_packed, E_, N_).permute(1, 0, 2).contiguous()
-            codebook = codebook_flat.view(E_, N_, 1 << bits)
+            lut_size = 1 << bits
+            codebook = codebook_flat.view(E_, N_, lut_size)
 
-            # Repack each expert for coalesced warp reads (v8 kernel requirement)
+            # Repack each expert and concatenate flat
             repacked_list = []
             for e in range(E_):
-                repacked_list.append(xfp_repack(packed[e]))  # [K_packed, N] -> [flat]
-            repacked = torch.stack(repacked_list)  # [E, flat]
+                repacked_list.append(xfp_repack(packed[e]))
+            flat_per_expert = repacked_list[0].numel()
+            all_repacked = torch.cat(repacked_list, dim=0)  # [E * flat_per_expert]
+            all_codebook = codebook.reshape(-1)  # [E * N * lut_size]
 
-            return repacked, codebook, stats
+            return all_repacked, all_codebook, flat_per_expert, stats
 
-        p13, cb13, stats13 = _batched_pack_and_repack(w13)
-        p2, cb2, stats2 = _batched_pack_and_repack(w2)
+        p13, cb13, fpe13, stats13 = _batched_pack_and_repack(w13)
+        p2, cb2, fpe2, stats2 = _batched_pack_and_repack(w2)
 
         if reg is not None:
             reg.record_stats("routed_expert", stats13)
             reg.record_stats("routed_expert", stats2)
 
+        # Store as flat tensors for fused kernel
         layer.w13_xfp_packed = nn.Parameter(p13.to(device), requires_grad=False)
         layer.w13_xfp_codebook = nn.Parameter(cb13.to(device), requires_grad=False)
         layer.w2_xfp_packed = nn.Parameter(p2.to(device), requires_grad=False)
@@ -147,6 +144,8 @@ class XFPMoEMethod(FusedMoEMethodBase):
         layer._xfp_moe_K2 = int(w2.shape[2])
         layer._xfp_moe_N2 = int(w2.shape[1])
         layer._xfp_moe_E = E
+        layer._xfp_moe_fpe13 = fpe13
+        layer._xfp_moe_fpe2 = fpe2
         layer._xfp_moe_packed = True
 
         try:
@@ -155,9 +154,9 @@ class XFPMoEMethod(FusedMoEMethodBase):
             pass
 
         logger.info(
-            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s (repacked)",
+            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s (fused, fpe=%d/%d)",
             E, layer._xfp_moe_N13, layer._xfp_moe_K13,
-            layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype,
+            layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype, fpe13, fpe2,
         )
 
     def apply(
@@ -175,15 +174,13 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 topk_weights=topk_weights, topk_ids=topk_ids,
             )
 
-        from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
+        from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
+
+        moe_kernel = _load_xfp_moe_gemm()
+        if moe_kernel is None:
+            raise RuntimeError("XFP MoE kernel not available")
 
         bits = layer._xfp_moe_bits
-        kernel = _load_xfp_gemm(bits)
-        if kernel is None:
-            raise RuntimeError(
-                f"XFPMoEMethod.apply: xfp_gemm kernel not available"
-            )
-
         B, K_in = x.shape
         topk = topk_ids.shape[1]
         E = layer._xfp_moe_E
@@ -193,42 +190,49 @@ class XFPMoEMethod(FusedMoEMethodBase):
         K2 = layer._xfp_moe_K2
         half_n = N13 // 2
 
-        # Direct per-token loop — minimal overhead for decode (B=1).
-        # At B=1, topk=4: only 4 expert pairs, 8 kernel calls total.
-        # No sorting, no tensor alloc beyond the output buffers.
+        # Token sorting (Marlin pattern)
+        sorted_token_ids, expert_ids, num_tokens_post = moe_align_block_size(
+            topk_ids, block_size=1, num_experts=E)
+        num_valid = int(num_tokens_post.item())
+
         x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
-        output = torch.zeros(B, K_in, dtype=x.dtype, device=x.device)
+        topk_w_flat = topk_weights.reshape(-1).to(torch.float32)
 
-        for b in range(B):
-            for t in range(topk):
-                eid = int(topk_ids[b, t].item())
-                w = float(topk_weights[b, t].item())
-                if eid < 0 or eid >= E:
-                    continue
+        # Gate+Up GEMM: one fused kernel launch
+        gate_up = torch.zeros(
+            num_valid, N13, dtype=torch.bfloat16, device=x.device)
+        moe_kernel.xfp_moe_gemm(
+            x_bf16, layer.w13_xfp_packed, layer.w13_xfp_codebook,
+            gate_up, sorted_token_ids[:num_valid], expert_ids,
+            topk_w_flat,
+            int(bits), int(K13), int(N13), int(topk),
+            int(layer._xfp_moe_fpe13), num_valid)
 
-                x_row = x_bf16[b:b + 1]  # [1, K]
+        # SiLU activation
+        gate = F.silu(gate_up[:, :half_n])
+        up = gate_up[:, half_n:]
+        activated = gate * up  # [num_valid, half_n]
 
-                # Gate+Up
-                gate_up = torch.zeros(
-                    1, N13, dtype=torch.bfloat16, device=x.device)
-                kernel.xfp_gemm(
-                    x_row, layer.w13_xfp_packed[eid],
-                    layer.w13_xfp_codebook[eid],
-                    gate_up, int(bits), int(K13))
+        # Down GEMM: one fused kernel launch (no topk_weights here)
+        down = torch.zeros(
+            num_valid, N2, dtype=torch.bfloat16, device=x.device)
+        empty_weights = torch.empty(0, dtype=torch.float32, device=x.device)
+        moe_kernel.xfp_moe_gemm(
+            x_bf16, layer.w2_xfp_packed, layer.w2_xfp_codebook,
+            down, sorted_token_ids[:num_valid], expert_ids,
+            empty_weights,
+            int(bits), int(K2), int(N2), int(topk),
+            int(layer._xfp_moe_fpe2), num_valid)
 
-                # SiLU(gate) * up
-                gate = gate_up[0, :half_n]
-                up = gate_up[0, half_n:]
-                activated = (F.silu(gate) * up).unsqueeze(0)  # [1, half_n]
-
-                # Down
-                down = torch.zeros(
-                    1, N2, dtype=torch.bfloat16, device=x.device)
-                kernel.xfp_gemm(
-                    activated, layer.w2_xfp_packed[eid],
-                    layer.w2_xfp_codebook[eid],
-                    down, int(bits), int(K2))
-
-                output[b] += w * down[0].to(output.dtype)
+        # Scatter-reduce back to [B, N2]
+        # sorted_token_ids maps to token_id in [0, B*topk)
+        # original token = token_id // topk
+        orig_tokens = sorted_token_ids[:num_valid] // topk
+        output = torch.zeros(B, N2, dtype=x.dtype, device=x.device)
+        output.scatter_add_(
+            0,
+            orig_tokens.unsqueeze(1).expand_as(down).to(torch.int64),
+            down.to(output.dtype),
+        )
 
         return output

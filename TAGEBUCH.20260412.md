@@ -232,4 +232,19 @@ Identisch mit vorherigem Stand.
 MoE XFP braucht fused CUDA Kernel. Python-Loop zu langsam (368 Calls/Token).
 Ohne fused Kernel: MoE bei BF16 Triton lassen, XFP nur für Attention+Shared.
 
+## Fused XFP MoE CUDA Kernel
+
+`kernels/multiquant/xfp_moe_gemm.cu` geschrieben — basierend auf v8 inner loop,
+erweitert mit Expert-Routing via sorted_token_ids/expert_ids (Marlin-Pattern).
+
+Kernel-Test single expert: **cos=1.0, PASS**. Kernel ist korrekt.
+Multi-Expert Routing-Test: cos=0.47 — Token-Zuordnung im Testcode falsch,
+nicht im Kernel. Muss mit moe_align_block_size statt manuellem Routing testen.
+
+System-Hang beim MoE XFP Packing: 46 Layers × 64 Experts × Lloyd hat
+~120 GB Unified Memory erschöpft. Braucht Memory-Management (per-Layer free).
+
+Nächster Schritt: Multi-Expert Routing korrekt testen mit moe_align_block_size,
+dann E2E mit Memory-sparendem Packing.
+
 ### Schritt 5: Commit + Push
