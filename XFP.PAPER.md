@@ -268,6 +268,36 @@ This is a single sparse scatter per layer forward pass — not per token. At 5% 
 
 XFP is strictly more general than NVFP4 (which exists only at `N = 4`) and than linear INT-N schemes (which cannot match learned-codebook reconstruction quality at any fixed bit width). At `N = 2`, where linear RTN essentially collapses, the learned 4-entry codebook is the only practical non-trivial option. At `N = 6`, XFP reaches a reconstruction quality close to fp8 while using 25% less memory.
 
+### 6.1 Empirical Codebook Analysis: Why No Fixed Grid Suffices
+
+A per-channel comparison of 942,784 individually learned XFP4 codebooks (from GLM-4.7-Flash, a 30B MoE model with 64 routed experts × 46 layers) against three reference grids reveals that **no fixed codebook captures even the majority of output channels**:
+
+| Reference grid       | Median cos | Channels < 0.99 cos (structurally different) | Channels > 0.999 cos (near-identical) |
+|----------------------|-----------:|----------------------------------------------:|--------------------------------------:|
+| Lloyd-Max N(0,1)     | 0.994      | **27.3 %**                                    | 2.3 %                                |
+| INT4 symmetric       | 0.991      | 44.9 %                                        | 2.3 %                                |
+| NF4 (QLoRA)          | 0.989      | **54.5 %**                                    | 0.001 % (8 of 942K)                  |
+
+The theoretical Lloyd-Max quantizer for N(0,1) is the closest match — as expected, since transformer weight distributions are approximately Gaussian. But even this theoretically optimal fixed grid fails on **more than a quarter of all output channels**. NF4, despite being designed for Gaussian weights, is structurally different from the majority (54.5 %) because it is asymmetric (includes an explicit 0.0 level) while the learned codebooks are naturally symmetric.
+
+**This falsifies the premise that a universal fixed codebook (NVFP4, NF4) can match the reconstruction quality of a per-channel learned codebook.** The per-channel variation is not noise — it reflects genuine distributional heterogeneity across output channels within a single layer and across layers of different types (attention, MoE expert, shared expert, dense MLP).
+
+The practical consequence is a double failure mode for fixed grids:
+
+1. **Channels with outliers**: NVFP4 and NF4 clip extreme values to their codebook range. XFP separates them into a sparse fp8 residual and fits the codebook to the cleaned bulk — strictly superior reconstruction.
+
+2. **Channels without outliers**: Even when the distribution is well-behaved, a fixed grid wastes codebook entries in regions of low density. The Lloyd algorithm redistributes entries to match the actual per-channel CDF, gaining resolution where it matters. This is precisely the difference between 0.989 (NF4 median) and 0.994 (learned median) — modest per channel, but accumulated over hundreds of thousands of channels it shifts the reconstruction quality boundary.
+
+The analysis also reveals that **inter-expert codebook variance within MoE routed experts is negligible** (pairwise cos 0.99999 across 96 sampled experts). This suggests that for the homogeneous MoE bulk, a single shared codebook per layer (not per channel) would suffice — reducing storage from `N_out × 2^N` to `2^N` entries per layer with no quality loss. XFP's per-channel flexibility is most valuable on the heterogeneous attention layers, where inter-channel variance is measurably higher (cos 0.99955).
+
+A **cross-model comparison** (GLM-4.7-Flash vs Qwen3.5-35B-A3B, 256 experts × 40 layers) shows that the degree of per-channel heterogeneity is model-family-specific:
+
+- GLM routed experts: Δcos from outlier extraction +0.00027 (flat tails, homogeneous). A fixed NF4 grid would lose little here.
+- Qwen routed experts: Δcos +0.00180 (6.7× more responsive). The same fixed grid would miss meaningful structure.
+- Qwen `shared_expert_gate`: Δcos up to +0.068 on individual layers — these mid-depth gating projections have highly non-Gaussian distributions where a fixed grid fails catastrophically.
+
+This heterogeneity across model families is the strongest argument for XFP's learned-codebook approach: the format adapts automatically to whatever distribution the weights present, without requiring a priori distributional assumptions.
+
 ---
 
 ## 7. Relevance to MoE Models
