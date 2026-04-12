@@ -196,15 +196,15 @@ class XFPMoEMethod(FusedMoEMethodBase):
         num_valid = int(num_tokens_post.item())
 
         x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
-        topk_w_flat = topk_weights.reshape(-1).to(torch.float32)
+        no_weights = torch.empty(0, dtype=torch.float32, device=x.device)
 
-        # Gate+Up GEMM: one fused kernel launch
+        # Gate+Up GEMM: one fused kernel launch, NO topk_weights yet
         gate_up = torch.zeros(
             num_valid, N13, dtype=torch.bfloat16, device=x.device)
         moe_kernel.xfp_moe_gemm(
             x_bf16, layer.w13_xfp_packed, layer.w13_xfp_codebook,
             gate_up, sorted_token_ids[:num_valid], expert_ids,
-            topk_w_flat,
+            no_weights,
             int(bits), int(K13), int(N13), int(topk),
             int(layer._xfp_moe_fpe13), num_valid)
 
@@ -213,26 +213,27 @@ class XFPMoEMethod(FusedMoEMethodBase):
         up = gate_up[:, half_n:]
         activated = gate * up  # [num_valid, half_n]
 
-        # Down GEMM: one fused kernel launch (no topk_weights here)
+        # Down GEMM: input is activated (not x!), no topk_weights
         down = torch.zeros(
             num_valid, N2, dtype=torch.bfloat16, device=x.device)
-        empty_weights = torch.empty(0, dtype=torch.float32, device=x.device)
         moe_kernel.xfp_moe_gemm(
-            x_bf16, layer.w2_xfp_packed, layer.w2_xfp_codebook,
+            activated, layer.w2_xfp_packed, layer.w2_xfp_codebook,
             down, sorted_token_ids[:num_valid], expert_ids,
-            empty_weights,
+            no_weights,
             int(bits), int(K2), int(N2), int(topk),
             int(layer._xfp_moe_fpe2), num_valid)
 
-        # Scatter-reduce back to [B, N2]
-        # sorted_token_ids maps to token_id in [0, B*topk)
-        # original token = token_id // topk
-        orig_tokens = sorted_token_ids[:num_valid] // topk
+        # Scatter-reduce with topk_weights back to [B, K_in]
+        sorted_ids_valid = sorted_token_ids[:num_valid]
+        orig_tokens = (sorted_ids_valid // topk).to(torch.int64)
+        weights_sorted = topk_weights.reshape(-1)[sorted_ids_valid.long()]
+        weighted_down = down.float() * weights_sorted.unsqueeze(1)
+
         output = torch.zeros(B, N2, dtype=x.dtype, device=x.device)
         output.scatter_add_(
             0,
-            orig_tokens.unsqueeze(1).expand_as(down).to(torch.int64),
-            down.to(output.dtype),
+            orig_tokens.unsqueeze(1).expand_as(weighted_down),
+            weighted_down.to(output.dtype),
         )
 
         return output
