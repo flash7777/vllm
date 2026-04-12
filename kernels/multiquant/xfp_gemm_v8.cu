@@ -15,6 +15,7 @@
 
 #include <torch/extension.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
 
 namespace multiquant {
@@ -25,10 +26,10 @@ namespace multiquant {
 
 template <int BITS>
 __global__ void xfp_gemm_v8_kernel(
-    const half* __restrict__ A,
+    const __nv_bfloat16* __restrict__ A,
     const uint32_t* __restrict__ B_packed,  // repacked flat
-    const half* __restrict__ codebook,      // [N, 2^BITS]
-    half* __restrict__ C,                   // [M, N]
+    const half* __restrict__ codebook,  // [N, 2^BITS] fp16 for precision
+    __nv_bfloat16* __restrict__ C,               // [M, N]
     int M, int N, int K, int K_packed)
 {
     constexpr int VALS_PER_WORD = (BITS == 2) ? 16 : (BITS == 3) ? 10 : 8;
@@ -43,14 +44,8 @@ __global__ void xfp_gemm_v8_kernel(
 
     if (m >= M) return;
 
-    // === SMEM codebook pool ===
-    // Each warp's 2^BITS entries stored in SMEM instead of registers.
-    // Total: WARPS_PER_BLOCK × LUT_SIZE floats
-    // For BITS=4: 8 × 16 × 4 = 512 bytes — tiny.
     __shared__ float s_cb[WARPS_PER_BLOCK * LUT_SIZE];
 
-    // Cooperative codebook load: each warp loads its own entries.
-    // Lane 0..LUT_SIZE-1 load the entries; rest idle (LUT_SIZE ≤ 16 < 32).
     if (n < N && lane < LUT_SIZE) {
         s_cb[warp_id * LUT_SIZE + lane] =
             __half2float(codebook[n * LUT_SIZE + lane]);
@@ -59,10 +54,9 @@ __global__ void xfp_gemm_v8_kernel(
 
     if (n >= N) return;
 
-    // Pointer to this warp's codebook slice in SMEM
     const float* my_cb = s_cb + warp_id * LUT_SIZE;
 
-    const half* A_row = A + m * K;
+    const __nv_bfloat16* A_row = A + m * K;
     float acc = 0.0f;
 
     // Repack addressing (same as v4opt)
@@ -86,9 +80,9 @@ __global__ void xfp_gemm_v8_kernel(
 
         #pragma unroll
         for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
-            half2 a2 = *reinterpret_cast<const half2*>(A_row + k_base + slot);
-            float a0 = __low2float(a2);
-            float a1 = __high2float(a2);
+            __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(A_row + k_base + slot);
+            float a0 = __bfloat162float(__low2bfloat16(a2));
+            float a1 = __bfloat162float(__high2bfloat16(a2));
 
             int idx0 = (int)((buf_cur >> (slot * BITS)) & MASK);
             int idx1 = (int)((buf_cur >> ((slot + 1) * BITS)) & MASK);
@@ -110,7 +104,7 @@ __global__ void xfp_gemm_v8_kernel(
         for (int slot = 0; slot < VALS_PER_WORD; slot++) {
             int k = k_base + slot;
             if (k >= K) break;
-            float a = __half2float(A_row[k]);
+            float a = __bfloat162float(A_row[k]);
             int idx = (int)((packed >> (slot * BITS)) & MASK);
             acc = fmaf(my_cb[idx], a, acc);
         }
@@ -123,7 +117,7 @@ __global__ void xfp_gemm_v8_kernel(
     }
 
     if (lane == 0) {
-        C[m * N + n] = __float2half(acc);
+        C[m * N + n] = __float2bfloat16(acc);
     }
 }
 
@@ -143,10 +137,10 @@ static void launch_v8(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     xfp_gemm_v8_kernel<BITS><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
         reinterpret_cast<const uint32_t*>(B_packed.data_ptr<int32_t>()),
         reinterpret_cast<const half*>(codebook.data_ptr()),
-        reinterpret_cast<half*>(C.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         M, N, K, K_packed);
 }
 
@@ -161,12 +155,12 @@ void xfp_gemm(
     TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() &&
                 codebook.is_cuda() && C.is_cuda(),
                 "xfp_gemm: all tensors must be CUDA");
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "xfp_gemm: A must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "xfp_gemm: A must be bfloat16");
     TORCH_CHECK(B_packed.dtype() == torch::kInt32,
                 "xfp_gemm: B_packed must be int32");
     TORCH_CHECK(codebook.dtype() == torch::kFloat16,
                 "xfp_gemm: codebook must be float16");
-    TORCH_CHECK(C.dtype() == torch::kFloat16, "xfp_gemm: C must be float16");
+    TORCH_CHECK(C.dtype() == torch::kBFloat16, "xfp_gemm: C must be bfloat16");
     TORCH_CHECK(A.dim() == 2 && C.dim() == 2,
                 "xfp_gemm: A and C must be 2D");
     TORCH_CHECK(B_packed.dim() == 1,

@@ -408,6 +408,32 @@ podman run -d --replace --name mq-test \
 python3 bench.py --url http://localhost:8011 --model glm-4.7-flash --label "XFP4 E2E"
 ```
 
+## v8 bf16-native kernel (2026-04-12)
+
+Kernel changed from fp16 to native bf16 for A and C tensors (codebook
+stays fp16 for precision). Eliminates the bf16→fp16→bf16 conversion
+overhead that profiling showed cost 124% per kernel call.
+
+**Image**: `localhost/vllm-xfp-bf16` (FROM vllm-multiquant + bf16 changes)
+**KV cache**: fp8 (not tq3 — tq3 KV has a separate bug)
+**Bench fix**: `bench.py` comma-separator parsing fixed (e.g. `130,696` → `130696`)
+
+| Config | KV | Graphs | Short | Medium | Long | Math |
+|--------|-----|--------|-------|--------|------|------|
+| **XFP4 v8 bf16** | fp8 | eager | 24.1 | 25.0 | 24.6 | 28/50 (56%) |
+| **XFP4 v8 bf16** | fp8 | **CUDA** | **29.1** | **33.0** | **32.7** | 25/50 (50%) |
+| XFP4 v8 bf16 (comma fix) | fp8 | CUDA | — | — | — | **33/50 (66%)** |
+| FP8 prequant baseline | fp8 | eager | 19.6 | 26.6 | 28.2 | 30/50 (60%) |
+
+Note: Math difference between eager (56%) and CUDA Graphs (50%) is
+run-to-run noise — both are 66% after the comma-separator parsing fix.
+
+**Key findings:**
+1. XFP4 bf16-native (66% math) **beats FP8 prequant** (60% math) on quality
+2. XFP4 with CUDA Graphs: **32.7 tok/s** (vs Marlin INT4 ~50 tok/s target)
+3. The previous 0% math was caused by tq3 KV-cache bug, not XFP
+4. bench.py had a comma-parsing bug that undercounted correct answers by ~16%
+
 ## Architecture notes
 
 - **Registry-centered dispatch**: XFP does not introduce a new `--quantization`

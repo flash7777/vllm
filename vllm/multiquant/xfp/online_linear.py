@@ -51,9 +51,10 @@ def _xfp_apply_impl(
     K: int,
     N_out: int,
 ) -> torch.Tensor:
-    """Real impl: eager fused xfp_gemm. Output dtype follows input.
+    """Real impl: eager fused xfp_gemm. Native bf16 — no dtype conversion.
 
     packed is 1D (repacked via xfp_repack for coalesced warp reads).
+    codebook is bf16 [N_out, 2^bits]. A and C are bf16.
     """
     from vllm.multiquant.xfp import xfp_kernel as _xk
     kernel = _xk._xfp_gemm_kernel
@@ -62,13 +63,14 @@ def _xfp_apply_impl(
             "xfp custom op called before xfp_gemm kernel was loaded. "
             "process_weights_after_loading should have triggered JIT."
         )
-    out_dtype = x.dtype
-    x_fp16 = x.to(torch.float16).contiguous()
-    # packed is 1D int32 (repacked); codebook is [N_out, 2^bits] fp16
-    C = torch.zeros(x_fp16.shape[0], N_out,
-                    dtype=torch.float16, device=x.device)
-    kernel.xfp_gemm(x_fp16, packed.reshape(-1), codebook, C, int(bits), int(K))
-    return C.to(out_dtype)
+    # A and C are bf16 (vLLM native), codebook stays fp16 (more precision).
+    # No dtype conversion on the hot path — kernel handles mixed types.
+    x_bf16 = x.to(torch.bfloat16).contiguous() if x.dtype != torch.bfloat16 else x.contiguous()
+    cb_fp16 = codebook.to(torch.float16) if codebook.dtype != torch.float16 else codebook
+    C = torch.zeros(x_bf16.shape[0], N_out,
+                    dtype=torch.bfloat16, device=x.device)
+    kernel.xfp_gemm(x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K))
+    return C
 
 
 def _xfp_apply_fake(
@@ -81,7 +83,7 @@ def _xfp_apply_fake(
 ) -> torch.Tensor:
     """Fake impl for torch.compile graph tracing. Matches real dtype."""
     return torch.empty(
-        x.shape[0], N_out, dtype=x.dtype, device=x.device
+        x.shape[0], N_out, dtype=torch.bfloat16, device=x.device
     )
 
 

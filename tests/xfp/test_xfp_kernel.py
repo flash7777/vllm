@@ -20,10 +20,10 @@ cuda_only = pytest.mark.skipif(
 )
 
 
-def _reference(x_fp16, packed_int32, codebook_fp16, K, bits):
-    """Reference matmul: fp16 x @ dequant(packed, codebook).T via torch."""
-    W_rec = dequant_xfp(packed_int32, codebook_fp16, K=K, bits=bits)
-    return (x_fp16.to(torch.float32) @ W_rec.to(torch.float32).T).to(torch.float16)
+def _reference(x, packed_int32, codebook, K, bits):
+    """Reference matmul: x @ dequant(packed, codebook).T via torch."""
+    W_rec = dequant_xfp(packed_int32, codebook, K=K, bits=bits)
+    return (x.to(torch.float32) @ W_rec.to(torch.float32).T).to(x.dtype)
 
 
 @cuda_only
@@ -43,7 +43,7 @@ def test_xfp_gemm_matches_reference(bits: int, M: int, N_out: int, K: int) -> No
     codebook = codebook_cpu.to(device)
 
     # Build an input activation
-    x = torch.randn(M, K, dtype=torch.float16, device=device)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
 
     # Reference: fp32 matmul through the torch dequant path (uses ORIGINAL packed)
     expected = _reference(x, packed_orig, codebook, K=K, bits=bits)
@@ -52,7 +52,7 @@ def test_xfp_gemm_matches_reference(bits: int, M: int, N_out: int, K: int) -> No
     from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
     kernel = _load_xfp_gemm(bits)
     assert kernel is not None, "xfp_gemm kernel did not load"
-    C = torch.zeros(M, N_out, dtype=torch.float16, device=device)
+    C = torch.zeros(M, N_out, dtype=torch.bfloat16, device=device)
     kernel.xfp_gemm(x, repacked, codebook, C, int(bits), int(K))
 
     # Cosine similarity (fp16 rounding makes exact match infeasible).
@@ -75,8 +75,8 @@ def test_xfp_gemm_rejects_bad_bits() -> None:
     packed_cpu, codebook_cpu, _, _, _ = xfp_pack(W, bits=4)
     repacked = xfp_repack(packed_cpu).to(device)
     codebook = codebook_cpu.to(device)
-    x = torch.randn(2, 128, dtype=torch.float16, device=device)
-    C = torch.zeros(2, 64, dtype=torch.float16, device=device)
+    x = torch.randn(2, 128, dtype=torch.bfloat16, device=device)
+    C = torch.zeros(2, 64, dtype=torch.bfloat16, device=device)
 
     from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
     kernel = _load_xfp_gemm(4)

@@ -176,7 +176,9 @@ def math_test(url, model, n=50):
             body = json.loads(resp.read())
         content = body["choices"][0]["text"]
         import re as _re
-        nums = [int(x) for x in _re.findall(r'-?\d+', content)]
+        # Strip thousand-separator commas (e.g. "130,696" → "130696")
+        content_clean = _re.sub(r'(\d),(\d)', r'\1\2', content)
+        nums = [int(x) for x in _re.findall(r'-?\d+', content_clean)]
         operands = {a, b}
         filtered = [n for n in nums if n not in operands]
 

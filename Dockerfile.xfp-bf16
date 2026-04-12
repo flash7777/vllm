@@ -1,0 +1,24 @@
+# XFP v8 bf16-native Kernel Update
+# Basis: vllm-multiquant (hat alles außer die bf16-Änderungen)
+# Kopiert die geänderten Python-Module und CUDA-Kernel rein.
+
+FROM localhost/vllm-multiquant:latest
+
+# XFP Python-Module (bf16-Änderungen)
+COPY vllm/multiquant/xfp/ /usr/local/lib/python3.12/dist-packages/vllm/multiquant/xfp/
+COPY vllm/multiquant/policy.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/policy.py
+COPY vllm/multiquant/autoround/config.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/config.py
+
+# CUDA Kernel Source (für JIT-Kompilierung)
+COPY kernels/multiquant/ /opt/mq_kernels/
+
+# Pre-build XFP CUDA kernel (xfp4, deckt auch xfp2/xfp3 ab)
+RUN python3 -c "\
+import sys; sys.path.insert(0, '/usr/local/lib/python3.12/dist-packages'); \
+from torch.utils.cpp_extension import load; \
+k = load(name='xfp_gemm', sources=['/opt/mq_kernels/xfp_gemm_v8.cu'], \
+    extra_cuda_cflags=['-O3', '-std=c++17', '--use_fast_math', \
+        '-gencode=arch=compute_120,code=sm_120', \
+        '-gencode=arch=compute_121,code=sm_121', \
+        '-diag-suppress=177,3288'], verbose=True); \
+print('XFP v8 bf16 kernel compiled:', k)"
