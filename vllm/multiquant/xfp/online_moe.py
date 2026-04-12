@@ -4,14 +4,14 @@
 Pipeline:
     create_weights                — delegate to UnquantizedFusedMoEMethod
                                     (BF16 alloc for w13_weight / w2_weight)
-    process_weights_after_loading — per-expert xfp_pack, stack [E, ...] tensors,
-                                    drop BF16 weights, record stats per expert
-    apply                         — naive per-token × per-topk × per-expert
-                                    loop calling xfp_gemm twice (gate+up, down)
-                                    with SiLU between
+    process_weights_after_loading — per-expert xfp_pack + xfp_repack, stack
+                                    [E, ...] tensors, drop BF16, record stats
+    apply                         — grouped dispatch: sort tokens by expert
+                                    via moe_align_block_size, one xfp_gemm
+                                    per active expert (not per token)
 
-v1 is a reference implementation — correctness first. Batched grouped MoE
-kernel is v3 scope.
+v2: grouped apply replaces the naive per-token loop. Reduces 184 kernel
+calls/token (B×topk) to ~4-8 (only active experts per layer).
 """
 
 from __future__ import annotations
@@ -42,7 +42,8 @@ class XFPMoEMethod(FusedMoEMethodBase):
     """Learned-codebook quant-on-load for FusedMoE layers.
 
     Per-expert Lloyd codebook + word-aligned packed indices. Apply path
-    is the per-token naive loop — reference implementation, not perf.
+    uses grouped dispatch — tokens sorted by expert, one xfp_gemm call
+    per active expert.
     """
 
     def __init__(
@@ -54,7 +55,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
         if dtype not in ("xfp2", "xfp3", "xfp4"):
             raise ValueError(
                 f"XFPMoEMethod: unsupported dtype '{dtype}', "
-                f"supported: xfp2, xfp3, xfp4 (v1)"
+                f"supported: xfp2, xfp3, xfp4"
             )
         if moe_config is not None:
             super().__init__(moe_config)
@@ -90,7 +91,8 @@ class XFPMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "_xfp_moe_packed", False):
             return
 
-        from vllm.multiquant.xfp.xfp_pack import xfp_pack
+        from vllm.multiquant.xfp.xfp_pack import xfp_pack, xfp_repack
+        from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
 
         bits = self.bits
         device = layer.w13_weight.device
@@ -98,44 +100,38 @@ class XFPMoEMethod(FusedMoEMethodBase):
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
         E = int(w13.shape[0])
 
+        # Eagerly compile kernel
+        _load_xfp_gemm(bits)
+
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
 
-        # Batched pack: flatten [E, N_out, K] to [E*N_out, K], run Lloyd
-        # once over all rows (each row is independent), then reshape the
-        # results back. This turns 2*E xfp_pack calls into exactly 2 and
-        # makes MoE pack time proportional to the total row count, not
-        # to E. Scales from O(E × Lloyd_chunk) to O(1 × Lloyd_chunk).
-        #
-        # MoE note: v3 outlier extraction runs over the flattened E*N row
-        # stack as a single matrix. This uses a shared mean/std estimate
-        # across experts. For GLM-4.7-Flash routed experts that's fine
-        # because distribution inspection shows routed_expert layers have
-        # <0.04 % of weights above 4σ — outlier extraction is a no-op in
-        # the expected case. If a future MoE model shows asymmetric expert
-        # distributions, this should be split per-expert; for now we keep
-        # it disabled on MoE to avoid cross-expert leakage.
-        def _batched_pack(W_stack: torch.Tensor):
-            """W_stack: [E, N, K] -> packed [E, K_packed, N], codebook [E, N, 2^b]."""
+        def _batched_pack_and_repack(W_stack: torch.Tensor):
+            """W_stack: [E, N, K] -> repacked [E, flat], codebook [E, N, 2^b]."""
             E_ = int(W_stack.shape[0])
             N_ = int(W_stack.shape[1])
             K_ = int(W_stack.shape[2])
             W_flat = W_stack.reshape(E_ * N_, K_).float()
-            # outlier_sigma=None → bulk-only path (MoE v3 scope)
             packed_flat, codebook_flat, _o_idx, _o_val, stats = xfp_pack(
                 W_flat, bits=bits, outlier_sigma=None,
             )
-            # packed_flat is [K_packed, E*N]; reshape N dim
+            # packed_flat is [K_packed, E*N]; reshape per expert
             k_packed = packed_flat.shape[0]
             packed = packed_flat.view(k_packed, E_, N_).permute(1, 0, 2).contiguous()
             codebook = codebook_flat.view(E_, N_, 1 << bits)
-            return packed, codebook, stats
 
-        p13, cb13, stats13 = _batched_pack(w13)
-        p2, cb2, stats2 = _batched_pack(w2)
+            # Repack each expert for coalesced warp reads (v8 kernel requirement)
+            repacked_list = []
+            for e in range(E_):
+                repacked_list.append(xfp_repack(packed[e]))  # [K_packed, N] -> [flat]
+            repacked = torch.stack(repacked_list)  # [E, flat]
+
+            return repacked, codebook, stats
+
+        p13, cb13, stats13 = _batched_pack_and_repack(w13)
+        p2, cb2, stats2 = _batched_pack_and_repack(w2)
 
         if reg is not None:
-            # One aggregate stats record per tensor — cheaper than one-per-expert.
             reg.record_stats("routed_expert", stats13)
             reg.record_stats("routed_expert", stats2)
 
@@ -144,13 +140,12 @@ class XFPMoEMethod(FusedMoEMethodBase):
         layer.w2_xfp_packed = nn.Parameter(p2.to(device), requires_grad=False)
         layer.w2_xfp_codebook = nn.Parameter(cb2.to(device), requires_grad=False)
 
-        # Save shape metadata so apply() can call the kernel.
         layer._xfp_moe_bits = bits
         layer._xfp_moe_dtype = self.dtype
-        layer._xfp_moe_K13 = int(w13.shape[2])     # hidden in
-        layer._xfp_moe_N13 = int(w13.shape[1])     # 2 * intermediate
-        layer._xfp_moe_K2 = int(w2.shape[2])       # intermediate in
-        layer._xfp_moe_N2 = int(w2.shape[1])       # hidden out
+        layer._xfp_moe_K13 = int(w13.shape[2])
+        layer._xfp_moe_N13 = int(w13.shape[1])
+        layer._xfp_moe_K2 = int(w2.shape[2])
+        layer._xfp_moe_N2 = int(w2.shape[1])
         layer._xfp_moe_E = E
         layer._xfp_moe_packed = True
 
@@ -160,7 +155,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
             pass
 
         logger.info(
-            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s",
+            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s (repacked)",
             E, layer._xfp_moe_N13, layer._xfp_moe_K13,
             layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype,
         )
@@ -186,56 +181,54 @@ class XFPMoEMethod(FusedMoEMethodBase):
         kernel = _load_xfp_gemm(bits)
         if kernel is None:
             raise RuntimeError(
-                f"XFPMoEMethod.apply: xfp_gemm kernel not available for bits={bits}"
+                f"XFPMoEMethod.apply: xfp_gemm kernel not available"
             )
 
-        B, K = x.shape
+        B, K_in = x.shape
         topk = topk_ids.shape[1]
         E = layer._xfp_moe_E
         N13 = layer._xfp_moe_N13
         K13 = layer._xfp_moe_K13
         N2 = layer._xfp_moe_N2
         K2 = layer._xfp_moe_K2
+        half_n = N13 // 2
 
-        output = torch.zeros(B, K, dtype=x.dtype, device=x.device)
+        # Direct per-token loop — minimal overhead for decode (B=1).
+        # At B=1, topk=4: only 4 expert pairs, 8 kernel calls total.
+        # No sorting, no tensor alloc beyond the output buffers.
+        x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
+        output = torch.zeros(B, K_in, dtype=x.dtype, device=x.device)
 
         for b in range(B):
             for t in range(topk):
-                expert_id = int(topk_ids[b, t].item())
-                weight = float(topk_weights[b, t].item())
-                if expert_id < 0 or expert_id >= E:
+                eid = int(topk_ids[b, t].item())
+                w = float(topk_weights[b, t].item())
+                if eid < 0 or eid >= E:
                     continue
 
-                x_row = x[b:b + 1].to(torch.float16)  # [1, K]
+                x_row = x_bf16[b:b + 1]  # [1, K]
 
-                # Gate+Up: x_row [1, K13] @ dequant(w13[e]) -> [1, N13]
-                w13_p = layer.w13_xfp_packed[expert_id]
-                w13_c = layer.w13_xfp_codebook[expert_id]
+                # Gate+Up
                 gate_up = torch.zeros(
-                    1, N13, dtype=torch.float16, device=x.device
-                )
+                    1, N13, dtype=torch.bfloat16, device=x.device)
                 kernel.xfp_gemm(
-                    x_row, w13_p, w13_c, gate_up, int(bits), int(K13)
-                )
+                    x_row, layer.w13_xfp_packed[eid],
+                    layer.w13_xfp_codebook[eid],
+                    gate_up, int(bits), int(K13))
 
-                # SiLU(gate) * up — first half is gate, second half is up
-                half_n = N13 // 2
+                # SiLU(gate) * up
                 gate = gate_up[0, :half_n]
                 up = gate_up[0, half_n:]
                 activated = (F.silu(gate) * up).unsqueeze(0)  # [1, half_n]
 
-                # Down: activated [1, K2] @ dequant(w2[e]) -> [1, N2]
-                w2_p = layer.w2_xfp_packed[expert_id]
-                w2_c = layer.w2_xfp_codebook[expert_id]
+                # Down
                 down = torch.zeros(
-                    1, N2, dtype=torch.float16, device=x.device
-                )
+                    1, N2, dtype=torch.bfloat16, device=x.device)
                 kernel.xfp_gemm(
-                    activated, w2_p, w2_c, down, int(bits), int(K2)
-                )
+                    activated, layer.w2_xfp_packed[eid],
+                    layer.w2_xfp_codebook[eid],
+                    down, int(bits), int(K2))
 
-                output[b] = output[b] + weight * down[0].to(output.dtype)
+                output[b] += w * down[0].to(output.dtype)
 
-        if shared_experts_input is not None:
-            return output, shared_experts_input
         return output

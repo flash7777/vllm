@@ -171,6 +171,65 @@ Das sind typische XFP4-Quantisierungsfehler, kein Infrastruktur-Bug.
 **XFP4 ist BESSER als FP8!** Die Fehler (Vorzeichen, Off-by-one Multiplikation)
 sind Modell-inherent bei GLM-4.7-Flash im Completions-Format — nicht XFP-spezifisch.
 
-Nächster Schritt: Kernel-Optimierung für höhere Geschwindigkeit.
+## Profiling: XFP vs Marlin Vergleich
+
+### XFP4 Per-Token Budget (30.6 ms = 32.7 tok/s)
+| Komponente | ms | % |
+|---|---|---|
+| XFP kernel (327 Calls) | 9.7 | 32% |
+| Custom op overhead | 0.7 | 2% |
+| Outlier scatter | 1.6 | 5% |
+| **Rest (attn+MoE+norm)** | **18.6** | **61%** |
+
+Größte Kernel-Posten:
+- routed_gate_up: 4.46 ms (184 Calls × 24.2 us)
+- attn_o: 1.62 ms (47 × 34.4 us)
+- routed_down: 1.14 ms (184 × 6.2 us)
+
+### Marlin INT4: 18.0 ms/tok = 55.6 tok/s
+
+### Analyse
+Rest bei XFP (18.6 ms) ≈ gesamte Marlin-Tokenzeit (18.0 ms).
+→ Attention + MoE-Routing + Norms kosten ~18 ms bei beiden.
+→ XFP legt 12.6 ms obendrauf (Kernel 9.7 + Overhead 2.3 + Graph-Overhead ~0.6).
+→ Marlin-GEMM ist ~0 ms extra (in den 18 ms enthalten, fusioniert in die Pipeline).
+
+### Weg zu 50 tok/s
+XFP-Kernel-Zeit von 9.7 ms auf <2 ms senken. Oder:
+- Hybrid: Marlin für MoE (95% der Gewichte), XFP nur für Attention (5%)
+- Kernel-Fusion: XFP-Decode in den MoE-Dispatch integrieren
+
+## Grouped XFP MoE Apply (v2)
+
+`online_moe.py` komplett umgeschrieben:
+- Naive B×topk Loop → grouped dispatch per Expert
+- Tokens nach Expert sortiert, ein xfp_gemm Call pro aktivem Expert
+- 184 Kernel-Calls → ~4-8 pro Layer (nur aktive Experts)
+- bf16 statt fp16 (Bug-Fix)
+- xfp_repack in process_weights_after_loading (Bug-Fix, v8 Kernel braucht repacked)
+- scatter_add für gewichtete Rückzuordnung
+
+Bug gefunden: `classify_layer` prüfte `.mlp.` vor `.experts.` → MoE als `dense_mlp` 
+klassifiziert → nie XFP. Fix: `.experts` Prüfung vor `.mlp.` verschoben.
+
+Zweiter Bug: Debug-Logging zeigt `create_weight_method` wird korrekt aufgerufen
+(type='routed_expert' dtype='xfp4') und XFPMoEMethod zurückgegeben.
+
+MoE XFP-Packing läuft (64 Experts × 46 Layer = 2944 Expert-Packs, ~15 Min).
+### classify_layer Bug
+`.mlp.` matchte vor `.experts.` → MoE als `dense_mlp` → nie XFP.
+Fix: `.experts` Prüfung vor `.mlp.`.
+
+### MoE XFP (grouped dispatch): 8.3 tok/s — 4× LANGSAMER
+Python-Overhead bei B=1 decode überwiegt: 64 Expert-Iterationen,
+tensor alloc, sorting. Zurück zum direkten Loop: auch 8.3 tok/s.
+
+### Baseline ohne MoE XFP: 32.5 tok/s
+Config: attn=xfp4, shared=xfp4, routed=bf16 (Triton BF16 MoE).
+Identisch mit vorherigem Stand.
+
+### Fazit
+MoE XFP braucht fused CUDA Kernel. Python-Loop zu langsam (368 Calls/Token).
+Ohne fused Kernel: MoE bei BF16 Triton lassen, XFP nur für Attention+Shared.
 
 ### Schritt 5: Commit + Push

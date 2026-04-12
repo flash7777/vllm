@@ -113,8 +113,8 @@ def classify_layer(prefix: str) -> str:
     # Shared experts (check before routed — "shared" substring match)
     if "shared_expert" in p:
         return "shared_expert"
-    # Routed experts
-    if ".experts." in p or "routed_expert" in p:
+    # Routed experts (check BEFORE dense_mlp — ".mlp.experts" contains ".mlp.")
+    if ".experts" in p or "routed_expert" in p:
         return "routed_expert"
     # Dense MLP (layer 0 in MoE models, or generic MLP)
     if ".mlp." in p:
@@ -602,6 +602,13 @@ def create_weight_method(
     layer_type = classify_layer(prefix)
     policy = reg.get_weight_policy(layer_type)
     dtype = policy.dtype
+
+    # Debug: log FusedMoE dispatch
+    if FusedMoE is not None and isinstance(layer, FusedMoE):
+        logger.info(
+            "create_weight_method: FusedMoE prefix='%s' -> type='%s' dtype='%s'",
+            prefix, layer_type, dtype,
+        )
 
     # Pass-through for unquantized dtypes
     if dtype in ("bf16", "fp16", "fp32"):
