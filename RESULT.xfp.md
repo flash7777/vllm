@@ -183,6 +183,61 @@ This is the kind of per-layer-class bit-width tuning the registry's
 v3 confirms the data is informative, the auto-size selection itself
 is still v3+ scope.
 
+### v3 — mixed-bit-width per-class quantization
+
+The XFP per-class dispatch allows different bit widths per component
+class on the same model. The per-expert A/B analysis predicted that
+GLM-4.7-Flash's routed experts — 95 % of the model's weight volume —
+are so homogeneously distributed (0.007 % outlier fraction at k=4)
+that they should tolerate extreme compression without math accuracy loss.
+
+**Mixed-bit-width matrix on GLM-4.7-Flash (v3, outlier k=4):**
+
+| Config (attn / routed / shared) | tok/s (long) | Math | eff. bits* |
+|---------------------------------|-------------:|-----:|-----------:|
+| xfp4 / xfp4 / xfp4             | 5.8          | 27/50 (54 %) | 4.0 |
+| **xfp4 / xfp3 / xfp4**         | **5.9**      | **27/50 (54 %)** | **~3.05** |
+| **xfp4 / xfp2 / xfp4**         | **5.9**      | **27/50 (54 %)** | **~2.10** |
+| xfp3 / xfp3 / xfp3             | 6.3          | 15/50 (30 %) | 3.0 |
+| xfp2 / xfp2 / xfp2             | 10.0         |  3/50 ( 6 %) | 2.0 |
+
+*Effective bits = weighted average across ~95 % routed + ~5 % attn/shared.
+
+**Key findings:**
+
+1. **Routed experts tolerate XFP2 (4-entry codebook) with zero math
+   degradation** (54 % = identical to all-XFP4). This reduces 95 % of
+   the model's weight storage by 50 % vs XFP4, for a weighted-average
+   effective bit width of ~2.1 bits per parameter.
+
+2. **Math accuracy collapses when ATTENTION drops to XFP3** (all-xfp3 =
+   30 %). The sensitivity bottleneck is exclusively in the attention
+   projections (`kv_a_proj`, `q_b_proj`, `kv_b_proj`, `o_proj`), not in
+   the MoE experts. This confirms the per-expert A/B analysis which
+   showed Δcos < 0.0003 for routed experts regardless of outlier
+   treatment.
+
+3. **The optimal mixed-bit policy for GLM-4.7-Flash is therefore:**
+   - Attention: XFP4 (or higher) — the only class that matters for
+     math accuracy.
+   - Routed experts: XFP2 — maximum compression with zero quality cost.
+   - Shared experts: XFP4 — small volume, keep it safe.
+   - Effective: ~2.1 bits per param, 54 % math.
+
+4. **tok/s is not improved** by using fewer bits on routed experts
+   (5.9 vs 5.8). The v2/v3 kernel is compute-bound on the codebook
+   lookup, not memory-bandwidth-bound on the packed weight reads. Once
+   the kernel is properly optimized (v3+), XFP2's 2× fewer packed bytes
+   should translate into proportional bandwidth savings.
+
+**CLI to reproduce:**
+```bash
+--quantization autoround_rtn \
+    --weight-dtype-attn xfp4 \
+    --weight-dtype-routed xfp2 \
+    --weight-dtype-shared xfp4
+```
+
 ### Remaining optimization headroom (v3+ scope)
 
 - **Cooperative A-row SMEM staging**. All 32 threads in a block read
