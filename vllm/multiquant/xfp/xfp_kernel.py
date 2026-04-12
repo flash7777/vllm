@@ -29,12 +29,12 @@ def _resolve_kernel_dir() -> Optional[str]:
     src_dir = os.path.normpath(
         os.path.join(here, "..", "..", "..", "kernels", "multiquant")
     )
-    # Prefer v4 kernel if available, fall back to v2/v1
-    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+    # Prefer newest kernel version, fall back to older
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm_v4.cu", "xfp_gemm.cu"):
         if os.path.exists(os.path.join(src_dir, name)):
             return src_dir
     fallback = "/opt/mq_kernels"
-    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm_v4.cu", "xfp_gemm.cu"):
         if os.path.exists(os.path.join(fallback, name)):
             return fallback
     return None
@@ -51,7 +51,7 @@ _load_attempted = False
 def _find_kernel_cu() -> Optional[str]:
     if _KERNEL_SRC_DIR is None:
         return None
-    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm_v4.cu", "xfp_gemm.cu"):
         p = os.path.join(_KERNEL_SRC_DIR, name)
         if os.path.exists(p):
             return p
