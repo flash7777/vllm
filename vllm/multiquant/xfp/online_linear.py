@@ -51,7 +51,10 @@ def _xfp_apply_impl(
     K: int,
     N_out: int,
 ) -> torch.Tensor:
-    """Real impl: eager fused xfp_gemm. Output dtype follows input."""
+    """Real impl: eager fused xfp_gemm. Output dtype follows input.
+
+    packed is 1D (repacked via xfp_repack for coalesced warp reads).
+    """
     from vllm.multiquant.xfp import xfp_kernel as _xk
     kernel = _xk._xfp_gemm_kernel
     if kernel is None:
@@ -59,11 +62,12 @@ def _xfp_apply_impl(
             "xfp custom op called before xfp_gemm kernel was loaded. "
             "process_weights_after_loading should have triggered JIT."
         )
-    out_dtype = x.dtype  # typically bf16; we preserve it on the output
+    out_dtype = x.dtype
     x_fp16 = x.to(torch.float16).contiguous()
+    # packed is 1D int32 (repacked); codebook is [N_out, 2^bits] fp16
     C = torch.zeros(x_fp16.shape[0], N_out,
                     dtype=torch.float16, device=x.device)
-    kernel.xfp_gemm(x_fp16, packed, codebook, C, int(bits), int(K))
+    kernel.xfp_gemm(x_fp16, packed.reshape(-1), codebook, C, int(bits), int(K))
     return C.to(out_dtype)
 
 
@@ -247,8 +251,11 @@ class XFPLinearMethod(QuantizeMethodBase):
             outlier_max_fraction=self.outlier_max_fraction,
         )
 
+        # Repack for coalesced warp reads (v4opt kernel expects 1D repacked)
+        from vllm.multiquant.xfp.xfp_pack import xfp_repack
+        repacked = xfp_repack(packed)
         layer.xfp_packed = nn.Parameter(
-            packed.to(device), requires_grad=False
+            repacked.to(device), requires_grad=False
         )
         layer.xfp_codebook = nn.Parameter(
             codebook.to(device), requires_grad=False

@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// XFP v4opt — micro-optimized warp-per-element kernel.
+// XFP v4opt — micro-optimized warp-per-element kernel with weight repack.
 //
 // Base: v4 design (1 warp = 1 output element, register codebook, shfl reduce).
-// Patches applied:
+// Optimizations:
 //   A: Unrolled main K-loop without bounds check (tail handled separately)
 //   B: half2 A-loads (2 K values per load instruction)
 //   C: Vectorized codebook init via uint32 + half2 cast
 //   D: Software pipelining (prefetch next packed word while processing current)
+//   E: FMA instead of separate mul+add (fmaf = 1 instruction vs 2)
+//   F: Weight repack for coalesced warp reads (xfp_repack in xfp_pack.py)
+//
+// B_packed layout (repacked): [K_groups * N * 32] int32 flattened from
+// [K_groups, N, 32] where the K dimension is interleaved over WARP_SIZE.
+// Lane i reads B_packed[kw_group * N * 32 + n * 32 + i] — all 32 lanes
+// hit consecutive addresses = 1 cache line = 100% L2 utilization.
 
 #include <torch/extension.h>
 #include <cuda_fp16.h>
@@ -19,9 +26,9 @@ namespace multiquant {
 template <int BITS>
 __global__ void xfp_gemm_v4opt_kernel(
     const half* __restrict__ A,
-    const uint32_t* __restrict__ B_packed,
-    const half* __restrict__ codebook,
-    half* __restrict__ C,
+    const uint32_t* __restrict__ B_packed,  // repacked flat [K_groups*N*32]
+    const half* __restrict__ codebook,      // [N, 2^BITS]
+    half* __restrict__ C,                   // [M, N]
     int M, int N, int K, int K_packed)
 {
     constexpr int VALS_PER_WORD = (BITS == 2) ? 16 : (BITS == 3) ? 10 : 8;
@@ -35,7 +42,6 @@ __global__ void xfp_gemm_v4opt_kernel(
     if (n >= N || m >= M) return;
 
     // === Patch C: Vectorized codebook init ===
-    // Load 2 fp16 entries per uint32 read, cast via half2.
     float cb[LUT_SIZE];
     {
         const uint32_t* cb_u32 = reinterpret_cast<const uint32_t*>(
@@ -52,36 +58,32 @@ __global__ void xfp_gemm_v4opt_kernel(
     const half* A_row = A + m * K;
     float acc = 0.0f;
 
-    // Compute the last kw this lane would process (for main/tail split).
-    // Main loop: process all words EXCEPT the very last one in the
-    // sequence (which may have padding). The last word gets a bounds-
-    // checked tail.
-    //
-    // K_packed_safe: the largest kw such that (kw+1)*VALS_PER_WORD <= K
-    // i.e. all VALS_PER_WORD slots are valid. If K is perfectly aligned
-    // then K_packed_safe = K_packed, and the tail is empty.
-    int K_packed_safe = K / VALS_PER_WORD;  // words whose slots are ALL valid
+    // === Repack addressing (Patch F) ===
+    // B_packed is [K_groups, N, WARP_SIZE] flattened.
+    // Lane i at group g reads: B_packed[g * N * WARP_SIZE + n * WARP_SIZE + lane]
+    int n_offset = n * WARP_SIZE + lane;  // fixed per thread
+
+    int K_packed_safe = K / VALS_PER_WORD;
 
     // === Patch D: Prefetch first packed word ===
     int kw = lane;
-    uint32_t buf_cur = (kw < K_packed) ? B_packed[kw * N + n] : 0u;
+    int g = 0;
+    uint32_t buf_cur = (kw < K_packed)
+        ? B_packed[g * N * WARP_SIZE + n_offset] : 0u;
 
-    // === Patch A: Unrolled main loop (no bounds check on slots) ===
-    for (; kw < K_packed_safe; kw += WARP_SIZE) {
-        // Patch D: prefetch next iteration's word
+    // === Patch A: Unrolled main loop ===
+    for (; kw < K_packed_safe; kw += WARP_SIZE, g++) {
+        // Patch D: prefetch next group
         uint32_t buf_next = 0u;
         int kw_next = kw + WARP_SIZE;
         if (kw_next < K_packed)
-            buf_next = B_packed[kw_next * N + n];
+            buf_next = B_packed[(g + 1) * N * WARP_SIZE + n_offset];
 
         int k_base = kw * VALS_PER_WORD;
 
-        // === Patch B: half2 A-loads (process 2 slots per load) ===
-        // VALS_PER_WORD is always even for BITS=2 (16) and BITS=4 (8).
-        // For BITS=3 (10) it's also even. So we can always pair.
+        // === Patch B: half2 A-loads + Patch E: FMA ===
         #pragma unroll
         for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
-            // Load 2 consecutive A values as half2
             half2 a2 = *reinterpret_cast<const half2*>(A_row + k_base + slot);
             float a0 = __low2float(a2);
             float a1 = __high2float(a2);
@@ -89,17 +91,16 @@ __global__ void xfp_gemm_v4opt_kernel(
             int idx0 = (int)((buf_cur >> (slot * BITS)) & MASK);
             int idx1 = (int)((buf_cur >> ((slot + 1) * BITS)) & MASK);
 
-            acc += cb[idx0] * a0;
-            acc += cb[idx1] * a1;
+            acc = fmaf(cb[idx0], a0, acc);
+            acc = fmaf(cb[idx1], a1, acc);
         }
 
         buf_cur = buf_next;
     }
 
     // === Tail: remaining words with bounds check ===
-    // kw now points to the first potentially-partial word this lane handles.
-    for (; kw < K_packed; kw += WARP_SIZE) {
-        uint32_t packed = B_packed[kw * N + n];
+    for (; kw < K_packed; kw += WARP_SIZE, g++) {
+        uint32_t packed = B_packed[g * N * WARP_SIZE + n_offset];
         int k_base = kw * VALS_PER_WORD;
 
         #pragma unroll
@@ -108,7 +109,7 @@ __global__ void xfp_gemm_v4opt_kernel(
             if (k >= K) break;
             float a = __half2float(A_row[k]);
             int idx = (int)((packed >> (slot * BITS)) & MASK);
-            acc += cb[idx] * a;
+            acc = fmaf(cb[idx], a, acc);
         }
     }
 
@@ -126,11 +127,9 @@ __global__ void xfp_gemm_v4opt_kernel(
 template <int BITS>
 static void launch_v4opt(
     torch::Tensor A, torch::Tensor B_packed, torch::Tensor codebook,
-    torch::Tensor C, int K)
+    torch::Tensor C, int K, int N, int K_packed)
 {
     int M = A.size(0);
-    int N = B_packed.size(1);
-    int K_packed = B_packed.size(0);
 
     dim3 block(WARP_SIZE);
     dim3 grid(N, M);
@@ -146,10 +145,10 @@ static void launch_v4opt(
 }
 
 void xfp_gemm(
-    torch::Tensor A,
-    torch::Tensor B_packed,
-    torch::Tensor codebook,
-    torch::Tensor C,
+    torch::Tensor A,         // [M, K] fp16
+    torch::Tensor B_packed,  // [K_groups * N * 32] int32 (repacked flat)
+    torch::Tensor codebook,  // [N, 2^bits] fp16
+    torch::Tensor C,         // [M, N] fp16
     int64_t bits,
     int64_t K)
 {
@@ -162,20 +161,26 @@ void xfp_gemm(
     TORCH_CHECK(codebook.dtype() == torch::kFloat16,
                 "xfp_gemm: codebook must be float16");
     TORCH_CHECK(C.dtype() == torch::kFloat16, "xfp_gemm: C must be float16");
-    TORCH_CHECK(A.dim() == 2 && B_packed.dim() == 2 &&
-                codebook.dim() == 2 && C.dim() == 2,
-                "xfp_gemm: all tensors must be 2D");
+    TORCH_CHECK(A.dim() == 2 && C.dim() == 2,
+                "xfp_gemm: A and C must be 2D");
+    TORCH_CHECK(B_packed.dim() == 1,
+                "xfp_gemm: B_packed must be 1D (repacked flat)");
+    TORCH_CHECK(codebook.dim() == 2,
+                "xfp_gemm: codebook must be 2D");
     TORCH_CHECK(A.size(1) == K, "xfp_gemm: A.size(1) must equal K");
-    TORCH_CHECK(A.size(0) == C.size(0) && B_packed.size(1) == C.size(1),
-                "xfp_gemm: M/N shape mismatch");
-    TORCH_CHECK(codebook.size(0) == B_packed.size(1),
-                "xfp_gemm: codebook rows must equal N");
     TORCH_CHECK(codebook.size(1) == (1LL << bits),
                 "xfp_gemm: codebook columns must equal 2^bits");
 
-    if (bits == 2) launch_v4opt<2>(A, B_packed, codebook, C, static_cast<int>(K));
-    else if (bits == 3) launch_v4opt<3>(A, B_packed, codebook, C, static_cast<int>(K));
-    else if (bits == 4) launch_v4opt<4>(A, B_packed, codebook, C, static_cast<int>(K));
+    int N = static_cast<int>(codebook.size(0));
+    int vals_per_word = (bits == 2) ? 16 : (bits == 3) ? 10 : 8;
+    int K_packed = (static_cast<int>(K) + vals_per_word - 1) / vals_per_word;
+
+    TORCH_CHECK(A.size(0) == C.size(0) && C.size(1) == N,
+                "xfp_gemm: M/N shape mismatch");
+
+    if (bits == 2) launch_v4opt<2>(A, B_packed, codebook, C, static_cast<int>(K), N, K_packed);
+    else if (bits == 3) launch_v4opt<3>(A, B_packed, codebook, C, static_cast<int>(K), N, K_packed);
+    else if (bits == 4) launch_v4opt<4>(A, B_packed, codebook, C, static_cast<int>(K), N, K_packed);
     else TORCH_CHECK(false, "xfp_gemm: unsupported bits=", bits);
 }
 
@@ -183,5 +188,5 @@ void xfp_gemm(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("xfp_gemm", &multiquant::xfp_gemm,
-          "XFP v4opt: unrolled main loop, half2 A-loads, vectorized CB, prefetch");
+          "XFP v4opt+repack: FMA, unrolled, half2, prefetch, coalesced warp reads");
 }

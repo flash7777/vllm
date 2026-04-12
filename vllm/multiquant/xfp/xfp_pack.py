@@ -282,6 +282,50 @@ def _score_mse_only(W: torch.Tensor, bits: int, lloyd_iters: int) -> float:
     return ((W - W_rec) * (W - W_rec)).mean().item()
 
 
+# ─── Weight repack for coalesced warp reads ────────────────────────
+
+
+def xfp_repack(packed: torch.Tensor, warp_size: int = 32) -> torch.Tensor:
+    """Repack [K_packed, N] → [K_groups * N * warp_size] int32.
+
+    v4opt kernel's access pattern: warp n, lane i reads
+    B_packed[kw * N + n] where kw = lane, lane+32, lane+64...
+
+    Without repack: consecutive lane reads (lane 0..31) at the same kw
+    are at addresses kw*N+n — all in one cache line IF different warps
+    happen to sync. In practice warps drift → poor L2 utilization.
+
+    After repack: the K dimension is interleaved over warp_size so that
+    one warp's consecutive lane reads at the same kw_group form a
+    contiguous 128-byte block:
+
+      repacked[kw_group * N * WS + n * WS + lane]
+
+    All 32 lane reads are consecutive → 1 cache line → 100% utilization.
+
+    The tensor is returned as a flat [K_groups * N * warp_size] int32
+    to avoid 3D stride complications in the kernel. The kernel computes:
+      idx = kw_group * (N * WS) + n * WS + lane
+    where kw_group = (kw_original / WS), and lane = kw_original % WS.
+    """
+    K_packed, N = packed.shape
+    K_groups = (K_packed + warp_size - 1) // warp_size
+
+    # Pad K_packed to a multiple of warp_size
+    if K_packed % warp_size != 0:
+        pad = warp_size - K_packed % warp_size
+        packed = F.pad(packed, (0, 0, 0, pad), value=0)
+
+    # [K_groups, warp_size, N] → [K_groups, N, warp_size] → flatten
+    repacked = (
+        packed.reshape(K_groups, warp_size, N)
+        .permute(0, 2, 1)
+        .contiguous()
+        .reshape(-1)
+    )
+    return repacked
+
+
 # ─── Auto bit-width selection ──────────────────────────────────────
 
 
