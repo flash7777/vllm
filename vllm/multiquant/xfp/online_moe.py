@@ -97,20 +97,38 @@ class XFPMoEMethod(FusedMoEMethodBase):
         _load_xfp_gemm(bits)
         _load_xfp_moe_gemm()
 
+        # Save shape metadata before freeing weights
+        K13 = int(w13.shape[2])
+        N13 = int(w13.shape[1])
+        K2 = int(w2.shape[2])
+        N2 = int(w2.shape[1])
+
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
 
+        # MoE experts have homogeneous distributions — fewer Lloyd iters
+        # suffice. Default 5 (vs 20 for attention). Override via XFP_MOE_LLOYD_ITERS.
+        import os
+        moe_lloyd_iters = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
+
         def _batched_pack_and_repack(W_stack: torch.Tensor):
-            """W_stack: [E, N, K] -> flat packed [E*flat], flat codebook [E*N*lut]."""
+            """W_stack: [E, N, K] -> flat packed [E*flat], flat codebook [E*N*lut].
+
+            Memory-conscious: deletes intermediates immediately.
+            """
             E_ = int(W_stack.shape[0])
             N_ = int(W_stack.shape[1])
             K_ = int(W_stack.shape[2])
             W_flat = W_stack.reshape(E_ * N_, K_).float()
+            del W_stack
             packed_flat, codebook_flat, _, _, stats = xfp_pack(
                 W_flat, bits=bits, outlier_sigma=None,
+                lloyd_iters=moe_lloyd_iters,
             )
+            del W_flat  # free float32 copy
             k_packed = packed_flat.shape[0]
             packed = packed_flat.view(k_packed, E_, N_).permute(1, 0, 2).contiguous()
+            del packed_flat
             lut_size = 1 << bits
             codebook = codebook_flat.view(E_, N_, lut_size)
 
@@ -118,14 +136,23 @@ class XFPMoEMethod(FusedMoEMethodBase):
             repacked_list = []
             for e in range(E_):
                 repacked_list.append(xfp_repack(packed[e]))
+            del packed
             flat_per_expert = repacked_list[0].numel()
-            all_repacked = torch.cat(repacked_list, dim=0)  # [E * flat_per_expert]
-            all_codebook = codebook.reshape(-1)  # [E * N * lut_size]
+            all_repacked = torch.cat(repacked_list, dim=0)
+            del repacked_list
+            all_codebook = codebook.reshape(-1)
+            del codebook
 
             return all_repacked, all_codebook, flat_per_expert, stats
 
-        p13, cb13, fpe13, stats13 = _batched_pack_and_repack(w13)
-        p2, cb2, fpe2, stats2 = _batched_pack_and_repack(w2)
+        # Pack w13, then free BF16 w13 before packing w2
+        p13, cb13, fpe13, stats13 = _batched_pack_and_repack(w13.clone())
+        del w13
+        layer.w13_weight.data = torch.empty(0)  # free BF16
+
+        p2, cb2, fpe2, stats2 = _batched_pack_and_repack(w2.clone())
+        del w2
+        layer.w2_weight.data = torch.empty(0)  # free BF16
 
         if reg is not None:
             reg.record_stats("routed_expert", stats13)
@@ -139,10 +166,10 @@ class XFPMoEMethod(FusedMoEMethodBase):
 
         layer._xfp_moe_bits = bits
         layer._xfp_moe_dtype = self.dtype
-        layer._xfp_moe_K13 = int(w13.shape[2])
-        layer._xfp_moe_N13 = int(w13.shape[1])
-        layer._xfp_moe_K2 = int(w2.shape[2])
-        layer._xfp_moe_N2 = int(w2.shape[1])
+        layer._xfp_moe_K13 = K13
+        layer._xfp_moe_N13 = N13
+        layer._xfp_moe_K2 = K2
+        layer._xfp_moe_N2 = N2
         layer._xfp_moe_E = E
         layer._xfp_moe_fpe13 = fpe13
         layer._xfp_moe_fpe2 = fpe2
@@ -154,9 +181,11 @@ class XFPMoEMethod(FusedMoEMethodBase):
             pass
 
         logger.info(
-            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s (fused, fpe=%d/%d)",
+            "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s "
+            "(fused, fpe=%d/%d, lloyd=%d)",
             E, layer._xfp_moe_N13, layer._xfp_moe_K13,
-            layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype, fpe13, fpe2,
+            layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype,
+            fpe13, fpe2, moe_lloyd_iters,
         )
 
     def apply(
@@ -198,6 +227,21 @@ class XFPMoEMethod(FusedMoEMethodBase):
         x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
         no_weights = torch.empty(0, dtype=torch.float32, device=x.device)
 
+        # Debug: log first call shapes
+        if not hasattr(layer, '_xfp_debug_logged'):
+            logger.info(
+                "XFP MoE apply: B=%d topk=%d E=%d N13=%d K13=%d N2=%d K2=%d "
+                "num_valid=%d fpe13=%d fpe2=%d "
+                "packed13=%s cb13=%s packed2=%s cb2=%s",
+                B, topk, E, N13, K13, N2, K2, num_valid,
+                layer._xfp_moe_fpe13, layer._xfp_moe_fpe2,
+                list(layer.w13_xfp_packed.shape),
+                list(layer.w13_xfp_codebook.shape),
+                list(layer.w2_xfp_packed.shape),
+                list(layer.w2_xfp_codebook.shape),
+            )
+            layer._xfp_debug_logged = True
+
         # Gate+Up GEMM: one fused kernel launch, NO topk_weights yet
         gate_up = torch.zeros(
             num_valid, N13, dtype=torch.bfloat16, device=x.device)
@@ -213,14 +257,18 @@ class XFPMoEMethod(FusedMoEMethodBase):
         up = gate_up[:, half_n:]
         activated = gate * up  # [num_valid, half_n]
 
-        # Down GEMM: input is activated (not x!), no topk_weights
+        # Down GEMM: input is activated[i] per sorted entry.
+        # Use top_k=1 so kernel reads A[token_id] directly (not A[token_id/topk]).
+        # Use identity sorted_ids [0,1,2,...] since activated is already sorted.
         down = torch.zeros(
             num_valid, N2, dtype=torch.bfloat16, device=x.device)
+        identity_ids = torch.arange(
+            num_valid, dtype=torch.int32, device=x.device)
         moe_kernel.xfp_moe_gemm(
             activated, layer.w2_xfp_packed, layer.w2_xfp_codebook,
-            down, sorted_token_ids[:num_valid], expert_ids,
+            down, identity_ids, expert_ids,
             no_weights,
-            int(bits), int(K2), int(N2), int(topk),
+            int(bits), int(K2), int(N2), 1,  # top_k=1: A[token_id] directly
             int(layer._xfp_moe_fpe2), num_valid)
 
         # Scatter-reduce with topk_weights back to [B, K_in]

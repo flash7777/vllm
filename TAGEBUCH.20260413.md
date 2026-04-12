@@ -1,0 +1,27 @@
+# Tagebuch 2026-04-13: Fused XFP MoE Kernel
+
+## Fortführung von gestern
+
+### Memory-Fix: BF16 sofort freigeben
+- `_batched_pack_and_repack`: `del W_stack`, `del W_flat`, etc. nach Benutzung
+- `layer.w13_weight.data = torch.empty(0)` nach Pack
+- Ergebnis: 78 GB frei während Packing (vorher System-Hang bei Layer 44)
+
+### Lloyd-Iterationen: 20 → 5 für MoE
+- MoE-Experts homogen → 5 Iterationen reichen
+- Parametrisierbar via `XFP_MOE_LLOYD_ITERS` Env-Var
+- Packing-Zeit: 15 Min → 5 Min (4× schneller)
+
+### Fused MoE Kernel Tests
+- Single Expert: cos=1.0 PASS
+- Multi-Expert (4 Experts, 2 topk): cos=1.0 PASS  
+- Full MoE Pfad (gate_up → SiLU → down → reduce): cos=1.0 PASS
+- Bug gefunden und gefixt: Down-GEMM muss top_k=1 + identity_ids nutzen
+  (activated ist pro sorted-Entry, nicht pro Original-Token)
+
+### E2E Problem
+- Server startet, aber Modell gibt Müll aus (0% Math)
+- Kernel isoliert korrekt — Problem ist in der vLLM-Integration
+- Debug-Logging eingebaut, nächster Server-Start läuft
+
+TODO: Debug-Log prüfen, Ursache für E2E-Müll finden
