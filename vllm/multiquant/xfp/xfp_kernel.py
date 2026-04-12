@@ -29,11 +29,14 @@ def _resolve_kernel_dir() -> Optional[str]:
     src_dir = os.path.normpath(
         os.path.join(here, "..", "..", "..", "kernels", "multiquant")
     )
-    if os.path.exists(os.path.join(src_dir, "xfp_gemm.cu")):
-        return src_dir
+    # Prefer v4 kernel if available, fall back to v2/v1
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+        if os.path.exists(os.path.join(src_dir, name)):
+            return src_dir
     fallback = "/opt/mq_kernels"
-    if os.path.exists(os.path.join(fallback, "xfp_gemm.cu")):
-        return fallback
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+        if os.path.exists(os.path.join(fallback, name)):
+            return fallback
     return None
 
 
@@ -44,9 +47,18 @@ _load_attempted = False
 
 # Pre-compute the full source path so _load_xfp_gemm is trivially callable
 # from anywhere without touching the filesystem API.
-_KERNEL_CU_PATH: Optional[str] = (
-    os.path.join(_KERNEL_SRC_DIR, "xfp_gemm.cu") if _KERNEL_SRC_DIR else None
-)
+# Prefer v4 kernel (warp-per-element, register LUT) if available
+def _find_kernel_cu() -> Optional[str]:
+    if _KERNEL_SRC_DIR is None:
+        return None
+    for name in ("xfp_gemm_v4.cu", "xfp_gemm.cu"):
+        p = os.path.join(_KERNEL_SRC_DIR, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+_KERNEL_CU_PATH: Optional[str] = _find_kernel_cu()
 
 
 def _load_xfp_gemm(bits: int):
