@@ -79,6 +79,7 @@ DTYPE_BITS = {
     "tq3": 3, "tq4": 4,
     "rq2": 2, "rq3": 3, "rq4": 4,
     # XFP family (learned per-channel codebook, XFP.PAPER.md)
+    "xfp": 0,  # auto-select bit width per layer via MSE/cos analysis
     "xfp2": 2, "xfp3": 3, "xfp4": 4, "xfp5": 5, "xfp6": 6,
 }
 
@@ -129,6 +130,7 @@ def _desc_for_dtype(dtype: str) -> str:
         "tq3w": "WHT 3-bit (Lloyd-Max, block-32)",
         "tq4w": "WHT 4-bit (Lloyd-Max, block-32)",
         "tq3r": "Block-rot 3-bit (random orthogonal)",
+        "xfp": "XFP auto (MSE-selected codebook size per layer)",
         "xfp2": "XFP2 (learned codebook, 4 entries)",
         "xfp3": "XFP3 (learned codebook, 8 entries)",
         "xfp4": "XFP4 (learned codebook, 16 entries)",

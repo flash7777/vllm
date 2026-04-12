@@ -282,6 +282,92 @@ def _score_mse_only(W: torch.Tensor, bits: int, lloyd_iters: int) -> float:
     return ((W - W_rec) * (W - W_rec)).mean().item()
 
 
+# ─── Auto bit-width selection ──────────────────────────────────────
+
+
+def xfp_auto_select(
+    W: torch.Tensor,
+    candidates: tuple[int, ...] = (2, 3, 4),
+    min_cos: float = 0.98,
+    lloyd_iters: int = 20,
+    outlier_sigma: Optional[float] = 4.0,
+    outlier_max_fraction: float = 0.02,
+) -> int:
+    """Pick the lowest bit width where reconstruction meets the cos gate.
+
+    Runs Lloyd at each candidate width, computes per-channel cosine
+    similarity, and returns the first (lowest) bits where the median
+    per-channel cos >= min_cos.
+
+    The cos gate is the sole discriminator. MSE ratio was tested and
+    rejected: on real MoE models, XFP2 has ~12× higher MSE than XFP4
+    but identical math accuracy (the error is spread uniformly and
+    doesn't concentrate in model-critical channels). Cos similarity
+    captures this: it measures directional preservation per channel,
+    which is what matters for downstream quality.
+
+    Falls back to max(candidates) if no lower width qualifies.
+
+    Returns:
+        Chosen bits (one of the candidates).
+    """
+    if W.dim() != 2:
+        raise ValueError(f"xfp_auto_select: W must be 2D, got {W.dim()}D")
+
+    W = W.to(torch.float32)
+    candidates = tuple(sorted(candidates))
+    best_bits = candidates[-1]  # fallback
+
+    # Outlier split (shared across all candidates — same mask)
+    if outlier_sigma is not None and outlier_sigma > 0:
+        mu = W.mean()
+        sigma = W.std()
+        threshold = float(outlier_sigma) * sigma
+        mask = (W - mu).abs() > threshold
+        total = W.numel()
+        max_allowed = int(outlier_max_fraction * total)
+        nnz = int(mask.sum().item())
+        if nnz > max_allowed and max_allowed > 0:
+            flat_abs = (W - mu).abs().reshape(-1)
+            _, top_idx = torch.topk(flat_abs, max_allowed, largest=True, sorted=False)
+            mask = torch.zeros_like(flat_abs, dtype=torch.bool)
+            mask[top_idx] = True
+            mask = mask.reshape_as(W)
+        if nnz > 0:
+            W_bulk = W.clone()
+            W_bulk[mask] = mu
+        else:
+            W_bulk = W
+            mask = None
+    else:
+        W_bulk = W
+        mask = None
+
+    # Test each candidate from lowest to highest
+    for bits in candidates:
+        if bits == best_bits:
+            # Highest candidate always qualifies as fallback
+            return bits
+
+        n_centroids = 1 << bits
+        cb = _lloyd_per_channel(W_bulk, n_centroids, lloyd_iters)
+        idx = _assign_indices(W_bulk, cb)
+        rec = torch.gather(cb, 1, idx)
+        if mask is not None:
+            flat_r = rec.reshape(-1).clone()
+            flat_r[mask.reshape(-1)] = W.reshape(-1)[mask.reshape(-1)]
+            rec = flat_r.reshape_as(W)
+
+        # Per-channel cos similarity — sole quality gate
+        cos_per_ch = F.cosine_similarity(W, rec, dim=1)  # [N_out]
+        median_cos = float(cos_per_ch.median().item())
+
+        if median_cos >= min_cos:
+            return bits
+
+    return best_bits
+
+
 # ─── Public entry point ────────────────────────────────────────────
 
 

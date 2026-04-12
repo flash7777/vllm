@@ -14,6 +14,7 @@ MultiQuantPolicyRegistry for end-of-load summary and future auto-size.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -156,19 +157,26 @@ class XFPLinearMethod(QuantizeMethodBase):
     outlier_sigma: float = 4.0
     outlier_max_fraction: float = 0.02
 
+    # Auto bit-width selection: minimum per-channel cosine similarity
+    # for a candidate bit width to be accepted. Configurable via
+    # XFP_MIN_COS environment variable. Default 0.98 — calibrated on
+    # GLM-4.7-Flash where it separates routed experts (xfp3 OK at
+    # cos 0.982) from attention (needs xfp4 at cos 0.994).
+    auto_min_cos: float = float(os.environ.get("XFP_MIN_COS", "0.98"))
+
     def __init__(
         self,
         quant_config: "QuantizationConfig",
         dtype: str = "xfp4",
     ):
-        if dtype not in ("xfp2", "xfp3", "xfp4"):
+        if dtype not in ("xfp", "xfp2", "xfp3", "xfp4"):
             raise ValueError(
                 f"XFPLinearMethod: unsupported dtype '{dtype}', "
-                f"supported: xfp2, xfp3, xfp4 (v1)"
+                f"supported: xfp (auto), xfp2, xfp3, xfp4"
             )
         self.quant_config = quant_config
         self.dtype = dtype
-        self.bits = DTYPE_BITS[dtype]  # 2, 3, or 4
+        self.bits = DTYPE_BITS[dtype]  # 0 = auto, 2/3/4 = explicit
 
     def create_weights(
         self,
@@ -211,20 +219,29 @@ class XFPLinearMethod(QuantizeMethodBase):
         from vllm.multiquant.xfp.xfp_pack import xfp_pack
         from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
 
-        # Eagerly JIT-compile the kernel once, outside any torch.compile
-        # graph. Subsequent .apply() calls will find the cached module.
-        _load_xfp_gemm(self.bits)
-
         W = layer.weight.data  # [N_out, K]
         device = W.device
 
-        # Pack only the chosen bit width. Candidate-scoring via
-        # also_score_widths is a v3 feature (auto-size selection) — for
-        # v1 it's disabled to keep load time proportional to one Lloyd
-        # pass per layer instead of three.
+        # Auto bit-width selection: when dtype="xfp" (bits=0), run Lloyd
+        # at candidates 2/3/4 and pick the lowest that passes the cos gate.
+        bits = self.bits
+        if bits == 0:
+            from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
+            bits = xfp_auto_select(
+                W.float(),
+                candidates=(2, 3, 4),
+                min_cos=self.auto_min_cos,
+                outlier_sigma=self.outlier_sigma,
+                outlier_max_fraction=self.outlier_max_fraction,
+            )
+
+        # Eagerly JIT-compile the kernel once, outside any torch.compile
+        # graph. Subsequent .apply() calls will find the cached module.
+        _load_xfp_gemm(bits)
+
         packed, codebook, o_idx, o_val, stats = xfp_pack(
             W.float(),
-            bits=self.bits,
+            bits=bits,
             also_score_widths=(),
             outlier_sigma=self.outlier_sigma,
             outlier_max_fraction=self.outlier_max_fraction,
@@ -257,7 +274,7 @@ class XFPLinearMethod(QuantizeMethodBase):
         else:
             layer._xfp_has_outliers = False
 
-        layer._xfp_bits = self.bits
+        layer._xfp_bits = bits
         layer._xfp_K = K
         layer._xfp_N = N_out
         layer._xfp_stats = stats
@@ -275,12 +292,13 @@ class XFPLinearMethod(QuantizeMethodBase):
             layer_type = classify_layer(layer_prefix) or "other"
             reg.record_stats(layer_type, stats)
 
+        auto_tag = f"(auto)" if self.bits == 0 else ""
         logger.info(
-            "XFP %s [%dx%d] -> %s | mse=%.3g cos=%.3f | "
+            "XFP %s [%dx%d] -> xfp%d%s | mse=%.3g cos=%.3f | "
             "3sigma=%.1f%% | outliers=%.3f%% (k=%.1f)",
             getattr(layer, "layer_name", "?"),
             stats.shape[0], stats.shape[1],
-            self.dtype, stats.mse, stats.cos_sim,
+            bits, auto_tag, stats.mse, stats.cos_sim,
             100.0 * stats.outlier_ratio_k3,
             100.0 * stats.outlier_fraction,
             stats.outlier_sigma,
@@ -302,11 +320,13 @@ class XFPLinearMethod(QuantizeMethodBase):
         reshaped_x = x.reshape(-1, x.shape[-1])
         # Dispatch through the registered custom op so torch.compile
         # sees a traceable operator instead of a pybind11 extension call.
+        # Use layer._xfp_bits (the actually chosen bits, which may differ
+        # from self.bits when auto-select picked a per-layer width).
         C = _xfp_op(
             reshaped_x,
             layer.xfp_packed,
             layer.xfp_codebook,
-            int(self.bits),
+            int(layer._xfp_bits),
             int(layer._xfp_K),
             int(layer._xfp_N),
         )
