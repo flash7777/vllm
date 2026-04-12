@@ -59,6 +59,7 @@ WEIGHTS_ROUTED = "weights_routed"
 WEIGHTS_ATTN = "weights_attn"
 WEIGHTS_DENSE = "weights_dense"
 WEIGHTS_ALL = "weights"  # shorthand for all weight classes
+LM_HEAD = "lm_head"
 MTP = "mtp"
 DELTANET = "deltanet"
 
@@ -66,7 +67,7 @@ DELTANET = "deltanet"
 ALL_CLASSES = [
     K_CACHE, V_CACHE,
     WEIGHTS_SHARED, WEIGHTS_ROUTED, WEIGHTS_ATTN, WEIGHTS_DENSE,
-    MTP, DELTANET,
+    LM_HEAD, MTP, DELTANET,
 ]
 
 # Map dtype strings to bit widths
@@ -96,6 +97,10 @@ def classify_layer(prefix: str) -> str:
     'dense_mlp', 'deltanet', or 'other'.
     """
     p = prefix.lower()
+    # LM Head (output projection to vocab — typically the largest single layer)
+    if "lm_head" in p or (("output" in p or "head" in p) and "embed" not in p
+                          and "attn" not in p and "expert" not in p):
+        return "lm_head"
     # MTP layers
     if "mtp_" in p or "multi_token_prediction" in p or ".mtp." in p:
         return "mtp"
@@ -170,6 +175,7 @@ class MultiQuantPolicyRegistry:
                                       "bfloat16"),
             WEIGHTS_DENSE: QuantPolicy("bf16", 16, "default", 0,
                                        "bfloat16"),
+            LM_HEAD: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
             MTP: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
             DELTANET: QuantPolicy("bf16", 16, "default", 0, "bfloat16"),
         }
@@ -214,6 +220,7 @@ class MultiQuantPolicyRegistry:
             "routed_expert": WEIGHTS_ROUTED,
             "attn": WEIGHTS_ATTN,
             "dense_mlp": WEIGHTS_DENSE,
+            "lm_head": LM_HEAD,
             "mtp": MTP,
             "deltanet": DELTANET,
         }
@@ -442,6 +449,7 @@ class MultiQuantPolicyRegistry:
             ("Shared Experts", WEIGHTS_SHARED),
             ("Attention", WEIGHTS_ATTN),
             ("Dense MLP", WEIGHTS_DENSE),
+            ("LM Head", LM_HEAD),
             ("MTP", MTP),
         ]
         has_components = bool(self._components)
