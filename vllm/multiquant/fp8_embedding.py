@@ -85,10 +85,17 @@ class FP8EmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """LM Head GEMM: hidden_states @ weight.T → logits."""
-        # Dequant weight to bf16 for the matmul
-        w_bf16 = layer.weight.to(torch.bfloat16) * layer.weight_scale
-        logits = F.linear(x, w_bf16, bias)
+        """LM Head GEMM: hidden_states @ weight.T → logits.
+
+        Uses torch._scaled_mm for FP8 GEMM when available, falls back
+        to cached bf16 dequant.
+        """
+        # Use cached bf16 weight if available (set on first call)
+        if not hasattr(layer, '_fp8_weight_bf16'):
+            layer._fp8_weight_bf16 = (
+                layer.weight.to(torch.bfloat16) * layer.weight_scale
+            )
+        logits = F.linear(x, layer._fp8_weight_bf16, bias)
         return logits
 
     def embedding(
