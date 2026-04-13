@@ -164,7 +164,7 @@ def math_test(url, model, n=50):
         data = json.dumps({
             "model": model,
             "prompt": prompt,
-            "max_tokens": 15,
+            "max_tokens": 200,
             "temperature": 0,
         }).encode()
         req = urllib.request.Request(
