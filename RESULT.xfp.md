@@ -512,9 +512,27 @@ XFP Summary (421 layers, 4 classes):
   Total: ~3.0 eff. bits/param, 0.01% outliers avg
 ```
 
+### Per-shape detail (auto-select, cos gate 0.98)
+
+| Shape | Layer type | Bits | Count | avg cos | avg outlier% |
+|-------|-----------|------|-------|---------|-------------|
+| 768×2048 | attn_qa | xfp3 | 47 | 0.9828 | 0.027% |
+| 5120×768 | attn_qb | xfp3/xfp4 | 47 | 0.9833 | 0.113% |
+| 576×2048 | attn_kva | xfp3 | 47 | 0.9897 | 1.015% |
+| 8960×512 | attn_kvb | xfp3 | 47 | 0.9857 | 0.347% |
+| 2048×5120 | attn_o | xfp3/xfp4 | 47 | 0.9818 | 0.048% |
+| 3072×2048 | shared_gate_up | xfp3 | 46 | 0.9835 | 0.136% |
+| 2048×1536 | shared_down | xfp3 | 46 | 0.9818 | 0.050% |
+| 3072×2048 | routed (64 experts) | xfp3 | 46 | 0.9770 | 0.000% |
+| 2048×1536 | routed (64 experts) | xfp3 | 46 | 0.9770 | 0.000% |
+| 20480×2048 | dense_gate_up | xfp3 | 1 | 0.9830 | 0.034% |
+| 2048×10240 | dense_down | xfp3 | 1 | 0.9820 | 0.018% |
+| 154880×2048 | lm_head | FP8 | 1 | — | — |
+
 Auto-select picks xfp3 (8-entry codebook) for 99.5% of layers.
-Only 2 attention layers (attn_qb [5120×768]) need xfp4 (cos < 0.98 at xfp3).
-MoE experts are uniformly distributed → xfp3 always sufficient (cos=0.977).
+Only 2 attention layers (attn_qb [5120×768], attn_o [2048×5120]) need
+xfp4 in some layers (cos < 0.98 at xfp3). MoE experts are uniformly
+distributed → xfp3 always sufficient (cos=0.977), no outliers extracted.
 
 ### Math bench methodology note
 
