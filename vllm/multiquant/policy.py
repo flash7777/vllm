@@ -542,34 +542,63 @@ class MultiQuantPolicyRegistry:
         for lt, st in self._stats:
             groups.setdefault(lt, []).append(st)
 
-        logger.info(
-            "XFP Quantization Summary (%d layers across %d classes):",
-            len(self._stats), len(groups),
-        )
-        logger.info(
-            "  %-16s %6s %10s %8s %8s %s",
-            "Component", "Count", "mean mse", "cos",
-            "3σ %", "recommend (# could downgrade)",
-        )
-        logger.info("  " + "-" * 72)
+        logger.info("")
+        logger.info("XFP Summary (%d layers, %d classes):",
+                    len(self._stats), len(groups))
 
-        for lt in sorted(groups):
+        total_params = 0
+        total_bits_weighted = 0.0
+        total_outlier_weighted = 0.0
+
+        # Display order
+        display_names = {
+            "attn": "Attention",
+            "routed_expert": "Routed MoE",
+            "shared_expert": "Shared",
+            "dense_mlp": "Dense MLP",
+            "lm_head": "LM Head",
+            "mtp": "MTP",
+            "deltanet": "DeltaNet",
+            "other": "Other",
+        }
+        for lt in ["attn", "routed_expert", "shared_expert",
+                    "dense_mlp", "lm_head", "mtp", "deltanet", "other"]:
+            if lt not in groups:
+                continue
             items = groups[lt]
             n = len(items)
-            mean_mse = sum(s.mse for s in items) / n
             mean_cos = sum(s.cos_sim for s in items) / n
-            mean_k3 = 100.0 * sum(s.outlier_ratio_k3 for s in items) / n
-            # Count layers where recommended < chosen bits
-            downgrade = sum(
-                1 for s in items
-                if s.recommended_bits < s.bits
-            )
-            chosen_bits = set(s.bits for s in items)
-            chosen_str = ("xfp" + "/".join(str(b) for b in sorted(chosen_bits)))
+            mean_outlier = 100.0 * sum(
+                getattr(s, 'outlier_fraction', 0) for s in items) / n
+
+            # Bit-width distribution
+            from collections import Counter
+            bit_counts = Counter(s.bits for s in items)
+            bit_str = ", ".join(
+                f"{cnt}× xfp{b}" for b, cnt in sorted(bit_counts.items()))
+
+            # Param count for effective bits
+            for s in items:
+                numel = s.shape[0] * s.shape[1]
+                total_params += numel
+                total_bits_weighted += numel * s.bits
+                total_outlier_weighted += numel * getattr(
+                    s, 'outlier_fraction', 0)
+
+            name = display_names.get(lt, lt)
             logger.info(
-                "  %-16s %6d %10.4g %8.3f %8.1f %s (%d layers)",
-                lt, n, mean_mse, mean_cos, mean_k3, chosen_str, downgrade,
+                "  %-14s (%2d layers): %-28s | avg cos=%.3f | outliers=%.2f%%",
+                name, n, bit_str, mean_cos, mean_outlier,
             )
+
+        if total_params > 0:
+            eff_bits = total_bits_weighted / total_params
+            avg_outlier = 100.0 * total_outlier_weighted / total_params
+            logger.info(
+                "  Total: ~%.1f eff. bits/param, %.2f%% outliers avg",
+                eff_bits, avg_outlier,
+            )
+        logger.info("")
 
 
 # ─── Central weight-method dispatcher ──────────────────────────────

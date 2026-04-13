@@ -9,6 +9,9 @@ COPY vllm/multiquant/xfp/ /usr/local/lib/python3.12/dist-packages/vllm/multiquan
 COPY vllm/multiquant/policy.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/policy.py
 COPY vllm/multiquant/autoround/config.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/config.py
 
+# GPU model runner (XFP summary trigger)
+COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
+
 # CUDA Kernel Source (für JIT-Kompilierung)
 COPY kernels/multiquant/ /opt/mq_kernels/
 
