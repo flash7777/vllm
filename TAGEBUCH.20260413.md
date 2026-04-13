@@ -24,4 +24,31 @@
 - Kernel isoliert korrekt — Problem ist in der vLLM-Integration
 - Debug-Logging eingebaut, nächster Server-Start läuft
 
-TODO: Debug-Log prüfen, Ursache für E2E-Müll finden
+## E2E Ergebnisse
+
+### Bug gefunden: Kernel schreibt C[token_id] in Original-topk-Order
+Der Kernel schreibt `C[token_id]` wobei token_id aus sorted_token_ids kommt.
+Das platziert Ergebnisse an der ORIGINALEN topk-Position, nicht der sortierten.
+Python-Seite las es als sorted order → falsche Expert-Zuordnung.
+
+Fix: gate_up/down als [B*topk, N] allokieren, Down-GEMM mit topk_ids direkt
+als expert_ids, Scatter-Reduce über [0..BT) mit topk_weights.
+
+### Fused MoE XFP E2E Benchmark (enforce-eager)
+
+| Config | tok/s (long) | Math |
+|--------|-------------|------|
+| XFP4 attn+shared only, BF16 MoE (eager) | 24.6 | 66% |
+| XFP4 attn+shared only, BF16 MoE (CUDA Graphs) | 32.5 | 66% |
+| **XFP4 ALL mit fused MoE Kernel (eager)** | **29.5** | **56%** |
+| XFP4 ALL mit fused MoE Kernel (CUDA Graphs) | CRASH | - |
+
+### CUDA Graphs Crash
+`cudaErrorStreamCaptureUnsupported` — moe_align_block_size oder Python-seitige
+Tensor-Allokationen im apply() nicht Graph-kompatibel. Braucht custom op Wrapper
+wie bei xfp_apply/xfp_outlier_scatter.
+
+### Nächste Schritte
+1. Custom op für MoE apply (torch.compile + CUDA Graphs kompatibel)
+2. Dann Bench mit CUDA Graphs → erwartung ~35+ tok/s
+3. Profiling des fused MoE Kernels vs Marlin
