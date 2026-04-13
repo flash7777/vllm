@@ -442,8 +442,9 @@ Replaces 368 Python-dispatched kernel calls/token with 2 fused launches.
 
 **Image**: `localhost/vllm-xfp-bf16` (tag: `xfp_fast`)
 **Config**: XFP4 all layers (attn + shared + routed), fp8 KV, max-model-len 4096
+**Math**: max_tokens=15 (old bench, see note below about 200-token improvement)
 
-| Config | KV | Graphs | Short | Medium | Long | Math |
+| Config | KV | Graphs | Short | Medium | Long | Math (15tok) |
 |--------|-----|--------|-------|--------|------|------|
 | XFP4 attn+shared, BF16 MoE | fp8 | CUDA | 29.1 | 33.0 | 32.7 | 66% |
 | XFP4 ALL, fused MoE, eager | fp8 | eager | 27.4 | 29.7 | 29.5 | 56% |
@@ -481,28 +482,48 @@ per layer that pass cos > 0.98. Combined with FP8 LM Head via
 
 **Tag**: `xfp_faster_than_marlin`
 **Config**: `--weight-dtype xfp --weight-dtype-lm-head fp8`
+**Math bench**: `max_tokens=200` (was 15 — model explains before answering)
+
+### Final benchmark (200-token math)
 
 | Config | KV | Graphs | Short | Medium | Long | Math |
 |--------|-----|--------|-------|--------|------|------|
-| XFP4 all | fp8 | CUDA | 43.4 | 50.5 | 49.6 | 56% |
+| FP8 prequant baseline | fp8 | eager | 18.4 | 25.4 | 25.0 | **70%** |
+| XFP4 all, fused MoE | fp8 | CUDA | 43.4 | 50.5 | 49.6 | 56% |
 | XFP auto (mostly xfp3) | fp8 | CUDA | 45.5 | 53.5 | 52.6 | 46% |
-| **XFP auto + FP8 LM Head** | **fp8** | **CUDA** | **48.1** | **59.0** | **57.9** | **48%** |
+| **XFP auto + FP8 LM Head** | **fp8** | **CUDA** | **49.3** | **59.5** | **58.3** | **54%** |
 | Marlin INT4 baseline | fp8 | CUDA | — | — | 55.6 | ~78% |
-| FP8 prequant baseline | fp8 | eager | 19.6 | 26.6 | 28.2 | 60% |
 
-**57.9 tok/s = 104% of Marlin INT4. XFP is faster.**
+**58.3 tok/s = 105% of Marlin INT4. XFP is faster.**
 
-XFP Summary (GLM-4.7-Flash, auto):
+Math quality: 54% vs 70% FP8 baseline = 16pp gap from xfp3 (~3 bits).
+Of the 23 errors: 6 are negative subtraction (model-inherent), 5 are
+large multiplication off-by-one, rest are xfp3 approximation errors.
+
+### XFP analysis (GLM-4.7-Flash, auto)
+
 ```
-  Attention      (235 layers): 233× xfp3, 2× xfp4  | cos=0.985 | outliers=0.31%
-  Routed MoE      (92 layers): 92× xfp3             | cos=0.977 | outliers=0.00%
-  Shared           (92 layers): 92× xfp3             | cos=0.983 | outliers=0.09%
-  Dense MLP         (2 layers): 2× xfp3              | cos=0.983 | outliers=0.03%
-  LM Head                     : FP8 E4M3 (saved 317 MB)
-  Total: ~3.0 eff. bits/param
+XFP Summary (421 layers, 4 classes):
+  Attention      (235 layers): 233× xfp3, 2× xfp4  | avg cos=0.985 | outliers=0.31%
+  Routed MoE      (92 layers): 92× xfp3             | avg cos=0.977 | outliers=0.00%
+  Shared           (92 layers): 92× xfp3             | avg cos=0.983 | outliers=0.09%
+  Dense MLP         (2 layers): 2× xfp3              | avg cos=0.983 | outliers=0.03%
+  LM Head                     : FP8 E4M3 (_scaled_mm, saved 317 MB)
+  Total: ~3.0 eff. bits/param, 0.01% outliers avg
 ```
 
-**Full performance progression:**
+Auto-select picks xfp3 (8-entry codebook) for 99.5% of layers.
+Only 2 attention layers (attn_qb [5120×768]) need xfp4 (cos < 0.98 at xfp3).
+MoE experts are uniformly distributed → xfp3 always sufficient (cos=0.977).
+
+### Math bench methodology note
+
+GLM-4.7-Flash needs 100-200 tokens to "think through" math problems via
+completions API (`{a} {op} {b} = `). At 15 tokens the answer gets cut off:
+  15 tok: 60%, 50 tok: 60%, 100 tok: 62%, 200 tok: 70%, 500 tok: 76%
+Chat API scores 0% — model starts with "1. Analyze the Request:" every time.
+
+### Full performance progression
 
 | Version | Long tok/s | Key optimization |
 |---------|-----------|-----------------|
@@ -512,7 +533,7 @@ XFP Summary (GLM-4.7-Flash, auto):
 | v8 (SMEM pool) | 32.7 | Multi-warp block, bf16 native |
 | v8+fused MoE | 49.6 | Fused MoE CUDA kernel, CUDA Graphs |
 | XFP auto (xfp3) | 52.6 | Auto bit-width: 3 bits where sufficient |
-| **XFP auto + FP8 LM Head** | **57.9** | **FP8 _scaled_mm for LM Head** |
+| **XFP auto + FP8 LM Head** | **58.3** | **FP8 _scaled_mm for LM Head** |
 
 ## Architecture notes
 
