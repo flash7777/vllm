@@ -366,6 +366,8 @@ class MultiQuantPolicyRegistry:
         weight_dtype_routed: Optional[str] = None,
         weight_dtype_attn: Optional[str] = None,
         weight_dtype_mtp: Optional[str] = None,
+        weight_dtype_lm_head: Optional[str] = None,
+        weight_dtype_dense: Optional[str] = None,
         model_quant_config: Optional[dict] = None,
         hf_config: Optional[object] = None,
     ) -> "MultiQuantPolicyRegistry":
@@ -421,13 +423,13 @@ class MultiQuantPolicyRegistry:
                               WEIGHTS_DENSE]:
                     reg.set(w_cls, "fp8", "model")
 
-        # 4. --weight-dtype overrides all weights
+        # 4. --weight-dtype overrides ALL weight classes
         if weight_dtype is not None:
             for w_cls in [WEIGHTS_SHARED, WEIGHTS_ROUTED, WEIGHTS_ATTN,
-                          WEIGHTS_DENSE]:
+                          WEIGHTS_DENSE, LM_HEAD, MTP]:
                 reg.set(w_cls, weight_dtype, "cli")
 
-        # 5. Per-class weight overrides
+        # 5. Per-class weight overrides (take precedence over global)
         if weight_dtype_shared is not None:
             reg.set(WEIGHTS_SHARED, weight_dtype_shared, "cli")
         if weight_dtype_routed is not None:
@@ -436,6 +438,10 @@ class MultiQuantPolicyRegistry:
             reg.set(WEIGHTS_ATTN, weight_dtype_attn, "cli")
         if weight_dtype_mtp is not None:
             reg.set(MTP, weight_dtype_mtp, "cli")
+        if weight_dtype_lm_head is not None:
+            reg.set(LM_HEAD, weight_dtype_lm_head, "cli")
+        if weight_dtype_dense is not None:
+            reg.set(WEIGHTS_DENSE, weight_dtype_dense, "cli")
 
         cls._active = reg
         return reg

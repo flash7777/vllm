@@ -400,6 +400,8 @@ class EngineArgs:
     weight_dtype_routed: str | None = None
     weight_dtype_attn: str | None = None
     weight_dtype_mtp: str | None = None
+    weight_dtype_lm_head: str | None = None
+    weight_dtype_dense: str | None = None
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1008,6 +1010,15 @@ class EngineArgs:
             "--weight-dtype-attn", type=str, default=None,
             help="Weight dtype for attention weights only")
         cache_group.add_argument(
+            "--weight-dtype-mtp", type=str, default=None,
+            help="Weight dtype for MTP layers")
+        cache_group.add_argument(
+            "--weight-dtype-lm-head", type=str, default=None,
+            help="Weight dtype for LM head")
+        cache_group.add_argument(
+            "--weight-dtype-dense", type=str, default=None,
+            help="Weight dtype for dense MLP layers")
+        cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
         cache_group.add_argument(
@@ -1599,6 +1610,8 @@ class EngineArgs:
             weight_dtype_routed=self.weight_dtype_routed,
             weight_dtype_attn=self.weight_dtype_attn,
             weight_dtype_mtp=getattr(self, "weight_dtype_mtp", None),
+            weight_dtype_lm_head=getattr(self, "weight_dtype_lm_head", None),
+            weight_dtype_dense=getattr(self, "weight_dtype_dense", None),
             model_quant_config=_mqc,
             hf_config=_hf_text,
         )
