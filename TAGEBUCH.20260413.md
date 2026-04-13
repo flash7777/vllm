@@ -119,6 +119,22 @@ Bonusfrage: XFP auf LM Head möglich? Ja — ist ein GEMM, xfp_gemm Kernel funkt
 Aber VocabParallelEmbedding ≠ LinearBase → braucht eigenen Pfad in create_weight_method.
 xfp3 auf LM Head = 100 MB statt 600 MB. Auto-select müsste Qualität prüfen.
 
+## Qwen3.5-122B-A10B Tests
+
+### INT4 AutoRound Marlin: 25.8 tok/s, 96% Math
+Exzellente Math-Qualität. Nur 2 Fehler (große Multiplikation, negative Subtraktion).
+
+### XFP quant-on-load: OOM!
+250 GB BF16 → 120 GB Unified Memory → System-Hang.
+Grund: vLLM lädt alle Safetensors (BF16) bevor process_weights_after_loading läuft.
+Auch FP8LinearMethod/FP8MoEMethod helfen nicht — die BF16-Tensoren müssen erst
+komplett im RAM sein.
+
+### TODO: Streaming Quant-on-Load
+Pro Layer laden → quantisieren → BF16 freigeben → nächster Layer.
+Betrifft DefaultModelLoader + AutoWeightsLoader — multiquant-übergreifend,
+nicht XFP-spezifisch. Alle quant-on-load Methoden profitieren.
+
 ## FP8 LM Head _scaled_mm: 57.9 tok/s!
 
 Cached transposed FP8 weight + torch._scaled_mm = FP8 Tensor Core GEMM.
