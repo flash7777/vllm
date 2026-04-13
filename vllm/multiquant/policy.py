@@ -591,6 +591,17 @@ class MultiQuantPolicyRegistry:
                 name, n, bit_str, mean_cos, mean_outlier,
             )
 
+        # Note classes that were targeted but have no stats (e.g. LM Head
+        # is VocabParallelEmbedding, not LinearBase — not quantized by XFP)
+        for lt in ["lm_head", "mtp", "deltanet"]:
+            if lt not in groups:
+                p = self.get_weight_policy(lt)
+                if p.dtype not in ("bf16", "fp16", "fp32"):
+                    name = display_names.get(lt, lt)
+                    logger.info(
+                        "  %-14s            : bf16 (not a Linear layer, "
+                        "target %s skipped)", name, p.dtype)
+
         if total_params > 0:
             eff_bits = total_bits_weighted / total_params
             avg_outlier = 100.0 * total_outlier_weighted / total_params
