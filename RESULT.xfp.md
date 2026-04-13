@@ -473,6 +473,47 @@ Replaces 368 Python-dispatched kernel calls/token with 2 fused launches.
 
 Gap to Marlin: 2.09 ms (12%). Fused MoE speedup vs Python loop: 130–440×.
 
+## XFP Auto + FP8 LM Head (2026-04-13)
+
+Auto bit-width selection (`--weight-dtype xfp`) picks the lowest bits
+per layer that pass cos > 0.98. Combined with FP8 LM Head via
+`torch._scaled_mm` (FP8 Tensor Core GEMM on SM121).
+
+**Tag**: `xfp_faster_than_marlin`
+**Config**: `--weight-dtype xfp --weight-dtype-lm-head fp8`
+
+| Config | KV | Graphs | Short | Medium | Long | Math |
+|--------|-----|--------|-------|--------|------|------|
+| XFP4 all | fp8 | CUDA | 43.4 | 50.5 | 49.6 | 56% |
+| XFP auto (mostly xfp3) | fp8 | CUDA | 45.5 | 53.5 | 52.6 | 46% |
+| **XFP auto + FP8 LM Head** | **fp8** | **CUDA** | **48.1** | **59.0** | **57.9** | **48%** |
+| Marlin INT4 baseline | fp8 | CUDA | — | — | 55.6 | ~78% |
+| FP8 prequant baseline | fp8 | eager | 19.6 | 26.6 | 28.2 | 60% |
+
+**57.9 tok/s = 104% of Marlin INT4. XFP is faster.**
+
+XFP Summary (GLM-4.7-Flash, auto):
+```
+  Attention      (235 layers): 233× xfp3, 2× xfp4  | cos=0.985 | outliers=0.31%
+  Routed MoE      (92 layers): 92× xfp3             | cos=0.977 | outliers=0.00%
+  Shared           (92 layers): 92× xfp3             | cos=0.983 | outliers=0.09%
+  Dense MLP         (2 layers): 2× xfp3              | cos=0.983 | outliers=0.03%
+  LM Head                     : FP8 E4M3 (saved 317 MB)
+  Total: ~3.0 eff. bits/param
+```
+
+**Full performance progression:**
+
+| Version | Long tok/s | Key optimization |
+|---------|-----------|-----------------|
+| v1 (naive) | 5.3 | Reference implementation |
+| v2a (SMEM cb) | 6.4 | Codebook in shared memory |
+| v4opt+repack | 28.6 | Warp-per-element, coalesced reads |
+| v8 (SMEM pool) | 32.7 | Multi-warp block, bf16 native |
+| v8+fused MoE | 49.6 | Fused MoE CUDA kernel, CUDA Graphs |
+| XFP auto (xfp3) | 52.6 | Auto bit-width: 3 bits where sufficient |
+| **XFP auto + FP8 LM Head** | **57.9** | **FP8 _scaled_mm for LM Head** |
+
 ## Architecture notes
 
 - **Registry-centered dispatch**: XFP does not introduce a new `--quantization`
