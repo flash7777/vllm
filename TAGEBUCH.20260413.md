@@ -48,7 +48,35 @@ als expert_ids, Scatter-Reduce über [0..BT) mit topk_weights.
 Tensor-Allokationen im apply() nicht Graph-kompatibel. Braucht custom op Wrapper
 wie bei xfp_apply/xfp_outlier_scatter.
 
-### Nächste Schritte
-1. Custom op für MoE apply (torch.compile + CUDA Graphs kompatibel)
-2. Dann Bench mit CUDA Graphs → erwartung ~35+ tok/s
-3. Profiling des fused MoE Kernels vs Marlin
+### CUDA Graphs Fix: torch.argsort statt moe_align_block_size
+`moe_align_block_size` (C++ op) nicht Graph-capture-kompatibel.
+Ersetzt durch `topk_ids.reshape(-1).argsort(stable=True)` — pure torch, Graph-safe.
+Plus custom op Wrapper `xfp_moe_forward` für torch.compile Boundary.
+
+### Ergebnis mit CUDA Graphs: 49.6 tok/s!
+
+| Config | tok/s (long) | Math |
+|--------|-------------|------|
+| XFP4 attn+shared, BF16 MoE, graphs | 32.5 | 66% |
+| XFP4 ALL, fused MoE, eager | 29.5 | 56% |
+| **XFP4 ALL, fused MoE, CUDA Graphs** | **49.6** | **56%** |
+| Marlin INT4 Referenz | 55.6 | ~78% |
+
+Tag: `xfp_fast`
+
+### Profiling bei 49.6 tok/s
+
+Per-Token Budget (20.2 ms):
+- Fused MoE gate_up: 3.05 ms (46 Layers)
+- Fused MoE down: 1.89 ms
+- Attn+shared XFP: 6.53 ms (einzelne Kernel-Calls)
+- **XFP Kernel total: 11.47 ms (57%)**
+- Rest (attn compute, norm, routing): 8.73 ms
+
+Fused MoE Speedup: 130-440× vs Python-Loop!
+Gap zu Marlin: nur noch 2.2 ms (11%)
+
+Optimierungspotential:
+1. Attention-Kernel batchen (7 Calls/Layer → 1-2 fused)
+2. Outlier scatter eliminieren (1.6 ms)
+3. Kernel SMEM-Prefetch / Tile-Tuning
