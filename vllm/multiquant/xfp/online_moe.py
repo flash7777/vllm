@@ -227,24 +227,27 @@ class XFPMoEMethod(FusedMoEMethodBase):
         x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
         no_weights = torch.empty(0, dtype=torch.float32, device=x.device)
 
-        # Debug: log first call shapes
+        # Debug: log first call details
         if not hasattr(layer, '_xfp_debug_logged'):
             logger.info(
                 "XFP MoE apply: B=%d topk=%d E=%d N13=%d K13=%d N2=%d K2=%d "
-                "num_valid=%d fpe13=%d fpe2=%d "
-                "packed13=%s cb13=%s packed2=%s cb2=%s",
+                "num_valid=%d fpe13=%d fpe2=%d",
                 B, topk, E, N13, K13, N2, K2, num_valid,
                 layer._xfp_moe_fpe13, layer._xfp_moe_fpe2,
-                list(layer.w13_xfp_packed.shape),
-                list(layer.w13_xfp_codebook.shape),
-                list(layer.w2_xfp_packed.shape),
-                list(layer.w2_xfp_codebook.shape),
+            )
+            logger.info(
+                "  sorted_ids[:8]=%s expert_ids[:8]=%s topk_ids[:2]=%s",
+                sorted_token_ids[:min(8, num_valid)].tolist(),
+                expert_ids[:min(8, num_valid)].tolist(),
+                topk_ids[:min(2, B)].tolist(),
             )
             layer._xfp_debug_logged = True
 
-        # Gate+Up GEMM: one fused kernel launch, NO topk_weights yet
+        BT = B * topk
+
+        # Gate+Up GEMM: kernel writes C[token_id] in ORIGINAL topk order
         gate_up = torch.zeros(
-            num_valid, N13, dtype=torch.bfloat16, device=x.device)
+            BT, N13, dtype=torch.bfloat16, device=x.device)
         moe_kernel.xfp_moe_gemm(
             x_bf16, layer.w13_xfp_packed, layer.w13_xfp_codebook,
             gate_up, sorted_token_ids[:num_valid], expert_ids,
@@ -252,30 +255,32 @@ class XFPMoEMethod(FusedMoEMethodBase):
             int(bits), int(K13), int(N13), int(topk),
             int(layer._xfp_moe_fpe13), num_valid)
 
-        # SiLU activation
+        # SiLU activation (gate_up is in original topk order)
         gate = F.silu(gate_up[:, :half_n])
         up = gate_up[:, half_n:]
-        activated = gate * up  # [num_valid, half_n]
+        activated = gate * up  # [BT, half_n]
 
-        # Down GEMM: input is activated[i] per sorted entry.
-        # Use top_k=1 so kernel reads A[token_id] directly (not A[token_id/topk]).
-        # Use identity sorted_ids [0,1,2,...] since activated is already sorted.
+        # Down GEMM: activated[i] is for topk-position i.
+        # Use identity sorted_ids + expert mapping from topk_ids directly.
         down = torch.zeros(
-            num_valid, N2, dtype=torch.bfloat16, device=x.device)
-        identity_ids = torch.arange(
-            num_valid, dtype=torch.int32, device=x.device)
+            BT, N2, dtype=torch.bfloat16, device=x.device)
+        # Build expert_ids for down: topk_ids flattened
+        down_expert_ids = topk_ids.reshape(-1).to(torch.int32)
+        down_sorted_ids = torch.arange(BT, dtype=torch.int32, device=x.device)
         moe_kernel.xfp_moe_gemm(
             activated, layer.w2_xfp_packed, layer.w2_xfp_codebook,
-            down, identity_ids, expert_ids,
+            down, down_sorted_ids, down_expert_ids,
             no_weights,
-            int(bits), int(K2), int(N2), 1,  # top_k=1: A[token_id] directly
-            int(layer._xfp_moe_fpe2), num_valid)
+            int(bits), int(K2), int(N2), 1,  # top_k=1
+            int(layer._xfp_moe_fpe2), BT)
 
         # Scatter-reduce with topk_weights back to [B, K_in]
-        sorted_ids_valid = sorted_token_ids[:num_valid]
-        orig_tokens = (sorted_ids_valid // topk).to(torch.int64)
-        weights_sorted = topk_weights.reshape(-1)[sorted_ids_valid.long()]
-        weighted_down = down.float() * weights_sorted.unsqueeze(1)
+        # C is written at C[token_id] by the kernel, so C is in ORIGINAL
+        # topk order (not sorted order). Index directly.
+        BT = B * topk
+        orig_tokens = torch.arange(BT, device=x.device, dtype=torch.int64) // topk
+        topk_w_flat = topk_weights.reshape(-1)
+        weighted_down = down[:BT].float() * topk_w_flat.unsqueeze(1)
 
         output = torch.zeros(B, N2, dtype=x.dtype, device=x.device)
         output.scatter_add_(
