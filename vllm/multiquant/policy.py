@@ -631,6 +631,9 @@ def create_weight_method(
     from vllm.model_executor.layers.linear import (
         LinearBase, UnquantizedLinearMethod,
     )
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
     try:
         from vllm.model_executor.layers.fused_moe import FusedMoE
     except ImportError:
@@ -655,6 +658,11 @@ def create_weight_method(
             "create_weight_method: FusedMoE prefix='%s' -> type='%s' dtype='%s'",
             prefix, layer_type, dtype,
         )
+
+    # FP8 embedding/LM-head — VocabParallelEmbedding, not LinearBase
+    if dtype == "fp8" and isinstance(layer, VocabParallelEmbedding):
+        from vllm.multiquant.fp8_embedding import FP8EmbeddingMethod
+        return FP8EmbeddingMethod()
 
     # Pass-through for unquantized dtypes
     if dtype in ("bf16", "fp16", "fp32"):
