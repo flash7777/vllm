@@ -85,18 +85,28 @@ class FP8EmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """LM Head GEMM: hidden_states @ weight.T → logits.
+        """LM Head GEMM via torch._scaled_mm (FP8 native, no dequant).
 
-        Uses torch._scaled_mm for FP8 GEMM when available, falls back
-        to cached bf16 dequant.
+        Caches transposed weight on first call. Keeps weight in FP8 —
+        real memory saving (no bf16 copy).
         """
-        # Use cached bf16 weight if available (set on first call)
-        if not hasattr(layer, '_fp8_weight_bf16'):
-            layer._fp8_weight_bf16 = (
-                layer.weight.to(torch.bfloat16) * layer.weight_scale
-            )
-        logits = F.linear(x, layer._fp8_weight_bf16, bias)
-        return logits
+        if not hasattr(layer, '_fp8_weight_t'):
+            # Cache transposed FP8 weight + scale tensors
+            layer._fp8_weight_t = layer.weight.t().contiguous()
+            layer._fp8_x_scale = torch.tensor(
+                1.0, dtype=torch.float32, device=layer.weight.device)
+
+        x_fp8 = x.to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_fp8,
+            layer._fp8_weight_t,
+            scale_a=layer._fp8_x_scale,
+            scale_b=layer.weight_scale,
+            out_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            out = out + bias
+        return out
 
     def embedding(
         self,

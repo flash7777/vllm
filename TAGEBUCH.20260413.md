@@ -105,3 +105,16 @@ Optimierungspotential:
    halber Speicher, FP8 GEMM im Sampler. Kein XFP, nur dtype-Cast in MultiQuant.
    ParallelLMHead.forward() wird nie aufgerufen — Weights direkt im Sampler als GEMM.
    Eigener kleiner Punkt, nicht XFP.
+
+## FP8 LM Head implementiert
+
+`--weight-dtype-lm-head fp8` → FP8EmbeddingMethod für VocabParallelEmbedding.
+- process_weights: bf16 → float8_e4m3fn + scale (154880×2048, spart 317 MB)
+- apply: torch._scaled_mm für FP8×FP8 → BF16 GEMM (kein Dequant nötig)
+- embedding: F.embedding in fp8, dequant output
+- Naive dequant war 33.7 tok/s (Regression!), cached bf16 = 52.6 tok/s (neutral)
+- _scaled_mm Variante wird getestet
+
+Bonusfrage: XFP auf LM Head möglich? Ja — ist ein GEMM, xfp_gemm Kernel funktioniert.
+Aber VocabParallelEmbedding ≠ LinearBase → braucht eigenen Pfad in create_weight_method.
+xfp3 auf LM Head = 100 MB statt 600 MB. Auto-select müsste Qualität prüfen.
