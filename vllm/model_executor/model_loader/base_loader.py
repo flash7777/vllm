@@ -58,7 +58,16 @@ class BaseModelLoader(ABC):
             log_model_inspection(model)
 
             logger.debug("Loading weights on %s ...", load_device)
+            # Streaming quant-on-load: wrap weight loaders to quantize
+            # per-layer as weights arrive (saves memory for large models)
+            if model_config.quantization in ("autoround_rtn",):
+                from vllm.model_executor.model_loader.utils import (
+                    initialize_streaming_quantload,
+                )
+                initialize_streaming_quantload(model)
+
             # Quantization does not happen in `load_weights` but after it
+            # (unless streaming quant-on-load processes it per-layer)
             self.load_weights(model, model_config)
 
             # Log peak GPU memory after loading weights. This is needed

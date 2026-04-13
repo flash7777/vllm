@@ -91,12 +91,93 @@ def initialize_model(
     return model
 
 
+def initialize_streaming_quantload(model: nn.Module) -> None:
+    """Wrap weight loaders to trigger per-layer quantization as weights arrive.
+
+    Enables loading models larger than available RAM by quantizing each
+    layer's weights immediately after they're loaded, freeing the BF16
+    originals before the next layer starts loading.
+
+    Pattern adapted from reload/layerwise.py's make_online_process_loader.
+    """
+    count = 0
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, QuantizeMethodBase):
+            continue
+
+        # Compute expected total elements for this module's direct parameters
+        total_numel = sum(
+            p.numel() for p in module.parameters(recurse=False)
+            if p is not None
+        )
+        if total_numel == 0:
+            continue
+
+        # Attach tracking state
+        module._sq_load_numel = 0
+        module._sq_load_total = total_numel
+        module._sq_processed = False
+
+        # Wrap each parameter's weight_loader
+        for name in list(module._parameters.keys()):
+            param = module._parameters[name]
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+
+            param.weight_loader = _make_streaming_loader(
+                module, name, original_loader)
+            count += 1
+
+    if count > 0:
+        logger.info("Streaming quant-on-load: wrapped %d parameters", count)
+
+
+def _make_streaming_loader(layer, param_name, original_loader):
+    """Wrap a weight_loader to track loading progress and trigger quantization."""
+    import functools
+
+    @functools.wraps(original_loader)
+    def streaming_loader(*args, **kwargs):
+        # Call original loader (copies weight data into parameter)
+        ret = original_loader(*args, **kwargs)
+
+        # Track how many elements have been loaded for this layer.
+        # weight_loader is called per shard/expert, so we accumulate.
+        # Use the loaded_weight size from args (2nd positional arg typically).
+        loaded_weight = args[1] if len(args) > 1 else kwargs.get(
+            "loaded_weight", None)
+        if loaded_weight is not None and hasattr(loaded_weight, "numel"):
+            layer._sq_load_numel += loaded_weight.numel()
+
+        # When all weights for this layer are loaded, quantize immediately
+        if (layer._sq_load_numel >= layer._sq_load_total
+                and not layer._sq_processed):
+            layer._sq_processed = True
+            quant_method = getattr(layer, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(layer)
+                logger.debug(
+                    "Streaming quant: processed %s (%d params)",
+                    layer.__class__.__name__, layer._sq_load_total,
+                )
+
+        return ret
+    return streaming_loader
+
+
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            # Skip modules already processed by streaming quant-on-load
+            if getattr(module, "_sq_processed", False):
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
