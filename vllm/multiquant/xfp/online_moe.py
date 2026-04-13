@@ -18,9 +18,6 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-    moe_align_block_size,
-)
 from vllm.multiquant.policy import DTYPE_BITS
 
 if TYPE_CHECKING:
@@ -30,6 +27,111 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+# ─── Custom op for torch.compile / CUDA Graph compatibility ─────────
+#
+# The MoE forward contains moe_align_block_size (C++ op), dynamic
+# tensor allocations, and Python control flow — all incompatible with
+# CUDA Graph capture. Wrapping as a custom op makes torch.compile see
+# an opaque operator with known output shape.
+
+def _xfp_moe_forward_impl(
+    x: torch.Tensor,              # [B, K]
+    topk_weights: torch.Tensor,   # [B, topk]
+    topk_ids: torch.Tensor,       # [B, topk]
+    w13_packed: torch.Tensor,     # [E * fpe13] int32
+    w13_codebook: torch.Tensor,   # [E * N13 * lut] fp16
+    w2_packed: torch.Tensor,      # [E * fpe2] int32
+    w2_codebook: torch.Tensor,    # [E * N2 * lut] fp16
+    bits: int,
+    K13: int, N13: int,
+    K2: int, N2: int,
+    E: int, fpe13: int, fpe2: int,
+) -> torch.Tensor:
+    """Real impl: full MoE forward (gate_up → SiLU → down → reduce)."""
+    from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
+    moe_kernel = _load_xfp_moe_gemm()
+    if moe_kernel is None:
+        raise RuntimeError("XFP MoE kernel not loaded")
+
+    B = x.shape[0]
+    topk = topk_ids.shape[1]
+    half_n = N13 // 2
+    BT = B * topk
+
+    x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
+    no_w = torch.empty(0, dtype=torch.float32, device=x.device)
+
+    # Token sorting — pure torch ops (CUDA Graph safe, no C++ custom op)
+    flat_topk = topk_ids.reshape(-1)  # [B*topk]
+    sort_indices = flat_topk.argsort(stable=True)
+    sorted_token_ids = sort_indices.to(torch.int32)
+    sorted_expert_ids = flat_topk[sort_indices].to(torch.int32)
+    num_valid = sorted_token_ids.shape[0]
+
+    # Gate+Up
+    gate_up = torch.zeros(BT, N13, dtype=torch.bfloat16, device=x.device)
+    moe_kernel.xfp_moe_gemm(
+        x_bf16, w13_packed, w13_codebook,
+        gate_up, sorted_token_ids, sorted_expert_ids,
+        no_w, int(bits), int(K13), int(N13), int(topk),
+        int(fpe13), num_valid)
+
+    # SiLU
+    gate = F.silu(gate_up[:, :half_n])
+    up = gate_up[:, half_n:]
+    activated = gate * up
+
+    # Down
+    down = torch.zeros(BT, N2, dtype=torch.bfloat16, device=x.device)
+    down_expert_ids = topk_ids.reshape(-1).to(torch.int32)
+    down_sorted = torch.arange(BT, dtype=torch.int32, device=x.device)
+    moe_kernel.xfp_moe_gemm(
+        activated, w2_packed, w2_codebook,
+        down, down_sorted, down_expert_ids,
+        no_w, int(bits), int(K2), int(N2), 1,
+        int(fpe2), BT)
+
+    # Scatter-reduce
+    orig = torch.arange(BT, device=x.device, dtype=torch.int64) // topk
+    weighted = down.float() * topk_weights.reshape(-1).unsqueeze(1)
+    output = torch.zeros(B, N2, dtype=torch.bfloat16, device=x.device)
+    output.scatter_add_(
+        0, orig.unsqueeze(1).expand_as(weighted),
+        weighted.to(output.dtype))
+    return output
+
+
+def _xfp_moe_forward_fake(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_packed: torch.Tensor,
+    w13_codebook: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w2_codebook: torch.Tensor,
+    bits: int,
+    K13: int, N13: int,
+    K2: int, N2: int,
+    E: int, fpe13: int, fpe2: int,
+) -> torch.Tensor:
+    """Fake impl: output shape [B, N2] bf16."""
+    return torch.empty(x.shape[0], N2, dtype=torch.bfloat16, device=x.device)
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+    direct_register_custom_op(
+        op_name="xfp_moe_forward",
+        op_func=_xfp_moe_forward_impl,
+        fake_impl=_xfp_moe_forward_fake,
+    )
+    _xfp_moe_op = torch.ops.vllm.xfp_moe_forward
+    logger.info("XFP MoE custom op registered (torch.compile safe)")
+except Exception as e:
+    logger.warning("XFP MoE custom op registration failed: %s", e)
+    _xfp_moe_op = _xfp_moe_forward_impl
 
 
 class XFPMoEMethod(FusedMoEMethodBase):
@@ -203,90 +305,13 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 topk_weights=topk_weights, topk_ids=topk_ids,
             )
 
-        from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
-
-        moe_kernel = _load_xfp_moe_gemm()
-        if moe_kernel is None:
-            raise RuntimeError("XFP MoE kernel not available")
-
-        bits = layer._xfp_moe_bits
-        B, K_in = x.shape
-        topk = topk_ids.shape[1]
-        E = layer._xfp_moe_E
-        N13 = layer._xfp_moe_N13
-        K13 = layer._xfp_moe_K13
-        N2 = layer._xfp_moe_N2
-        K2 = layer._xfp_moe_K2
-        half_n = N13 // 2
-
-        # Token sorting (Marlin pattern)
-        sorted_token_ids, expert_ids, num_tokens_post = moe_align_block_size(
-            topk_ids, block_size=1, num_experts=E)
-        num_valid = int(num_tokens_post.item())
-
-        x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
-        no_weights = torch.empty(0, dtype=torch.float32, device=x.device)
-
-        # Debug: log first call details
-        if not hasattr(layer, '_xfp_debug_logged'):
-            logger.info(
-                "XFP MoE apply: B=%d topk=%d E=%d N13=%d K13=%d N2=%d K2=%d "
-                "num_valid=%d fpe13=%d fpe2=%d",
-                B, topk, E, N13, K13, N2, K2, num_valid,
-                layer._xfp_moe_fpe13, layer._xfp_moe_fpe2,
-            )
-            logger.info(
-                "  sorted_ids[:8]=%s expert_ids[:8]=%s topk_ids[:2]=%s",
-                sorted_token_ids[:min(8, num_valid)].tolist(),
-                expert_ids[:min(8, num_valid)].tolist(),
-                topk_ids[:min(2, B)].tolist(),
-            )
-            layer._xfp_debug_logged = True
-
-        BT = B * topk
-
-        # Gate+Up GEMM: kernel writes C[token_id] in ORIGINAL topk order
-        gate_up = torch.zeros(
-            BT, N13, dtype=torch.bfloat16, device=x.device)
-        moe_kernel.xfp_moe_gemm(
-            x_bf16, layer.w13_xfp_packed, layer.w13_xfp_codebook,
-            gate_up, sorted_token_ids[:num_valid], expert_ids,
-            no_weights,
-            int(bits), int(K13), int(N13), int(topk),
-            int(layer._xfp_moe_fpe13), num_valid)
-
-        # SiLU activation (gate_up is in original topk order)
-        gate = F.silu(gate_up[:, :half_n])
-        up = gate_up[:, half_n:]
-        activated = gate * up  # [BT, half_n]
-
-        # Down GEMM: activated[i] is for topk-position i.
-        # Use identity sorted_ids + expert mapping from topk_ids directly.
-        down = torch.zeros(
-            BT, N2, dtype=torch.bfloat16, device=x.device)
-        # Build expert_ids for down: topk_ids flattened
-        down_expert_ids = topk_ids.reshape(-1).to(torch.int32)
-        down_sorted_ids = torch.arange(BT, dtype=torch.int32, device=x.device)
-        moe_kernel.xfp_moe_gemm(
-            activated, layer.w2_xfp_packed, layer.w2_xfp_codebook,
-            down, down_sorted_ids, down_expert_ids,
-            no_weights,
-            int(bits), int(K2), int(N2), 1,  # top_k=1
-            int(layer._xfp_moe_fpe2), BT)
-
-        # Scatter-reduce with topk_weights back to [B, K_in]
-        # C is written at C[token_id] by the kernel, so C is in ORIGINAL
-        # topk order (not sorted order). Index directly.
-        BT = B * topk
-        orig_tokens = torch.arange(BT, device=x.device, dtype=torch.int64) // topk
-        topk_w_flat = topk_weights.reshape(-1)
-        weighted_down = down[:BT].float() * topk_w_flat.unsqueeze(1)
-
-        output = torch.zeros(B, N2, dtype=x.dtype, device=x.device)
-        output.scatter_add_(
-            0,
-            orig_tokens.unsqueeze(1).expand_as(weighted_down),
-            weighted_down.to(output.dtype),
+        return _xfp_moe_op(
+            x, topk_weights, topk_ids,
+            layer.w13_xfp_packed, layer.w13_xfp_codebook,
+            layer.w2_xfp_packed, layer.w2_xfp_codebook,
+            int(layer._xfp_moe_bits),
+            int(layer._xfp_moe_K13), int(layer._xfp_moe_N13),
+            int(layer._xfp_moe_K2), int(layer._xfp_moe_N2),
+            int(layer._xfp_moe_E),
+            int(layer._xfp_moe_fpe13), int(layer._xfp_moe_fpe2),
         )
-
-        return output
