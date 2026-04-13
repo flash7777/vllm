@@ -118,3 +118,24 @@ Optimierungspotential:
 Bonusfrage: XFP auf LM Head möglich? Ja — ist ein GEMM, xfp_gemm Kernel funktioniert.
 Aber VocabParallelEmbedding ≠ LinearBase → braucht eigenen Pfad in create_weight_method.
 xfp3 auf LM Head = 100 MB statt 600 MB. Auto-select müsste Qualität prüfen.
+
+## FP8 LM Head _scaled_mm: 57.9 tok/s!
+
+Cached transposed FP8 weight + torch._scaled_mm = FP8 Tensor Core GEMM.
+Schneller als BF16 F.linear! **57.9 tok/s = 104% von Marlin INT4.**
+Tag: `xfp_faster_than_marlin`
+
+## Math-Test Analyse
+
+Format-Vergleich (FP8 baseline, 10 Aufgaben):
+- Completions `{a} {op} {b} = `: **90%** ← bestes Format
+- Chat (alle Varianten): **0%** — GLM startet mit "Analyze the Request..."
+- Completions ohne Spaces: 70%
+
+Fehler-Muster im 50er Test (FP8 baseline = 60%):
+- 6/50 negative Subtraktionen → Modell versagt bei allen (a-b mit a<b)
+- 4-5 große Multiplikationsfehler (off-by-one, 3-stellig × 3-stellig)
+- Completions-Artefakte (Modell erklärt statt rechnet)
+
+→ 40% der Fehler sind Modell-inherent, nicht Quantisierung.
+→ Realer XFP-Impact: 4-12% Math-Differenz zu FP8.
