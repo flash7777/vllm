@@ -9,6 +9,7 @@ COPY vllm/multiquant/xfp/ /usr/local/lib/python3.12/dist-packages/vllm/multiquan
 COPY vllm/multiquant/policy.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/policy.py
 COPY vllm/multiquant/autoround/config.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/config.py
 COPY vllm/multiquant/fp8_embedding.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_embedding.py
+COPY vllm/multiquant/fp8_linear.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_linear.py
 COPY vllm/engine/arg_utils.py /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
 
 # GPU model runner (XFP summary trigger)

@@ -659,10 +659,15 @@ def create_weight_method(
             prefix, layer_type, dtype,
         )
 
-    # FP8 embedding/LM-head — VocabParallelEmbedding, not LinearBase
-    if dtype == "fp8" and isinstance(layer, VocabParallelEmbedding):
-        from vllm.multiquant.fp8_embedding import FP8EmbeddingMethod
-        return FP8EmbeddingMethod()
+    # FP8 quant-on-load (bf16 → fp8_e4m3fn at load time)
+    if dtype == "fp8":
+        if isinstance(layer, VocabParallelEmbedding):
+            from vllm.multiquant.fp8_embedding import FP8EmbeddingMethod
+            return FP8EmbeddingMethod()
+        if isinstance(layer, LinearBase):
+            from vllm.multiquant.fp8_linear import FP8LinearMethod
+            return FP8LinearMethod(quant_config)
+        return None
 
     # Pass-through for unquantized dtypes
     if dtype in ("bf16", "fp16", "fp32"):
