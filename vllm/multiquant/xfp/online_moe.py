@@ -196,7 +196,12 @@ class XFPMoEMethod(FusedMoEMethodBase):
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
         E = int(w13.shape[0])
 
-        # Auto bit-width: sample a few experts from w13, run auto_select
+        # MoE Lloyd iters: defined BEFORE auto-select so both use the same.
+        import os
+        moe_lloyd_iters = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
+
+        # Auto bit-width: sample a few experts, run auto_select with the
+        # SAME lloyd_iters as the actual packing to avoid quality mismatch.
         if bits == 0:
             from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
             sample_experts = min(4, E)
@@ -206,9 +211,10 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 candidates=(2, 3, 4),
                 min_cos=self.quant_config.auto_min_cos
                     if hasattr(self.quant_config, 'auto_min_cos') else 0.98,
+                lloyd_iters=moe_lloyd_iters,
             )
-            logger.info("XFP MoE auto-select: bits=%d (from %d expert sample)",
-                        bits, sample_experts)
+            logger.info("XFP MoE auto-select: bits=%d (from %d expert sample, "
+                        "lloyd=%d)", bits, sample_experts, moe_lloyd_iters)
 
         _load_xfp_gemm(bits)
         _load_xfp_moe_gemm()
@@ -221,11 +227,6 @@ class XFPMoEMethod(FusedMoEMethodBase):
 
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
-
-        # MoE experts have homogeneous distributions — fewer Lloyd iters
-        # suffice. Default 5 (vs 20 for attention). Override via XFP_MOE_LLOYD_ITERS.
-        import os
-        moe_lloyd_iters = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
 
         def _batched_pack_and_repack(W_stack: torch.Tensor):
             """W_stack: [E, N, K] -> flat packed [E*flat], flat codebook [E*N*lut].
