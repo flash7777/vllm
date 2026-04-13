@@ -101,3 +101,7 @@ Optimierungspotential:
 2. Outlier scatter eliminieren (1.6 ms)
 3. Kernel SMEM-Prefetch / Tile-Tuning
 4. LM Head cos-Schwellwert erhöhen (0.995 statt 0.98)
+5. Embedding/LM Head FP8: `--weight-dtype-lm-head fp8` → weight.to(float8_e4m3fn),
+   halber Speicher, FP8 GEMM im Sampler. Kein XFP, nur dtype-Cast in MultiQuant.
+   ParallelLMHead.forward() wird nie aufgerufen — Weights direkt im Sampler als GEMM.
+   Eigener kleiner Punkt, nicht XFP.
