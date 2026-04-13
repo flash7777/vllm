@@ -76,7 +76,28 @@ Per-Token Budget (20.2 ms):
 Fused MoE Speedup: 130-440× vs Python-Loop!
 Gap zu Marlin: nur noch 2.2 ms (11%)
 
+### XFP auto alle Klassen
+
+`--weight-dtype xfp` setzt jetzt ALLE Klassen (inkl LM Head, MTP, Dense).
+Auto-Select wählt pro Layer die niedrigste Bitbreite die cos > 0.98 schafft.
+
+GLM-4.7-Flash Ergebnis:
+- 327 Linear-Layer: 325× xfp3, 2× xfp4 (attn_qb)
+- 46 MoE-Layer: alle xfp3
+- Outliers: 0.02–0.94% pro Layer
+
+| Config | tok/s | Math |
+|--------|-------|------|
+| XFP4 all | 49.6 | 56% |
+| XFP auto (routed+attn+shared) | 51.1 | 54% |
+| XFP auto (ALL classes) | **52.6** | 46% |
+| Marlin INT4 | 55.6 | ~78% |
+
+52.6 tok/s = 95% von Marlin! Math fällt bei xfp3 auf Dense+LM Head.
+→ LM Head und Dense MLP sollten xfp4 erzwingen oder höheren cos-Schwellwert.
+
 Optimierungspotential:
 1. Attention-Kernel batchen (7 Calls/Layer → 1-2 fused)
 2. Outlier scatter eliminieren (1.6 ms)
 3. Kernel SMEM-Prefetch / Tile-Tuning
+4. LM Head cos-Schwellwert erhöhen (0.995 statt 0.98)
