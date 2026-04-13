@@ -147,10 +147,10 @@ class XFPMoEMethod(FusedMoEMethodBase):
         dtype: str = "xfp4",
         moe_config: "FusedMoEConfig | None" = None,
     ):
-        if dtype not in ("xfp2", "xfp3", "xfp4"):
+        if dtype not in ("xfp", "xfp2", "xfp3", "xfp4"):
             raise ValueError(
                 f"XFPMoEMethod: unsupported dtype '{dtype}', "
-                f"supported: xfp2, xfp3, xfp4"
+                f"supported: xfp (auto), xfp2, xfp3, xfp4"
             )
         if moe_config is not None:
             super().__init__(moe_config)
@@ -195,6 +195,20 @@ class XFPMoEMethod(FusedMoEMethodBase):
         w13 = layer.w13_weight.data  # [E, N_gate_up, K]
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
         E = int(w13.shape[0])
+
+        # Auto bit-width: sample a few experts from w13, run auto_select
+        if bits == 0:
+            from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
+            sample_experts = min(4, E)
+            sample = w13[:sample_experts].reshape(-1, w13.shape[2]).float()
+            bits = xfp_auto_select(
+                sample,
+                candidates=(2, 3, 4),
+                min_cos=self.quant_config.auto_min_cos
+                    if hasattr(self.quant_config, 'auto_min_cos') else 0.98,
+            )
+            logger.info("XFP MoE auto-select: bits=%d (from %d expert sample)",
+                        bits, sample_experts)
 
         _load_xfp_gemm(bits)
         _load_xfp_moe_gemm()

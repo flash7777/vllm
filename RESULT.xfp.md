@@ -434,6 +434,45 @@ run-to-run noise — both are 66% after the comma-separator parsing fix.
 3. The previous 0% math was caused by tq3 KV-cache bug, not XFP
 4. bench.py had a comma-parsing bug that undercounted correct answers by ~16%
 
+## Fused MoE Kernel (2026-04-13)
+
+New CUDA kernel `xfp_moe_gemm.cu` — single launch handles all active
+experts per layer via sorted_token_ids / expert_ids (Marlin pattern).
+Replaces 368 Python-dispatched kernel calls/token with 2 fused launches.
+
+**Image**: `localhost/vllm-xfp-bf16` (tag: `xfp_fast`)
+**Config**: XFP4 all layers (attn + shared + routed), fp8 KV, max-model-len 4096
+
+| Config | KV | Graphs | Short | Medium | Long | Math |
+|--------|-----|--------|-------|--------|------|------|
+| XFP4 attn+shared, BF16 MoE | fp8 | CUDA | 29.1 | 33.0 | 32.7 | 66% |
+| XFP4 ALL, fused MoE, eager | fp8 | eager | 27.4 | 29.7 | 29.5 | 56% |
+| **XFP4 ALL, fused MoE** | **fp8** | **CUDA** | **43.4** | **50.5** | **49.6** | **56%** |
+| Marlin INT4 baseline | fp8 | CUDA | — | — | 55.6 | ~78% |
+| FP8 prequant baseline | fp8 | eager | 19.6 | 26.6 | 28.2 | 60% |
+
+**Kernel performance progression:**
+
+| Version | Long tok/s | Change | Key optimization |
+|---------|-----------|--------|-----------------|
+| v1 (naive) | 5.3 | — | Reference implementation |
+| v2a (SMEM cb) | 6.4 | +21% | Codebook in shared memory |
+| v4opt+repack | 28.6 | +347% | Warp-per-element, coalesced reads |
+| v8 (SMEM pool) | 32.7 | +14% | Multi-warp block, bf16 native |
+| **v8+fused MoE** | **49.6** | **+52%** | **Fused MoE kernel, CUDA Graphs** |
+
+**Profiling at 49.6 tok/s (20.08 ms/tok):**
+
+| Component | ms/tok | % |
+|-----------|--------|---|
+| Fused MoE gate_up | 3.05 | 15% |
+| Fused MoE down | 1.89 | 9% |
+| Attn+shared XFP (7 calls/layer) | 6.53 | 33% |
+| **XFP kernel total** | **11.47** | **57%** |
+| Rest (attn compute, norm, routing) | 8.73 | 43% |
+
+Gap to Marlin: 2.09 ms (12%). Fused MoE speedup vs Python loop: 130–440×.
+
 ## Architecture notes
 
 - **Registry-centered dispatch**: XFP does not introduce a new `--quantization`
