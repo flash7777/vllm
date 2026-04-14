@@ -135,6 +135,26 @@ Pro Layer laden → quantisieren → BF16 freigeben → nächster Layer.
 Betrifft DefaultModelLoader + AutoWeightsLoader — multiquant-übergreifend,
 nicht XFP-spezifisch. Alle quant-on-load Methoden profitieren.
 
+## Streaming Quant-on-Load Implementierung
+
+### Versuch 1: numel-tracking + process_weights trigger
+- weight_loader wrapper trackt geladene Elemente pro Layer
+- Bei Completion → process_weights_after_loading
+- Problem: Parameter schon bei create_weights in BF16 allokiert → Peak = volles Modell
+
+### Versuch 2: Meta device + lazy materialization  
+- Parameter auf meta device (0 RAM) nach create_weights
+- Materialisierung beim ersten weight_loader call
+- GLM: Memory stabil bei 70-80 GB frei während Laden (funktioniert!)
+- Crash nach Laden: FusedMoE weight_loader hat spezielle Signatur
+  (param, loaded_weight, weight_name, shard_id, expert_id)
+  die der generische Wrapper nicht versteht
+- MoE-Layer bleiben auf meta device → crash bei XFP-Packing
+
+### Nächster Schritt
+FusedMoE weight_loader Signatur im Streaming-Wrapper handhaben.
+Oder: separate Streaming-Logik für Linear (einfach) vs FusedMoE (komplex).
+
 ## FP8 LM Head _scaled_mm: 57.9 tok/s!
 
 Cached transposed FP8 weight + torch._scaled_mm = FP8 Tensor Core GEMM.
