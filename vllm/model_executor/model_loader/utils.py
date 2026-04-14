@@ -94,11 +94,13 @@ def initialize_model(
 def initialize_streaming_quantload(model: nn.Module) -> None:
     """Wrap weight loaders to trigger per-layer quantization as weights arrive.
 
-    Enables loading models larger than available RAM by quantizing each
-    layer's weights immediately after they're loaded, freeing the BF16
-    originals before the next layer starts loading.
+    Enables loading models larger than available RAM by:
+    1. Replacing BF16 parameters with meta-device placeholders (0 RAM)
+    2. Materializing each parameter on first weight_loader call
+    3. Triggering process_weights_after_loading when a layer is complete
+    4. Quantized layer stays in RAM, BF16 original freed
 
-    Pattern adapted from reload/layerwise.py's make_online_process_loader.
+    Peak memory: ~1 layer BF16 + all previously quantized layers.
     """
     count = 0
     for module in model.modules():
@@ -119,7 +121,7 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
         module._sq_load_total = total_numel
         module._sq_processed = False
 
-        # Wrap each parameter's weight_loader
+        # Replace parameters with meta placeholders + wrapped loaders
         for name in list(module._parameters.keys()):
             param = module._parameters[name]
             if param is None:
@@ -128,26 +130,72 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
             if original_loader is None:
                 continue
 
-            param.weight_loader = _make_streaming_loader(
-                module, name, original_loader)
+            # Save shape/dtype/attrs, create meta placeholder
+            shape = param.shape
+            dtype = param.dtype
+            attrs = {}
+            for attr in dir(param):
+                if not attr.startswith("_") and attr not in (
+                    "data", "grad", "device", "dtype", "shape",
+                    "requires_grad", "weight_loader", "is_leaf",
+                ):
+                    try:
+                        v = getattr(param, attr)
+                        if not callable(v):
+                            attrs[attr] = v
+                    except Exception:
+                        pass
+
+            meta_param = torch.nn.Parameter(
+                torch.empty(shape, dtype=dtype, device="meta"),
+                requires_grad=False,
+            )
+            for k, v in attrs.items():
+                try:
+                    setattr(meta_param, k, v)
+                except Exception:
+                    pass
+            meta_param.weight_loader = _make_streaming_loader(
+                module, name, original_loader, shape, dtype)
+            module._parameters[name] = meta_param
             count += 1
 
     if count > 0:
-        logger.info("Streaming quant-on-load: wrapped %d parameters", count)
+        logger.info("Streaming quant-on-load: %d parameters on meta device", count)
 
 
-def _make_streaming_loader(layer, param_name, original_loader):
-    """Wrap a weight_loader to track loading progress and trigger quantization."""
+def _make_streaming_loader(layer, param_name, original_loader,
+                           orig_shape, orig_dtype):
+    """Wrap a weight_loader to materialize meta params and trigger quantization."""
     import functools
 
     @functools.wraps(original_loader)
     def streaming_loader(*args, **kwargs):
+        # Materialize parameter from meta device on first load
+        param = getattr(layer, param_name)
+        if param.device.type == "meta":
+            real_param = torch.nn.Parameter(
+                torch.empty(orig_shape, dtype=orig_dtype,
+                            device="cpu"),
+                requires_grad=False,
+            )
+            # Transfer attrs
+            for attr in ("input_dim", "output_dim", "packed_dim",
+                         "num_experts", "tp_size"):
+                if hasattr(param, attr):
+                    setattr(real_param, attr, getattr(param, attr))
+            real_param.weight_loader = streaming_loader
+            layer._parameters[param_name] = real_param
+
         # Call original loader (copies weight data into parameter)
+        # Update args to use the materialized parameter
+        if len(args) > 0 and hasattr(args[0], "device"):
+            args = (getattr(layer, param_name),) + args[1:]
+        elif "param" in kwargs:
+            kwargs["param"] = getattr(layer, param_name)
         ret = original_loader(*args, **kwargs)
 
-        # Track how many elements have been loaded for this layer.
-        # weight_loader is called per shard/expert, so we accumulate.
-        # Use the loaded_weight size from args (2nd positional arg typically).
+        # Track how many elements have been loaded for this layer
         loaded_weight = args[1] if len(args) > 1 else kwargs.get(
             "loaded_weight", None)
         if loaded_weight is not None and hasattr(loaded_weight, "numel"):
