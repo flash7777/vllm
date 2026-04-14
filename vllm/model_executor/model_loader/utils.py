@@ -94,21 +94,34 @@ def initialize_model(
 def initialize_streaming_quantload(model: nn.Module) -> None:
     """Wrap weight loaders to trigger per-layer quantization as weights arrive.
 
-    Enables loading models larger than available RAM by:
-    1. Replacing BF16 parameters with meta-device placeholders (0 RAM)
-    2. Materializing each parameter on first weight_loader call
-    3. Triggering process_weights_after_loading when a layer is complete
-    4. Quantized layer stays in RAM, BF16 original freed
+    Two strategies depending on layer type:
+    - LinearBase: replace params with meta device, materialize on weight_loader
+    - FusedMoE (has load_weights): wrap load_weights to trigger quant after
+      all experts loaded. Params stay real (FusedMoE manages its own memory).
 
     Peak memory: ~1 layer BF16 + all previously quantized layers.
     """
-    count = 0
+    linear_count = 0
+    moe_count = 0
+
     for module in model.modules():
         quant_method = getattr(module, "quant_method", None)
         if not isinstance(quant_method, QuantizeMethodBase):
             continue
 
-        # Compute expected total elements for this module's direct parameters
+        module._sq_processed = False
+
+        # FusedMoE: has its own load_weights — wrap that instead of params
+        has_load_weights = hasattr(module, "load_weights") and callable(
+            getattr(module, "load_weights"))
+        if has_load_weights:
+            original_lw = module.load_weights
+            module.load_weights = _make_moe_streaming_loader(
+                module, original_lw)
+            moe_count += 1
+            continue
+
+        # LinearBase: meta device + param.weight_loader wrapping
         total_numel = sum(
             p.numel() for p in module.parameters(recurse=False)
             if p is not None
@@ -116,12 +129,9 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
         if total_numel == 0:
             continue
 
-        # Attach tracking state
         module._sq_load_numel = 0
         module._sq_load_total = total_numel
-        module._sq_processed = False
 
-        # Replace parameters with meta placeholders + wrapped loaders
         for name in list(module._parameters.keys()):
             param = module._parameters[name]
             if param is None:
@@ -130,9 +140,9 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
             if original_loader is None:
                 continue
 
-            # Save shape/dtype/attrs, create meta placeholder
             shape = param.shape
             dtype = param.dtype
+            # Collect non-callable, non-private attributes
             attrs = {}
             for attr in dir(param):
                 if not attr.startswith("_") and attr not in (
@@ -158,10 +168,48 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
             meta_param.weight_loader = _make_streaming_loader(
                 module, name, original_loader, shape, dtype)
             module._parameters[name] = meta_param
-            count += 1
+            linear_count += 1
 
-    if count > 0:
-        logger.info("Streaming quant-on-load: %d parameters on meta device", count)
+    if linear_count + moe_count > 0:
+        logger.info(
+            "Streaming quant-on-load: %d linear params (meta), %d MoE modules",
+            linear_count, moe_count,
+        )
+
+
+def _move_params_to_device(layer: nn.Module) -> None:
+    """Move all direct parameters to CUDA after CPU quantization."""
+    target = torch.device("cuda:0") if torch.cuda.is_available() \
+        else torch.device("cpu")
+    for name in list(layer._parameters.keys()):
+        p = layer._parameters[name]
+        if p is not None and p.device != target:
+            layer._parameters[name] = torch.nn.Parameter(
+                p.data.to(target), requires_grad=False)
+
+
+def _make_moe_streaming_loader(layer, original_load_weights):
+    """Wrap FusedMoE.load_weights to trigger quant after all experts loaded."""
+    import functools
+
+    @functools.wraps(original_load_weights)
+    def streaming_load_weights(weights):
+        # Let FusedMoE load all experts normally
+        result = original_load_weights(weights)
+
+        # Then immediately quantize and free BF16
+        if not layer._sq_processed:
+            layer._sq_processed = True
+            quant_method = getattr(layer, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(layer)
+                # Move quantized params to GPU after CPU packing
+                _move_params_to_device(layer)
+                logger.debug("Streaming quant: MoE %s processed",
+                             layer.__class__.__name__)
+
+        return result
+    return streaming_load_weights
 
 
 def _make_streaming_loader(layer, param_name, original_loader,
@@ -208,6 +256,7 @@ def _make_streaming_loader(layer, param_name, original_loader,
             quant_method = getattr(layer, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(layer)
+                _move_params_to_device(layer)
                 logger.debug(
                     "Streaming quant: processed %s (%d params)",
                     layer.__class__.__name__, layer._sq_load_total,
