@@ -46,12 +46,18 @@ class AutoRoundRTNConfig(QuantizationConfig):
         nsamples: int = 128,
         seqlen: int = 2048,
         dataset: str = "NeelNanda/pile-10k",
+        mq_dtype: Optional[dict] = None,
+        mq_gs: Optional[dict] = None,
     ):
         self.bits = bits
         self.group_size = group_size
         self.nsamples = nsamples
         self.seqlen = seqlen
         self.dataset = dataset
+        # Persist MultiQuant policy so it survives pickle/spawn across
+        # process boundaries (API server → Engine Core).
+        self.mq_dtype = mq_dtype or {}
+        self.mq_gs = mq_gs or {}
 
     @classmethod
     def get_name(cls) -> str:
@@ -79,42 +85,53 @@ class AutoRoundRTNConfig(QuantizationConfig):
         Registry singleton in the Engine Core process is empty and the
         central dispatcher cannot route layers.
         """
+        mq_dtype: dict[str, str] = config.get("_mq_class_dtype", {})
+        mq_gs: dict[str, int] = config.get("_mq_class_gs", {})
         instance = cls(
             bits=config.get("bits", 4),
             group_size=config.get("group_size", 128),
             nsamples=config.get("nsamples", 128),
+            mq_dtype=mq_dtype,
+            mq_gs=mq_gs,
         )
-
-        mq_dtype: dict[str, str] = config.get("_mq_class_dtype", {})
-        mq_gs: dict[str, int] = config.get("_mq_class_gs", {})
-
-        if mq_dtype:
-            from vllm.multiquant.policy import (
-                MultiQuantPolicyRegistry,
-                ALL_CLASSES,
-            )
-            if MultiQuantPolicyRegistry.get_active() is None:
-                reg = MultiQuantPolicyRegistry()
-                for cls_key in ALL_CLASSES:
-                    if cls_key in mq_dtype:
-                        reg.set(
-                            cls_key,
-                            mq_dtype[cls_key],
-                            "cli",
-                            group_size=mq_gs.get(cls_key, 0),
-                        )
-                MultiQuantPolicyRegistry._active = reg
-                logger.info(
-                    "autoround_rtn: rebuilt MultiQuant registry from "
-                    "config dict: %s",
-                    {k: v for k, v in mq_dtype.items()
-                     if v not in ("bf16", "fp16")},
-                )
+        instance._ensure_registry()
         return instance
+
+    def _ensure_registry(self):
+        """Rebuild the MultiQuant policy registry if it's empty in this
+        process. Called from from_config (API server) and from
+        get_quant_method (Engine Core, after pickle+spawn)."""
+        if not self.mq_dtype:
+            return
+        from vllm.multiquant.policy import (
+            MultiQuantPolicyRegistry,
+            ALL_CLASSES,
+        )
+        if MultiQuantPolicyRegistry.get_active() is not None:
+            return
+        reg = MultiQuantPolicyRegistry()
+        for cls_key in ALL_CLASSES:
+            if cls_key in self.mq_dtype:
+                reg.set(
+                    cls_key,
+                    self.mq_dtype[cls_key],
+                    "cli",
+                    group_size=self.mq_gs.get(cls_key, 0),
+                )
+        MultiQuantPolicyRegistry._active = reg
+        logger.info(
+            "autoround_rtn: rebuilt MultiQuant registry: %s",
+            {k: v for k, v in self.mq_dtype.items()
+             if v not in ("bf16", "fp16")},
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         """Delegate to the central Registry-based dispatcher."""
+        # Engine Core is a spawned process that receives a pickled copy of
+        # this config — the policy registry singleton in that process is
+        # empty. Rebuild it lazily on first dispatch.
+        self._ensure_registry()
         from vllm.multiquant.policy import create_weight_method
         return create_weight_method(self, layer, prefix)

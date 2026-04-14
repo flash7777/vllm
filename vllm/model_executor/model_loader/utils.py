@@ -91,6 +91,72 @@ def initialize_model(
     return model
 
 
+def _mem_snapshot(tag: str) -> str:
+    """Layered memory breakdown. On GB10 Unified Memory, CUDA allocs and CPU
+    tensors share the same physical DRAM, so we track every layer:
+    - VmRSS   : resident set (process-owned CPU pages)
+    - VmHWM   : peak RSS ever seen by this process
+    - VmData  : data+heap segment (Python+libc malloc)
+    - PssAnon : proportional share of anonymous mem (smaps_rollup)
+    - CUDA alloc/reserved : PyTorch allocator view
+    - MemAvail: kernel-reported free+reclaimable
+    Differences between these tell us:
+      * RSS << MemUsed → CUDA/UVM pages not in RSS (unified mem cdev)
+      * VmData - RSS   → mmap/cache pages swapped out or unmapped
+      * reserved - alloc → PyTorch caching-allocator overhead
+    """
+    vm_rss = vm_hwm = vm_data = vm_peak = pss = -1
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    vm_rss = int(line.split()[1]) // 1024
+                elif line.startswith("VmHWM:"):
+                    vm_hwm = int(line.split()[1]) // 1024
+                elif line.startswith("VmData:"):
+                    vm_data = int(line.split()[1]) // 1024
+                elif line.startswith("VmPeak:"):
+                    vm_peak = int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    pss = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        pass
+    ram_total = ram_used = ram_avail = mem_free = cached = -1
+    try:
+        with open("/proc/meminfo") as f:
+            mi = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                mi[k] = int(v.strip().split()[0])
+            ram_total = mi.get("MemTotal", 0) // 1024
+            ram_avail = mi.get("MemAvailable", 0) // 1024
+            mem_free = mi.get("MemFree", 0) // 1024
+            cached = mi.get("Cached", 0) // 1024
+            ram_used = ram_total - ram_avail
+    except Exception:
+        pass
+    gpu = "GPU=n/a"
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            alloc = _t.cuda.memory_allocated() // (1024 * 1024)
+            reserv = _t.cuda.memory_reserved() // (1024 * 1024)
+            gpu = f"CUDA alloc={alloc} resv={reserv}"
+    except Exception:
+        gpu = "GPU=err"
+    return (f"{tag}: "
+            f"RSS={vm_rss} HWM={vm_hwm} Data={vm_data} Pss={pss} "
+            f"| MemUsed={ram_used}/{ram_total} Avail={ram_avail} "
+            f"Cached={cached} Free={mem_free} "
+            f"| {gpu} [MiB]")
+
+
 def initialize_streaming_quantload(model: nn.Module) -> None:
     """Wrap weight loaders to trigger per-layer quantization as weights arrive.
 
@@ -101,6 +167,7 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
 
     Peak memory: ~1 layer BF16 + all previously quantized layers.
     """
+    logger.info("[stream-mem] %s", _mem_snapshot("streaming-quantload entry"))
     linear_count = 0
     moe_count = 0
 
@@ -111,17 +178,10 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
 
         module._sq_processed = False
 
-        # FusedMoE: has its own load_weights — wrap that instead of params
-        has_load_weights = hasattr(module, "load_weights") and callable(
-            getattr(module, "load_weights"))
-        if has_load_weights:
-            original_lw = module.load_weights
-            module.load_weights = _make_moe_streaming_loader(
-                module, original_lw)
-            moe_count += 1
-            continue
-
-        # LinearBase: meta device + param.weight_loader wrapping
+        # Unified path: wrap param.weight_loader for every param that has
+        # one. This covers LinearBase, FusedMoE (model-level load_weights in
+        # e.g. qwen3_5 calls param.weight_loader directly — bypasses any
+        # module.load_weights wrapping), embeddings, etc.
         total_numel = sum(
             p.numel() for p in module.parameters(recurse=False)
             if p is not None
@@ -140,41 +200,29 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
             if original_loader is None:
                 continue
 
-            shape = param.shape
+            shape = tuple(param.shape)
             dtype = param.dtype
-            # Collect non-callable, non-private attributes
-            attrs = {}
-            for attr in dir(param):
-                if not attr.startswith("_") and attr not in (
-                    "data", "grad", "device", "dtype", "shape",
-                    "requires_grad", "weight_loader", "is_leaf",
-                ):
-                    try:
-                        v = getattr(param, attr)
-                        if not callable(v):
-                            attrs[attr] = v
-                    except Exception:
-                        pass
+            device = param.device
 
-            meta_param = torch.nn.Parameter(
-                torch.empty(shape, dtype=dtype, device="meta"),
-                requires_grad=False,
-            )
-            for k, v in attrs.items():
-                try:
-                    setattr(meta_param, k, v)
-                except Exception:
-                    pass
-            meta_param.weight_loader = _make_streaming_loader(
+            # Free the underlying storage while keeping the parameter object
+            # (and its subclass — ModelWeightParameter etc.) alive. We set
+            # a zero-size tensor on the same device, which passes vLLM's
+            # subclass `__torch_function__` compat check (a meta-tensor
+            # here fails with "incompatible tensor type"). The streaming
+            # loader re-allocates full shape on first weight_loader call.
+            param.data = torch.empty(0, dtype=dtype, device=device)
+            param._streaming_shape = shape
+            param._streaming_dtype = dtype
+            param.weight_loader = _make_streaming_loader(
                 module, name, original_loader, shape, dtype)
-            module._parameters[name] = meta_param
             linear_count += 1
 
-    if linear_count + moe_count > 0:
+    if linear_count > 0:
         logger.info(
-            "Streaming quant-on-load: %d linear params (meta), %d MoE modules",
-            linear_count, moe_count,
+            "Streaming quant-on-load: %d params swapped to meta",
+            linear_count,
         )
+        logger.info("[stream-mem] %s", _mem_snapshot("after meta-swap"))
 
 
 def _move_params_to_device(layer: nn.Module) -> None:
@@ -188,25 +236,63 @@ def _move_params_to_device(layer: nn.Module) -> None:
                 p.data.to(target), requires_grad=False)
 
 
-def _make_moe_streaming_loader(layer, original_load_weights):
-    """Wrap FusedMoE.load_weights to trigger quant after all experts loaded."""
+def _make_moe_streaming_loader(layer, original_load_weights, meta_specs):
+    """Wrap FusedMoE.load_weights to materialize meta params, then quant.
+
+    meta_specs: dict[name -> (shape, dtype, attrs)] for params swapped to meta
+    in initialize_streaming_quantload. On first call, allocate real tensors
+    on CUDA (pre-quantization BF16 storage), run the original load_weights so
+    FusedMoE.weight_loader can copy into them, then immediately quantize and
+    free the BF16 storage via process_weights_after_loading.
+    """
     import functools
+
+    target = torch.device("cuda:0") if torch.cuda.is_available() \
+        else torch.device("cpu")
 
     @functools.wraps(original_load_weights)
     def streaming_load_weights(weights):
-        # Let FusedMoE load all experts normally
-        result = original_load_weights(weights)
+        # Materialize meta params before FusedMoE loads experts into them.
+        materialized_bytes = 0
+        for name, (shape, dtype, attrs) in meta_specs.items():
+            p = layer._parameters.get(name)
+            if p is None or p.device.type != "meta":
+                continue
+            real = torch.nn.Parameter(
+                torch.empty(shape, dtype=dtype, device=target),
+                requires_grad=False,
+            )
+            for k, v in attrs.items():
+                try:
+                    setattr(real, k, v)
+                except Exception:
+                    pass
+            layer._parameters[name] = real
+            materialized_bytes += real.data.numel() * real.data.element_size()
+        if materialized_bytes:
+            logger.info(
+                "[stream-mem] %s",
+                _mem_snapshot(
+                    f"MoE materialize +{materialized_bytes // (1024*1024)} MiB "
+                    f"({layer.__class__.__name__})"),
+            )
 
-        # Then immediately quantize and free BF16
+        result = original_load_weights(weights)
+        # load_weights is a generator — drain it so the experts actually load.
+        import types
+        if isinstance(result, types.GeneratorType):
+            result = list(result)
+
         if not layer._sq_processed:
             layer._sq_processed = True
+            logger.info("[stream-mem] %s",
+                        _mem_snapshot(f"MoE pre-quant ({layer.__class__.__name__})"))
             quant_method = getattr(layer, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(layer)
-                # Move quantized params to GPU after CPU packing
                 _move_params_to_device(layer)
-                logger.debug("Streaming quant: MoE %s processed",
-                             layer.__class__.__name__)
+                logger.info("[stream-mem] %s",
+                            _mem_snapshot(f"MoE post-quant ({layer.__class__.__name__})"))
 
         return result
     return streaming_load_weights
@@ -217,30 +303,23 @@ def _make_streaming_loader(layer, param_name, original_loader,
     """Wrap a weight_loader to materialize meta params and trigger quantization."""
     import functools
 
+    target = torch.device("cuda:0") if torch.cuda.is_available() \
+        else torch.device("cpu")
+
     @functools.wraps(original_loader)
     def streaming_loader(*args, **kwargs):
-        # Materialize parameter from meta device on first load
+        # Materialize parameter data on first load — mutate .data in place
+        # so the subclass object (and its custom methods) survive.
         param = getattr(layer, param_name)
-        if param.device.type == "meta":
-            real_param = torch.nn.Parameter(
-                torch.empty(orig_shape, dtype=orig_dtype,
-                            device="cpu"),
-                requires_grad=False,
-            )
-            # Transfer attrs
-            for attr in ("input_dim", "output_dim", "packed_dim",
-                         "num_experts", "tp_size"):
-                if hasattr(param, attr):
-                    setattr(real_param, attr, getattr(param, attr))
-            real_param.weight_loader = streaming_loader
-            layer._parameters[param_name] = real_param
+        if param.data.numel() == 0 and getattr(param, "_streaming_shape", None):
+            param.data = torch.empty(orig_shape, dtype=orig_dtype,
+                                     device=target)
 
-        # Call original loader (copies weight data into parameter)
-        # Update args to use the materialized parameter
+        # Update args to use the (now-materialized) parameter
         if len(args) > 0 and hasattr(args[0], "device"):
-            args = (getattr(layer, param_name),) + args[1:]
+            args = (param,) + args[1:]
         elif "param" in kwargs:
-            kwargs["param"] = getattr(layer, param_name)
+            kwargs["param"] = param
         ret = original_loader(*args, **kwargs)
 
         # Track how many elements have been loaded for this layer
@@ -255,15 +334,41 @@ def _make_streaming_loader(layer, param_name, original_loader,
             layer._sq_processed = True
             quant_method = getattr(layer, "quant_method", None)
             if quant_method is not None:
+                # Count + log every N-th layer to avoid log spam but still
+                # give a per-layer memory trace — critical for validating
+                # that streaming actually frees BF16 as we advance.
+                import gc as _gc
+                cls_counter = _mem_stream_counters
+                key = layer.__class__.__name__
+                cls_counter[key] = cls_counter.get(key, 0) + 1
+                n = cls_counter[key]
+                log_this = (n <= 3 or n % 20 == 0)
+                if log_this:
+                    logger.info("[stream-mem] %s",
+                                _mem_snapshot(
+                                    f"pre-quant {key} #{n} "
+                                    f"({layer._sq_load_total} params)"))
                 quant_method.process_weights_after_loading(layer)
                 _move_params_to_device(layer)
-                logger.debug(
-                    "Streaming quant: processed %s (%d params)",
-                    layer.__class__.__name__, layer._sq_load_total,
-                )
+                _gc.collect()
+                # Release caching-allocator blocks so reserved ~= allocated.
+                # Critical for UMA devices (GB10) where reserved-but-unused
+                # pool still counts against the system MemUsed budget.
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                if log_this:
+                    logger.info("[stream-mem] %s",
+                                _mem_snapshot(f"post-quant {key} #{n}"))
 
         return ret
     return streaming_loader
+
+
+_mem_stream_counters: dict[str, int] = {}
 
 
 def process_weights_after_loading(

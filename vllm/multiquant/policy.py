@@ -654,7 +654,7 @@ def create_weight_method(
 
     # Debug: log FusedMoE dispatch
     if FusedMoE is not None and isinstance(layer, FusedMoE):
-        logger.info(
+        logger.debug(
             "create_weight_method: FusedMoE prefix='%s' -> type='%s' dtype='%s'",
             prefix, layer_type, dtype,
         )
