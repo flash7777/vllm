@@ -63,11 +63,20 @@ class AutoRoundRTNMoEMethod(FusedMoEMethodBase):
             UnquantizedFusedMoEMethod,
         )
         self._unquant = UnquantizedFusedMoEMethod(self.moe)
-        self._unquant.create_weights(
-            layer, num_experts, hidden_size,
-            intermediate_size_per_partition, params_dtype,
-            **extra_weight_attrs,
-        )
+        from vllm.model_executor.model_loader.utils import _moe_meta_active
+        if _moe_meta_active():
+            with torch.device("meta"):
+                self._unquant.create_weights(
+                    layer, num_experts, hidden_size,
+                    intermediate_size_per_partition, params_dtype,
+                    **extra_weight_attrs,
+                )
+        else:
+            self._unquant.create_weights(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
+                **extra_weight_attrs,
+            )
         # Store dimensions for later packing
         layer._rtn_moe_hidden = hidden_size
         layer._rtn_moe_intermediate = intermediate_size_per_partition

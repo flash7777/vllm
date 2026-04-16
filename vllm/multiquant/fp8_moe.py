@@ -60,11 +60,20 @@ class FP8MoEMethod(FusedMoEMethodBase):
             UnquantizedFusedMoEMethod,
         )
         self._unquant = UnquantizedFusedMoEMethod(self.moe)
-        self._unquant.create_weights(
-            layer, num_experts, hidden_size,
-            intermediate_size_per_partition, params_dtype,
-            **extra_weight_attrs,
-        )
+        from vllm.model_executor.model_loader.utils import _moe_meta_active
+        if _moe_meta_active():
+            with torch.device("meta"):
+                self._unquant.create_weights(
+                    layer, num_experts, hidden_size,
+                    intermediate_size_per_partition, params_dtype,
+                    **extra_weight_attrs,
+                )
+        else:
+            self._unquant.create_weights(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
+                **extra_weight_attrs,
+            )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Cast w13/w2 bf16 → fp8_e4m3fn + per-tensor scale, then dequant cached."""

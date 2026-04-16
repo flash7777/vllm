@@ -118,6 +118,11 @@ def _xfp_outlier_scatter_impl(
     outlier_val: torch.Tensor,   # [n_outliers] fp16 weight values
 ) -> torch.Tensor:
     """Real impl: base_out[:, row] += x[:, col] * val."""
+    # Layers without outliers pass zero-size index tensors. CUDA's
+    # index_select rejects those with "invalid argument" on some kernels,
+    # and scatter_add is a no-op anyway.
+    if outlier_col.numel() == 0:
+        return base_out
     x_cast = x.to(base_out.dtype)
     x_cols = x_cast.index_select(1, outlier_col)   # [M, n_outliers]
     contrib = x_cols * outlier_val.to(base_out.dtype)

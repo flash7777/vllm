@@ -10,6 +10,8 @@ COPY vllm/multiquant/policy.py /usr/local/lib/python3.12/dist-packages/vllm/mult
 COPY vllm/multiquant/autoround/config.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/config.py
 COPY vllm/multiquant/fp8_embedding.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_embedding.py
 COPY vllm/multiquant/fp8_linear.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_linear.py
+COPY vllm/multiquant/fp8_moe.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_moe.py
+COPY vllm/multiquant/autoround/online_moe.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/online_moe.py
 COPY vllm/engine/arg_utils.py /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
 
 # GPU model runner (XFP summary trigger)
@@ -18,6 +20,8 @@ COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python3.12/dist-packages/
 # Streaming quant-on-load (per-layer quantization during weight loading)
 COPY vllm/model_executor/model_loader/base_loader.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py
 COPY vllm/model_executor/model_loader/utils.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py
+COPY vllm/model_executor/model_loader/weight_utils.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py
+COPY vllm/model_executor/model_loader/default_loader.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/default_loader.py
 
 # CUDA Kernel Source (für JIT-Kompilierung)
 COPY kernels/multiquant/ /opt/mq_kernels/

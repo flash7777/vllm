@@ -97,6 +97,12 @@ def classify_layer(prefix: str) -> str:
     'dense_mlp', 'deltanet', or 'other'.
     """
     p = prefix.lower()
+    # Vision / ViT encoders in multimodal models — skip quantization.
+    # XFP kernels are tuned for LLM shapes; ViT shapes (small patch count,
+    # different head layout) trigger CUDA invalid-argument errors.
+    if "visual." in p or "vision." in p or "vit." in p or p.startswith("visual") \
+            or p.startswith("vision") or p.startswith("vit"):
+        return "other"
     # LM Head (output projection to vocab — typically the largest single layer)
     if "lm_head" in p or (("output" in p or "head" in p) and "embed" not in p
                           and "attn" not in p and "expert" not in p):
@@ -649,6 +655,12 @@ def create_weight_method(
         return None
 
     layer_type = classify_layer(prefix)
+    # Layers classified as "other" (e.g. ViT/vision encoders) are passed
+    # through unquantized — their shapes aren't covered by our kernels.
+    if layer_type == "other":
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
     policy = reg.get_weight_policy(layer_type)
     dtype = policy.dtype
 

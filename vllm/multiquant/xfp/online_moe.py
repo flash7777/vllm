@@ -174,11 +174,23 @@ class XFPMoEMethod(FusedMoEMethodBase):
             UnquantizedFusedMoEMethod,
         )
         self._unquant = UnquantizedFusedMoEMethod(self.moe)
-        self._unquant.create_weights(
-            layer, num_experts, hidden_size,
-            intermediate_size_per_partition, params_dtype,
-            **extra_weight_attrs,
-        )
+        # When the base_loader has flagged streaming quant-on-load, allocate
+        # the huge expert tensors on meta. initialize_streaming_quantload()
+        # will materialize them on CUDA right before the loader touches them.
+        from vllm.model_executor.model_loader.utils import _moe_meta_active
+        if _moe_meta_active():
+            with torch.device("meta"):
+                self._unquant.create_weights(
+                    layer, num_experts, hidden_size,
+                    intermediate_size_per_partition, params_dtype,
+                    **extra_weight_attrs,
+                )
+        else:
+            self._unquant.create_weights(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
+                **extra_weight_attrs,
+            )
         layer._xfp_moe_hidden = hidden_size
         layer._xfp_moe_intermediate = intermediate_size_per_partition
 
@@ -228,47 +240,48 @@ class XFPMoEMethod(FusedMoEMethodBase):
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
 
-        def _batched_pack_and_repack(W_stack: torch.Tensor):
-            """W_stack: [E, N, K] -> flat packed [E*flat], flat codebook [E*N*lut].
+        def _expertwise_pack_and_repack(W_stack: torch.Tensor):
+            """W_stack: [E, N, K] -> flat packed [E*fpe], flat codebook [E*N*lut].
 
-            Memory-conscious: deletes intermediates immediately.
+            Packs one expert at a time: float32 transient = N×K×4 bytes
+            (~25 MiB) instead of E×N×K×4 (~9 GiB). Critical for 122B+
+            models on unified memory.
             """
             E_ = int(W_stack.shape[0])
             N_ = int(W_stack.shape[1])
             K_ = int(W_stack.shape[2])
-            W_flat = W_stack.reshape(E_ * N_, K_).float()
-            del W_stack
-            packed_flat, codebook_flat, _, _, stats = xfp_pack(
-                W_flat, bits=bits, outlier_sigma=None,
-                lloyd_iters=moe_lloyd_iters,
-            )
-            del W_flat  # free float32 copy
-            k_packed = packed_flat.shape[0]
-            packed = packed_flat.view(k_packed, E_, N_).permute(1, 0, 2).contiguous()
-            del packed_flat
             lut_size = 1 << bits
-            codebook = codebook_flat.view(E_, N_, lut_size)
 
-            # Repack each expert and concatenate flat
             repacked_list = []
+            codebook_list = []
+            last_stats = None
+
             for e in range(E_):
-                repacked_list.append(xfp_repack(packed[e]))
-            del packed
+                W_e = W_stack[e].float()          # [N, K] float32, ~25 MiB
+                packed_e, cb_e, _, _, stats_e = xfp_pack(
+                    W_e, bits=bits, outlier_sigma=None,
+                    lloyd_iters=moe_lloyd_iters,
+                )
+                del W_e
+                repacked_list.append(xfp_repack(packed_e))
+                codebook_list.append(cb_e)        # [N, lut_size]
+                del packed_e
+                last_stats = stats_e
+
+            del W_stack
             flat_per_expert = repacked_list[0].numel()
             all_repacked = torch.cat(repacked_list, dim=0)
             del repacked_list
-            all_codebook = codebook.reshape(-1)
-            del codebook
+            all_codebook = torch.cat(codebook_list, dim=0)
+            del codebook_list
 
-            return all_repacked, all_codebook, flat_per_expert, stats
+            return all_repacked, all_codebook, flat_per_expert, last_stats
 
         # Pack w13, then free BF16 w13 before packing w2
-        p13, cb13, fpe13, stats13 = _batched_pack_and_repack(w13.clone())
-        del w13
+        p13, cb13, fpe13, stats13 = _expertwise_pack_and_repack(w13)
         layer.w13_weight.data = torch.empty(0)  # free BF16
 
-        p2, cb2, fpe2, stats2 = _batched_pack_and_repack(w2.clone())
-        del w2
+        p2, cb2, fpe2, stats2 = _expertwise_pack_and_repack(w2)
         layer.w2_weight.data = torch.empty(0)  # free BF16
 
         if reg is not None:
