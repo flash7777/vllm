@@ -30,15 +30,15 @@ COPY kernels/multiquant/ /opt/mq_kernels/
 RUN python3 -c "\
 import sys; sys.path.insert(0, '/usr/local/lib/python3.12/dist-packages'); \
 from torch.utils.cpp_extension import load; \
-k = load(name='xfp_gemm', sources=['/opt/mq_kernels/xfp_gemm_v8.cu'], \
+k = load(name='xfp_gemm_v11', sources=['/opt/mq_kernels/xfp_gemm_v11.cu'], \
     extra_cuda_cflags=['-O3', '-std=c++17', '--use_fast_math', \
         '-gencode=arch=compute_120,code=sm_120', \
         '-gencode=arch=compute_121,code=sm_121', \
         '-diag-suppress=177,3288'], verbose=True); \
-print('XFP v8 bf16 kernel compiled:', k); \
-k2 = load(name='xfp_moe_gemm', sources=['/opt/mq_kernels/xfp_moe_gemm.cu'], \
+print('XFP v11 template kernel compiled:', k); \
+k2 = load(name='xfp_moe_gemm_v11', sources=['/opt/mq_kernels/xfp_moe_gemm_v11.cu'], \
     extra_cuda_cflags=['-O3', '-std=c++17', '--use_fast_math', \
         '-gencode=arch=compute_120,code=sm_120', \
         '-gencode=arch=compute_121,code=sm_121', \
         '-diag-suppress=177,3288'], verbose=True); \
-print('XFP MoE fused kernel compiled:', k2)"
+print('XFP MoE v11 template kernel compiled:', k2)"

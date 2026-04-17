@@ -30,11 +30,24 @@ def _resolve_kernel_dir() -> Optional[str]:
         os.path.join(here, "..", "..", "..", "kernels", "multiquant")
     )
     # Prefer newest kernel version, fall back to older
-    for name in ("xfp_gemm_v8.cu", "xfp_gemm_v8.cu", "xfp_gemm.cu"):
+    force = os.environ.get("XFP_KERNEL", "")
+    if force == "v8":
+        preferred = ("xfp_gemm_v8.cu", "xfp_gemm.cu")
+    elif force == "v9":
+        preferred = ("xfp_gemm_v9.cu",)
+    elif force == "v10":
+        preferred = ("xfp_gemm_v10.cu",)
+    else:
+        # v11 template wrapper is the default — identical algorithm to v10,
+        # but the inner loop lives in xfp_gemm_core.cuh and is shared with
+        # the MoE kernel. Future optimisations touch only the core header.
+        preferred = ("xfp_gemm_v11.cu", "xfp_gemm_v10.cu",
+                     "xfp_gemm_v8.cu", "xfp_gemm.cu")
+    for name in preferred:
         if os.path.exists(os.path.join(src_dir, name)):
             return src_dir
     fallback = "/opt/mq_kernels"
-    for name in ("xfp_gemm_v8.cu", "xfp_gemm_v8.cu", "xfp_gemm.cu"):
+    for name in preferred:
         if os.path.exists(os.path.join(fallback, name)):
             return fallback
     return None
@@ -51,7 +64,17 @@ _load_attempted = False
 def _find_kernel_cu() -> Optional[str]:
     if _KERNEL_SRC_DIR is None:
         return None
-    for name in ("xfp_gemm_v8.cu", "xfp_gemm_v8.cu", "xfp_gemm.cu"):
+    force = os.environ.get("XFP_KERNEL", "")
+    if force == "v8":
+        names = ("xfp_gemm_v8.cu", "xfp_gemm.cu")
+    elif force == "v9":
+        names = ("xfp_gemm_v9.cu",)
+    elif force == "v10":
+        names = ("xfp_gemm_v10.cu",)
+    else:
+        names = ("xfp_gemm_v11.cu", "xfp_gemm_v10.cu",
+                 "xfp_gemm_v8.cu", "xfp_gemm.cu")
+    for name in names:
         p = os.path.join(_KERNEL_SRC_DIR, name)
         if os.path.exists(p):
             return p
@@ -94,8 +117,17 @@ def _load_xfp_gemm(bits: int):
 
     try:
         from torch.utils.cpp_extension import load
+        # Determine kernel name from source file
+        if _KERNEL_CU_PATH and "v11" in _KERNEL_CU_PATH:
+            kname = "xfp_gemm_v11"
+        elif _KERNEL_CU_PATH and "v10" in _KERNEL_CU_PATH:
+            kname = "xfp_gemm_v10"
+        elif _KERNEL_CU_PATH and "v9" in _KERNEL_CU_PATH:
+            kname = "xfp_gemm_v9"
+        else:
+            kname = "xfp_gemm"
         _xfp_gemm_kernel = load(
-            name="xfp_gemm",
+            name=kname,
             sources=[_KERNEL_CU_PATH],
             extra_cuda_cflags=[
                 "-O3",
@@ -107,8 +139,8 @@ def _load_xfp_gemm(bits: int):
             ],
             verbose=False,
         )
-        logger.info("XFP fused GEMM CUDA kernel compiled and loaded from %s",
-                    _KERNEL_SRC_DIR)
+        logger.info("XFP GEMM kernel compiled (%s) from %s",
+                    kname, _KERNEL_SRC_DIR)
         return _xfp_gemm_kernel
     except Exception as e:
         logger.warning("XFP kernel JIT compile FAILED: %s", e)

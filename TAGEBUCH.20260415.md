@@ -230,8 +230,115 @@ System Avail       39.2 GiB  ← nie unter 35 GiB gefallen!
 
 **Application startup complete** ✓ nach ~30 Minuten (47 MoE × 256 Experts × Lloyd + 120 Linear xfp3).
 
+## Qwen 122B Bench-Ergebnis (v8 Kernel, fp8 KV, XFP auto)
+
+| Metric | Wert |
+|---|---|
+| short  | 6.8 tok/s |
+| medium | 16.3 tok/s |
+| long   | 15.2 tok/s |
+| **Math** | **49/50 (98%)** |
+
+Einziger Fehler: 469-613=-144, Modell gab 144 (Vorzeichenfehler, modell-inherent).
+**98% Math bei 3.2 eff. bits/param** — XFP-Qualität exzellent.
+
+## XFP Kernel v9 → v10 Entwicklung
+
+### v9 (A-in-SMEM + fused outlier): GESCHEITERT
+- Compiled OK, aber hing beim ersten Forward-Pass (EngineCore 101% CPU, kein Log)
+- Vermutete Ursache: Bug im Outlier-Loop oder SMEM-Alignment
+- v9 als opt-in (`XFP_USE_V9=1`) geparkt
+
+### v10 (SHFL.IDX Codebook Lookup): DER GAME CHANGER
+
+Statt SMEM-basiertem Codebook-Lookup (~28 Cycle Latenz):
+```cuda
+// v8: SMEM
+acc = fmaf(my_cb[idx0], a0, acc);  // SMEM read ~28 cycles
+
+// v10: Warp Shuffle
+float w0 = __shfl_sync(0xffffffff, my_cb_val, idx0);  // 1 cycle!
+acc = fmaf(w0, a0, acc);
+```
+
+Jeder Lane hält einen Codebook-Eintrag als Register. Lookup via Warp-Shuffle:
+- XFP4 (16 entries): Lanes 0–15
+- XFP3 (8 entries): Lanes 0–7
+- XFP2 (4 entries): Lanes 0–3
+
+**Kein SMEM, kein __syncthreads, keine Bank-Konflikte. Pure Register-Path.**
+
+Gleiche C++-Signatur wie v8 (`xfp_gemm(A, B_packed, codebook, C, bits, K)`)
+→ Python-Side zero changes nötig.
+
+Geschätzt +30–50% Kernel-Speedup. GLM v8 baseline 32.7 tok/s → erwartet 42–49.
+
+### ISA-Basis (aus Blackwell SM12x Instruktions-Analyse)
+
+| Codebook-Größe | Empfehlung |
+|---|---|
+| ≤ 8 Einträge (XFP2/3) | PRMT kaskadiert (4 Lookups/Instruktion) |
+| 16 Einträge (XFP4) | **SHFL.IDX** (1 Cycle, Register-to-Register) |
+| 32 Einträge (XFP5) | SHFL.IDX (exakt 32 Lanes = Warp-Size) |
+
+Gleiche SHFL-Tricks anwendbar auf TQ-WHT KV-Cache Decode:
+- WHT-Butterfly: 5× SHFL.XOR statt SMEM
+- Centroid-Lookup: PRMT (2/3-bit) oder SHFL.IDX (4-bit)
+
+## v10 Bench-Ergebnisse (eager vs CUDA Graphs)
+
+### GLM-4.7-Flash (XFP + fp8 KV + fp8 LM-Head)
+
+| Modus | short | medium | long | Math |
+|---|---|---|---|---|
+| v8 eager | — | — | 32.7 | 66% |
+| **v10 SHFL eager** | 26.6 | 30.5 | 32.3 | 52% |
+| **v10 SHFL + CUDA Graphs** | **47.5** | **57.0** | **56.0** | 52% |
+| Marlin INT4 (Referenz) | — | — | 55.6 | ~78% |
+
+**CUDA Graphs = Game-Changer, nicht v10 SHFL.** SMEM-Codebook-Latenz war schon durch
+Warp-Occupancy versteckt. Launch-Overhead der 327 Kernel-Calls war der Bottleneck,
+nicht Codebook-Lookup. XFP holt Marlin INT4 ein mit CUDA Graphs.
+
+### Qwen 122B-A10B (XFP + fp8 KV + fp8 LM-Head)
+
+| Modus | short | medium | long | Math |
+|---|---|---|---|---|
+| **v10 + CUDA Graphs** | 7.0 | 17.2 | 16.0 | 98% |
+| INT4 AutoRound (baseline) | — | — | 29 | — |
+| INT4 + FP8 LM head | — | — | 35 | — |
+| INT4 + FP8 LM head + MTP nst=1..5 | — | — | 50 | — |
+
+**Nur +5% durch CUDA Graphs bei 122B** — Bandwidth-bound auf 70 GiB Weights
+(große Layer-Dimensionen, Launch-Overhead relativ klein). Gap zu INT4 bleibt
+55% von Baseline.
+
+## v11 Kernel-Entwicklung gestartet
+
+### MMA Tensor-Core Validierung (Phase A)
+
+**Step 1: MMA Skeleton** — `mma.m16n8k16.bf16.bf16.f32` mit BF16-Direct-Load.
+- Test `test_mma_skeleton.py`: **5/5 PASS** für K ∈ {16, 32, 64, 128, 512}
+- A-Fragment-Layout: 4 Frags × 2 bf16/thread (8 bf16/lane)
+- B-Fragment-Layout: 2 Frags × 2 bf16/thread (4 bf16/lane)
+- cos > 0.999, relerr < 0.02 vs torch.matmul
+
+**Step 2: MMA + XFP-decoded B-Tile** — SMEM-basierter Codebook-Lookup
+- SHFL mit `cb_reg[variable_n_col]` fehlschlägt: Compiler spillt Array nach
+  Local Memory wenn dynamisch indiziert → `__shfl_sync` liest falsche Lane.
+- Fix: Codebook in SMEM (8 cols × 16 entries × 4 bytes = 512 B, trivial)
+- Test `test_xfp_mma_single.py`: **5/5 PASS** für K ∈ {16, 32, 64, 256, 2048}
+- cos > 0.9999 vs `xfp_gemm_v8` Referenz
+
+**Wichtige Lektion:** ldmatrix noch nicht integriert — B-Tile wird direkt aus
+SMEM in MMA-Layout geladen (langsamer aber einfacher). Nächster Schritt:
+ldmatrix für bank-conflict-free Load.
+
 ## Offen / Nächste Schritte
-- bench.py Qwen 122B für tok/s + Math-Score
-- FP8 vs XFP Vergleich
-- XFPEmbeddingMethod falls LM-Head auch XFP werden soll
-- tq4w KV-Cache Kernel für D=256 mse_bits=4 im base-Image updaten
+- Phase A Step 3: Multi-M (M=32,64,128) + Multi-N-Tile
+- Phase B: MoE-Routing (sorted_token_ids, expert_ids)
+- Phase C: cp.async + ldmatrix
+- Phase D: Outlier-Fusion Linear v11
+- TQ-WHT SHFL-Optimierung (KV-Cache Decode) — wenn v11 stabil
+- tq4w D=256 Kernel im Base-Image fixen
+- ngram MTP für XFP (nst=3, prompt_lookup) — bench aktuell laufend

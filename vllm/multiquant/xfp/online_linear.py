@@ -69,7 +69,17 @@ def _xfp_apply_impl(
     cb_fp16 = codebook.to(torch.float16) if codebook.dtype != torch.float16 else codebook
     C = torch.zeros(x_bf16.shape[0], N_out,
                     dtype=torch.bfloat16, device=x.device)
-    kernel.xfp_gemm(x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K))
+    # v9 kernel has fused outlier scatter — detected by method name
+    if hasattr(kernel, "xfp_gemm_v9"):
+        # Will be called with outliers from _xfp_apply_fused_impl
+        kernel.xfp_gemm_v9(
+            x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K),
+            torch.empty(0, dtype=torch.int64, device=x.device),
+            torch.empty(0, dtype=torch.int64, device=x.device),
+            torch.empty(0, dtype=torch.bfloat16, device=x.device),
+        )
+    else:
+        kernel.xfp_gemm(x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K))
     return C
 
 
@@ -332,32 +342,56 @@ class XFPLinearMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        # Dispatch through the registered custom op so torch.compile
-        # sees a traceable operator instead of a pybind11 extension call.
-        # Use layer._xfp_bits (the actually chosen bits, which may differ
-        # from self.bits when auto-select picked a per-layer width).
-        C = _xfp_op(
-            reshaped_x,
-            layer.xfp_packed,
-            layer.xfp_codebook,
-            int(layer._xfp_bits),
-            int(layer._xfp_K),
-            int(layer._xfp_N),
-        )
 
-        # Outlier correction (v3): add the sparse residual contribution
-        #   Y[:, row] += X[:, col] * val
-        # via a registered custom op so torch.compile sees it as an opaque
-        # boundary instead of specializing the graph on the per-layer
-        # outlier count (which would cause one recompile per Linear layer).
-        if getattr(layer, "_xfp_has_outliers", False):
-            C = _xfp_outlier_op(
+        # v9 kernel: GEMM + outlier scatter in a single kernel launch.
+        # A_row is loaded into SMEM once (shared across warps), outlier
+        # accumulation happens inline — no separate kernel or x re-read.
+        # Set XFP_USE_V9=1 to enable (disabled by default until validated).
+        import os as _os
+        from vllm.multiquant.xfp import xfp_kernel as _xk
+        kernel = _xk._xfp_gemm_kernel
+        use_v9 = _os.environ.get("XFP_USE_V9", "0") == "1"
+        if use_v9 and kernel is not None and hasattr(kernel, "xfp_gemm_v9"):
+            x_bf16 = reshaped_x.to(torch.bfloat16).contiguous() \
+                if reshaped_x.dtype != torch.bfloat16 else reshaped_x.contiguous()
+            cb_fp16 = layer.xfp_codebook.to(torch.float16) \
+                if layer.xfp_codebook.dtype != torch.float16 \
+                else layer.xfp_codebook
+            C = torch.zeros(x_bf16.shape[0], layer._xfp_N,
+                            dtype=torch.bfloat16, device=x.device)
+            has_out = getattr(layer, "_xfp_has_outliers", False)
+            kernel.xfp_gemm_v9(
+                x_bf16,
+                layer.xfp_packed.reshape(-1),
+                cb_fp16,
                 C,
-                reshaped_x,
-                layer.xfp_outlier_row,
-                layer.xfp_outlier_col,
-                layer.xfp_outlier_val,
+                int(layer._xfp_bits),
+                int(layer._xfp_K),
+                layer.xfp_outlier_row if has_out else torch.empty(
+                    0, dtype=torch.int64, device=x.device),
+                layer.xfp_outlier_col if has_out else torch.empty(
+                    0, dtype=torch.int64, device=x.device),
+                layer.xfp_outlier_val if has_out else torch.empty(
+                    0, dtype=torch.bfloat16, device=x.device),
             )
+        else:
+            # v8 fallback: separate GEMM + outlier scatter
+            C = _xfp_op(
+                reshaped_x,
+                layer.xfp_packed,
+                layer.xfp_codebook,
+                int(layer._xfp_bits),
+                int(layer._xfp_K),
+                int(layer._xfp_N),
+            )
+            if getattr(layer, "_xfp_has_outliers", False):
+                C = _xfp_outlier_op(
+                    C,
+                    reshaped_x,
+                    layer.xfp_outlier_row,
+                    layer.xfp_outlier_col,
+                    layer.xfp_outlier_val,
+                )
 
         if bias is not None:
             C = C + bias.to(C.dtype)
