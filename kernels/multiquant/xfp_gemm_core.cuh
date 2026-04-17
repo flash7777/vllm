@@ -52,12 +52,45 @@ __device__ __forceinline__ void xfp_gemm_core(
     int warp_id = threadIdx.x / XFP_WARP_SIZE;
     int lane    = threadIdx.x % XFP_WARP_SIZE;
 
+#ifdef XFP_CORE_USE_SMEM_A
+    // ── v12: block-uniform A-row resolution + cooperative SMEM load ──
+    // block_A_row() must return nullptr iff the WHOLE block is inactive
+    // (MoE padding expert/token, Linear m-out-of-range). If non-null,
+    // every thread in the block participates in the cooperative load.
+    const __nv_bfloat16* block_A = Policy::block_A_row(A, K, params);
+    if (block_A == nullptr) return;  // all threads exit together → safe
+
+    // Static SMEM — compile-time size per Policy. No dynamic smem launch.
+    __shared__ __nv_bfloat16 s_A[Policy::K_SMEM_MAX];
+
+    // Vectorized bf162 cooperative copy. K must be even (asserted host-side).
+    {
+        int pair_count = K >> 1;
+        const __nv_bfloat162* __restrict__ src2 =
+            reinterpret_cast<const __nv_bfloat162*>(block_A);
+        __nv_bfloat162* dst2 =
+            reinterpret_cast<__nv_bfloat162*>(s_A);
+        #pragma unroll 4
+        for (int i = threadIdx.x; i < pair_count; i += XFP_BLOCK_SIZE) {
+            dst2[i] = src2[i];
+        }
+    }
+    __syncthreads();
+#endif
+
     // Policy resolves all per-block/per-warp metadata: output column n,
     // A_row pointer, per-expert B_packed pointer, per-expert codebook
     // slice pointer, and any routing info for the epilogue.
     auto ctx = Policy::template prologue<BITS, LUT_SIZE>(
         A, B_packed_base, codebook_base, N, K, warp_id, lane, params);
     if (!ctx.active) return;
+
+    // A-source pointer: SMEM (v12) or per-warp global (v11).
+#ifdef XFP_CORE_USE_SMEM_A
+    const __nv_bfloat16* __restrict__ A_src = s_A;
+#else
+    const __nv_bfloat16* __restrict__ A_src = ctx.A_row;
+#endif
 
     // ── Codebook in register, SHFL lookup (same as v10) ──
     float my_cb_val = (lane < LUT_SIZE)
@@ -116,7 +149,7 @@ __device__ __forceinline__ void xfp_gemm_core(
             float w = __shfl_sync(0xffffffff, my_cb_val, idx);
             int k = k_base + slot;
             if (k < K && kw < K_packed) {
-                float a = __bfloat162float(ctx.A_row[k]);
+                float a = __bfloat162float(A_src[k]);
                 acc = fmaf(w, a, acc);
             }
         }
@@ -146,7 +179,7 @@ __device__ __forceinline__ void xfp_gemm_core(
         #pragma unroll
         for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
             __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(
-                ctx.A_row + k_base + slot);
+                A_src + k_base + slot);
             float a0 = __bfloat162float(__low2bfloat16(a2));
             float a1 = __bfloat162float(__high2bfloat16(a2));
             int idx0 = (int)((packed >> (slot * BITS)) & MASK);
@@ -171,7 +204,7 @@ __device__ __forceinline__ void xfp_gemm_core(
             float w = __shfl_sync(0xffffffff, my_cb_val, idx);
             int k = k_base + slot;
             if (k < K && kw < K_packed) {
-                float a = __bfloat162float(ctx.A_row[k]);
+                float a = __bfloat162float(A_src[k]);
                 acc = fmaf(w, a, acc);
             }
         }
@@ -195,6 +228,11 @@ __device__ __forceinline__ void xfp_gemm_core(
 // Each warp produces one output C[m, n_warp]. No routing, no scaling.
 
 struct LinearPolicy {
+    // Rigid compile-time SMEM budget for v12 A-row cache.
+    // Covers FFN gate/up/down and attn q/k/v up to model-dim 8192.
+    // Shapes with K > 8192 (e.g. attn kv_b 17408) must use v11.
+    static constexpr int K_SMEM_MAX = 8192;
+
     struct Params {
         int M;
     };
@@ -207,6 +245,15 @@ struct LinearPolicy {
         const uint32_t*      B_packed;
         const half*          codebook_slice;
     };
+
+    // Block-uniform A-row pointer. Returns nullptr iff whole block is
+    // inactive (m out of range). Called BEFORE __syncthreads in v12.
+    __device__ static const __nv_bfloat16* block_A_row(
+        const __nv_bfloat16* A, int K, const Params& p)
+    {
+        int m = blockIdx.y;
+        return (m < p.M) ? (A + (size_t)m * K) : nullptr;
+    }
 
     template <int BITS, int LUT>
     __device__ static Ctx prologue(
@@ -243,6 +290,10 @@ struct LinearPolicy {
 // Each block owns one (token, expert) pair; warp produces C[token_id, n].
 
 struct MoEPolicy {
+    // Rigid compile-time SMEM budget for v12 A-row cache.
+    // Covers Qwen/GLM MoE shapes (K=2048 max) with 2× headroom.
+    static constexpr int K_SMEM_MAX = 4096;
+
     struct Params {
         const int32_t* sorted_token_ids;   // [num_tokens_padded]
         const int32_t* expert_ids;         // [num_token_blocks]
@@ -262,6 +313,22 @@ struct MoEPolicy {
         const half*          codebook_slice;
         const float*         topk_weights;
     };
+
+    // Block-uniform A-row pointer. Returns nullptr iff the whole block is
+    // inactive (padding expert, padding token, or orig_token out of M).
+    // All warps of a MoE block share the same orig_token, so this is safe.
+    __device__ static const __nv_bfloat16* block_A_row(
+        const __nv_bfloat16* A, int K, const Params& p)
+    {
+        int tb = blockIdx.y;
+        int expert_id = p.expert_ids[tb];
+        if (expert_id < 0) return nullptr;
+        int token_id = p.sorted_token_ids[tb];
+        if (token_id >= p.num_valid_tokens) return nullptr;
+        int orig = token_id / p.top_k;
+        if (orig >= p.M) return nullptr;
+        return A + (size_t)orig * K;
+    }
 
     template <int BITS, int LUT>
     __device__ static Ctx prologue(

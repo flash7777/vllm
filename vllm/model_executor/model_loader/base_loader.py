@@ -87,6 +87,11 @@ class BaseModelLoader(ABC):
                 # per-layer quant trigger.
                 self._streaming_quant_active = True
 
+                # Initialize the MultiQuant disk cache if enabled. Each
+                # quant method (XFP, Archer/TQ/RQ, AutoRound RTN, …) reads
+                # from / writes to it in their process_weights_after_loading.
+                _initialize_multiquant_cache(vllm_config, model_config)
+
             # Quantization does not happen in `load_weights` but after it
             # (unless streaming quant-on-load processes it per-layer)
             self.load_weights(model, model_config)
@@ -103,6 +108,10 @@ class BaseModelLoader(ABC):
 
             process_weights_after_loading(model, model_config, target_device)
 
+            # Finalize cache (write manifest + log summary) after all
+            # per-layer process_weights_after_loading calls have fired.
+            _finalize_multiquant_cache()
+
         return model.eval()
 
 
@@ -114,3 +123,78 @@ def log_model_inspection(model: nn.Module) -> None:
     from vllm.model_inspection import format_model_inspection
 
     logger.info("vLLM model structure:\n%s", format_model_inspection(model))
+
+
+def _initialize_multiquant_cache(
+    vllm_config: VllmConfig, model_config: ModelConfig,
+) -> None:
+    """Set up the MultiQuant weight cache as a singleton for this process.
+
+    Silently no-ops when ``MULTIQUANT_CACHE_DIR`` (or legacy
+    ``XFP_CACHE_DIR``) is unset — the common case. Any hard failure
+    (unreadable model path, bad env) is logged and swallowed: a broken
+    cache must never prevent model loading.
+    """
+    try:
+        from vllm.multiquant.policy import MultiQuantPolicyRegistry
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+    except ImportError:
+        return
+
+    registry = MultiQuantPolicyRegistry.get_active()
+    model_path = getattr(model_config, "model", "") or ""
+    if not model_path:
+        return
+
+    tp_size = 1
+    ep_size = 1
+    try:
+        par = getattr(vllm_config, "parallel_config", None)
+        if par is not None:
+            tp_size = int(getattr(par, "tensor_parallel_size", 1) or 1)
+            ep_size = int(getattr(par, "expert_parallel_size", 1) or 1)
+    except Exception:
+        pass
+
+    try:
+        cache = MultiQuantWeightCache.from_env(
+            model_path=model_path,
+            registry=registry,
+            hf_config=getattr(model_config, "hf_config", None),
+            tp_size=tp_size,
+            ep_size=ep_size,
+        )
+    except Exception as e:
+        logger.warning(
+            "MultiQuant cache: init failed (%s) — running without cache",
+            e,
+        )
+        return
+
+    if cache is None:
+        return
+
+    # verify_manifest logs its own INFO/WARNING messages. False just means
+    # the cache is cold (first run); save path still runs.
+    cache.verify_manifest()
+    MultiQuantWeightCache.set_active(cache)
+
+
+def _finalize_multiquant_cache() -> None:
+    """Write manifest + summary log at the end of model load."""
+    try:
+        from vllm.multiquant.policy import MultiQuantPolicyRegistry
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+    except ImportError:
+        return
+
+    cache = MultiQuantWeightCache.get_active()
+    if cache is None:
+        return
+    try:
+        registry = MultiQuantPolicyRegistry.get_active()
+        inventory = [p.stem for p in cache.cache_dir.glob("*.safetensors")]
+        cache.write_manifest(registry, inventory)
+        cache.log_summary()
+    except Exception as e:
+        logger.warning("MultiQuant cache: finalize failed (%s)", e)

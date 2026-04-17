@@ -79,7 +79,9 @@ def _xfp_apply_impl(
             torch.empty(0, dtype=torch.bfloat16, device=x.device),
         )
     else:
-        kernel.xfp_gemm(x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K))
+        # v12 primary + v11 fallback for K > K_SMEM_MAX_LINEAR.
+        _xk.dispatch_linear_gemm(
+            x_bf16, packed.reshape(-1), cb_fp16, C, int(bits), int(K))
     return C
 
 
@@ -239,9 +241,30 @@ class XFPLinearMethod(QuantizeMethodBase):
 
         from vllm.multiquant.xfp.xfp_pack import xfp_pack
         from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+        from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
 
         W = layer.weight.data  # [N_out, K]
         device = W.device
+
+        # ─── Cache check (skip Lloyd + pack if we've done this before) ──
+        cache = MultiQuantWeightCache.get_active()
+        layer_prefix = getattr(layer, "layer_name", "") or \
+            getattr(layer, "prefix", "") or ""
+        if cache is not None and layer_prefix and xfp_cache.load_linear(
+                cache, layer_prefix, layer, device):
+            # Eagerly JIT kernel so the forward path is torch.compile safe.
+            _load_xfp_gemm(int(layer._xfp_bits))
+            logger.info(
+                "XFP %s ← cache (skip Lloyd) bits=%d K=%d N=%d",
+                layer_prefix, layer._xfp_bits,
+                layer._xfp_K, layer._xfp_N,
+            )
+            try:
+                del layer.weight
+            except AttributeError:
+                pass
+            return
 
         # Auto bit-width selection: when dtype="xfp" (bits=0), run Lloyd
         # at candidates 2/3/4 and pick the lowest that passes the cos gate.
@@ -327,6 +350,10 @@ class XFPLinearMethod(QuantizeMethodBase):
             100.0 * stats.outlier_fraction,
             stats.outlier_sigma,
         )
+
+        # Persist to disk cache (if enabled) so future loads skip Lloyd.
+        if cache is not None and layer_prefix:
+            xfp_cache.save_linear(cache, layer_prefix, layer)
 
         # Free the BF16 weight
         try:

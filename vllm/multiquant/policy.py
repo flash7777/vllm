@@ -202,6 +202,33 @@ class MultiQuantPolicyRegistry:
         """Get policy for a component class."""
         return self._policies.get(cls, QuantPolicy())
 
+    def to_dict(self) -> dict:
+        """Stable, deterministic serialization of the weight-quant state.
+
+        Used as input to the XFP weight-cache hash. Only fields that change
+        the packed/codebook bytes are included — `description`/`source` are
+        pure metadata. KV-cache entries are excluded because they only
+        affect runtime inference, not the saved weights.
+
+        Keys are sorted component names; inner dicts are sorted by key.
+        Safe to feed to ``json.dumps(..., sort_keys=True)``.
+        """
+        weight_classes = (
+            WEIGHTS_SHARED, WEIGHTS_ROUTED, WEIGHTS_ATTN,
+            WEIGHTS_DENSE, LM_HEAD, MTP, DELTANET,
+        )
+        out: dict[str, dict] = {}
+        for cls_name in sorted(weight_classes):
+            p = self._policies.get(cls_name)
+            if p is None:
+                continue
+            out[cls_name] = {
+                "dtype": p.dtype,
+                "bits": p.bits,
+                "group_size": p.group_size,
+            }
+        return out
+
     @property
     def k_cache(self) -> QuantPolicy:
         return self._policies[K_CACHE]

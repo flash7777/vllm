@@ -201,9 +201,34 @@ class XFPMoEMethod(FusedMoEMethodBase):
         from vllm.multiquant.xfp.xfp_pack import xfp_pack, xfp_repack
         from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
         from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+        from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
+
+        device = layer.w13_weight.device
+
+        # ─── Cache check (skip 256-expert Lloyd if we have it on disk) ──
+        cache = MultiQuantWeightCache.get_active()
+        layer_prefix = getattr(layer, "layer_name", "") or \
+            getattr(layer, "prefix", "") or ""
+        if cache is not None and layer_prefix and xfp_cache.load_moe(
+                cache, layer_prefix, layer, device):
+            # Kernel JIT-load still needed so forward path is graph-safe.
+            _load_xfp_gemm(int(layer._xfp_moe_bits))
+            _load_xfp_moe_gemm()
+            logger.info(
+                "XFP MoE %s ← cache (skip Lloyd) bits=%d E=%d "
+                "K13=%d N13=%d K2=%d N2=%d",
+                layer_prefix, layer._xfp_moe_bits, layer._xfp_moe_E,
+                layer._xfp_moe_K13, layer._xfp_moe_N13,
+                layer._xfp_moe_K2, layer._xfp_moe_N2,
+            )
+            try:
+                del layer.w13_weight, layer.w2_weight
+            except AttributeError:
+                pass
+            return
 
         bits = self.bits
-        device = layer.w13_weight.device
         w13 = layer.w13_weight.data  # [E, N_gate_up, K]
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
         E = int(w13.shape[0])
@@ -309,6 +334,10 @@ class XFPMoEMethod(FusedMoEMethodBase):
             del layer.w13_weight, layer.w2_weight
         except AttributeError:
             pass
+
+        # Persist to disk cache (if enabled) so future loads skip Lloyd.
+        if cache is not None and layer_prefix:
+            xfp_cache.save_moe(cache, layer_prefix, layer)
 
         logger.info(
             "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s "

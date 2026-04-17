@@ -19,17 +19,19 @@ def _find_kernel_cu() -> Optional[str]:
     src_dir = os.path.normpath(
         os.path.join(here, "..", "..", "..", "kernels", "multiquant")
     )
-    # Prefer v10 (SHFL codebook lookup, no SMEM) over legacy v8 kernel
     force = os.environ.get("XFP_MOE_KERNEL", "")
     if force == "v8":
         candidates = ("xfp_moe_gemm.cu",)
     elif force == "v10":
         candidates = ("xfp_moe_gemm_v10.cu", "xfp_moe_gemm.cu")
+    elif force == "v11":
+        candidates = ("xfp_moe_gemm_v11.cu",)
     else:
-        # v11 template wrapper is the default (same algorithm as v10 but
-        # shares the inner-loop template with the Linear kernel).
-        candidates = ("xfp_moe_gemm_v11.cu", "xfp_moe_gemm_v10.cu",
-                      "xfp_moe_gemm.cu")
+        # v12 default: static SMEM A-row cache (K_SMEM_MAX=4096 covers all
+        # Qwen/GLM MoE shapes with K=2048, 2× headroom). v11 kept as
+        # fallback if v12 not present in this build.
+        candidates = ("xfp_moe_gemm_v12.cu", "xfp_moe_gemm_v11.cu",
+                      "xfp_moe_gemm_v10.cu", "xfp_moe_gemm.cu")
     for d in [src_dir, "/opt/mq_kernels"]:
         for name in candidates:
             p = os.path.join(d, name)
@@ -58,7 +60,9 @@ def _load_xfp_moe_gemm():
     try:
         from torch.utils.cpp_extension import load
         # Module name must match the file so torch caches the right .so
-        if "v11" in _KERNEL_CU_PATH:
+        if "v12" in _KERNEL_CU_PATH:
+            mod_name = "xfp_moe_gemm_v12"
+        elif "v11" in _KERNEL_CU_PATH:
             mod_name = "xfp_moe_gemm_v11"
         elif "v10" in _KERNEL_CU_PATH:
             mod_name = "xfp_moe_gemm_v10"
@@ -77,6 +81,19 @@ def _load_xfp_moe_gemm():
         )
         logger.info("XFP MoE GEMM kernel compiled (%s) from %s",
                      mod_name, os.path.dirname(_KERNEL_CU_PATH))
+        # Be loud about whether the SMEM A-row cache is active for MoE —
+        # a silently-selected v10/v11 would explain any missing speedup.
+        force = os.environ.get("XFP_MOE_KERNEL", "")
+        if mod_name == "xfp_moe_gemm_v12":
+            logger.info(
+                "XFP MoE: v12 primary (static SMEM A-row cache, K_SMEM_MAX=4096)"
+            )
+        else:
+            logger.warning(
+                "XFP MoE: primary=%s (XFP_MOE_KERNEL=%r). v12 SMEM A-row "
+                "cache is NOT active — per-warp global A-reads in use.",
+                mod_name, force or "<auto, v12 not found>",
+            )
         return _xfp_moe_kernel
     except Exception as e:
         logger.warning("XFP MoE kernel JIT compile FAILED: %s", e)
