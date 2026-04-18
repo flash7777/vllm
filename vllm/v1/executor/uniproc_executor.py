@@ -135,6 +135,17 @@ class UniProcExecutor(Executor):
     def shutdown(self) -> None:
         if worker := self.driver_worker:
             worker.shutdown()
+        # Mirror MultiprocExecutor.shutdown: destroy the distributed env so
+        # NCCL/Gloo groups and the CUDA context tied to them can be released.
+        # Without this the UVM pages on GB10 stay pinned past ``podman stop``.
+        # Both functions are idempotent — safe when the env was never fully
+        # initialized (ExecutorWithExternalLauncher, test stubs).
+        from vllm.distributed import (
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
     @classmethod
     def supports_async_scheduling(cls) -> bool:

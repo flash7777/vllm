@@ -1005,6 +1005,36 @@ class Worker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
+        # Drop the model + KV caches so nn.Parameter storages (incl.
+        # MultiQuant layer.xfp_packed/codebook/w13_xfp_packed/...) are
+        # released now, while we're still inside the executor-shutdown
+        # window. Without this the runner keeps refs until interpreter
+        # teardown; on GB10 UMA, podman's SIGTERM grace period expires
+        # before Python finalizers run → SIGKILL → UVM pages stranded.
+        import gc
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            if hasattr(model_runner, "model"):
+                model_runner.model = None
+            for attr in ("kv_caches", "attn_metadata_builder"):
+                if hasattr(model_runner, attr):
+                    setattr(model_runner, attr, None)
+            self.model_runner = None
+
+        # Reset MultiQuant module-level kernel handles + singletons. The
+        # JIT-compiled C++ extensions they cache hold CUDA-context-bound
+        # workspaces; dropping the refs here lets empty_cache reclaim them.
+        try:
+            from vllm.multiquant import _cleanup_multiquant_globals
+            _cleanup_multiquant_globals()
+        except ImportError:
+            pass
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
