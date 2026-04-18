@@ -90,6 +90,29 @@ def _bits_for_dtype(dtype: str) -> int:
     return DTYPE_BITS.get(dtype, 16)
 
 
+# Plain tq2/tq3/tq4 are mathematically broken on GB10/Blackwell: no rotation
+# (Walsh-Hadamard) and no block-rotation (random orthogonal) means the
+# Lloyd-Max codebooks degenerate on the long-tailed KV distribution — empty
+# generations, gibberish, or catastrophic perplexity. Always use the "w"
+# (Walsh-Hadamard) or "r" (block-rotation) variant. History: confirmed on
+# Qwen 35B/122B and GLM-4.7-Flash — see TAGEBUCH.20260415.md, and the repeated
+# note in MEMORY.md. Fail fast here so the next time someone types "tq3" by
+# mistake they get an error instead of a silent 30-minute load + broken math.
+_BROKEN_KV_DTYPES = frozenset({"tq2", "tq3", "tq4"})
+
+
+def _reject_broken_kv_dtype(dtype: Optional[str]) -> None:
+    if dtype is None:
+        return
+    if dtype in _BROKEN_KV_DTYPES:
+        raise ValueError(
+            f"KV-cache dtype {dtype!r} is broken — it produces garbage output "
+            f"(no rotation → Lloyd-Max degenerates on KV tails). "
+            f"Use {dtype}w (Walsh-Hadamard) or {dtype}r (block-rotation) instead. "
+            f"See TAGEBUCH.20260415.md and MEMORY.md for context."
+        )
+
+
 def classify_layer(prefix: str) -> str:
     """Classify a layer by its parameter name prefix.
 
@@ -412,6 +435,9 @@ class MultiQuantPolicyRegistry:
             reg._components = cls.analyze_model(hf_config, model_quant_config)
 
         # 1. KV-Cache: --kv-cache-dtype sets both K and V
+        _reject_broken_kv_dtype(kv_cache_dtype)
+        _reject_broken_kv_dtype(k_dtype)
+        _reject_broken_kv_dtype(v_dtype)
         if kv_cache_dtype is not None:
             reg.set(K_CACHE, kv_cache_dtype, "cli")
             reg.set(V_CACHE, kv_cache_dtype, "cli")

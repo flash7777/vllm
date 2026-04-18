@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────
-KV_DTYPE="tq3"
+KV_DTYPE="tq3w"   # Always use Walsh-Hadamard variant; plain tq3/tq4 are math-broken.
 WEIGHTS=""               # tq3 | tq4 | rq3 | rq4 (Archer online-quant, leer=keine)
 ROUTED=""                # Per-class: int2 int3 int4 tq3 tq4 rq3 rq4 (leer=vom Modell)
 SHARED=""                # Per-class: bf16 int4 (leer=vom Modell)
@@ -31,15 +31,22 @@ SERVED_NAME="glm-4.7-flash"
 REASONING_PARSER=""
 TOOL_PARSER=""
 MAX_MODEL_LEN=32768
-# Auto-detect: GB10 Unified Memory needs lower util (nvidia-smi shows "Not Supported")
+# Auto-detect: GB10 Unified Memory needs very low util — the CUDA profiler
+# lies on UMA (reports <9 GiB free regardless of actual), so anything above
+# ~0.05 causes vLLM to reserve phantom memory and OOM during BF16 load.
+# Companion: kv_cache_memory_bytes must be set explicitly when util is tiny.
 if nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -q "N/A\|Not Supported"; then
-    GPU_MEM_UTIL=0.33   # GB10 Unified Memory (~40 GB for vLLM)
+    GPU_MEM_UTIL=0.05   # GB10 UMA: force vLLM to skip profiler, rely on KV bytes
+    KV_CACHE_MEM_DEFAULT="10G"
 else
     GPU_MEM_UTIL=0.95   # Discrete GPU (RTX, A100, etc.)
+    KV_CACHE_MEM_DEFAULT=""
 fi
-KV_CACHE_MEM=""
+KV_CACHE_MEM="$KV_CACHE_MEM_DEFAULT"
 IMAGE="localhost/vllm-multiquant"
 CONTAINER_NAME="mq-serve"
+CACHE_DIR="/data/tensordata/mq-cache"
+CACHE_READ_ONLY=false
 EXTRA_ARGS=()
 
 # ── Argparse ──────────────────────────────────────────────
@@ -66,6 +73,9 @@ while [[ $# -gt 0 ]]; do
         --port)     PORT="$2"; shift 2 ;;
         --image)    IMAGE="$2"; shift 2 ;;
         --name)     CONTAINER_NAME="$2"; shift 2 ;;
+        --cache-dir)   CACHE_DIR="$2"; shift 2 ;;
+        --no-cache)    CACHE_DIR=""; shift ;;
+        --cache-ro)    CACHE_READ_ONLY=true; shift ;;
         --eager)    EXTRA_ARGS+=("--enforce-eager"); shift ;;
         --help|-h)
             echo "Nutzung: $0 [Optionen]"
@@ -140,6 +150,9 @@ else
     QUANT_LABEL="(vom Modell)"
 fi
 
+# Global weight dtype override (xfp, xfp2, xfp3, xfp4, fp8)
+[[ -n "$WDTYPE" ]]  && QUANT_ARGS+=("--weight-dtype" "$WDTYPE")
+[[ -n "$WLMHEAD" ]] && QUANT_ARGS+=("--weight-dtype-lm-head" "$WLMHEAD")
 # Per-class weight dtype overrides
 [[ -n "$ROUTED" ]] && QUANT_ARGS+=("--weight-dtype-routed" "$ROUTED")
 [[ -n "$SHARED" ]] && QUANT_ARGS+=("--weight-dtype-shared" "$SHARED")
@@ -197,7 +210,24 @@ printf "║  TP:       %-40s ║\n" "$TP"
 printf "║  MTP:      %-40s ║\n" "$MTP_LABEL"
 printf "║  RIY:      %-40s ║\n" "$RIY_LABEL"
 printf "║  Port:     %-40s ║\n" "$PORT"
+if [[ -n "$CACHE_DIR" ]]; then
+    _cache_label="$CACHE_DIR"
+    $CACHE_READ_ONLY && _cache_label="$_cache_label (ro)"
+else
+    _cache_label="disabled"
+fi
+printf "║  Cache:    %-40s ║\n" "$_cache_label"
 printf "╚══════════════════════════════════════════════════════╝\n"
+
+# Cache env array (only set if cache is enabled)
+CACHE_ENV=()
+if [[ -n "$CACHE_DIR" ]]; then
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+    CACHE_ENV+=("-e" "MULTIQUANT_CACHE_DIR=$CACHE_DIR")
+    if $CACHE_READ_ONLY; then
+        CACHE_ENV+=("-e" "MULTIQUANT_CACHE_READ_ONLY=1")
+    fi
+fi
 echo ""
 
 # ── Prüfungen ────────────────────────────────────────────
@@ -237,6 +267,7 @@ podman run -d \
   -e FLASHINFER_DISABLE_AUTOTUNER=1 \
   -e VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
   -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  "${CACHE_ENV[@]}" \
   "${QUANT_ENV[@]}" \
   "$IMAGE" \
   vllm serve "$MODEL_PATH" \
