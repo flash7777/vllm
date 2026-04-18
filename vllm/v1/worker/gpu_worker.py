@@ -1012,14 +1012,38 @@ class Worker(WorkerBase):
         # teardown; on GB10 UMA, podman's SIGTERM grace period expires
         # before Python finalizers run → SIGKILL → UVM pages stranded.
         import gc
+        _alloc_before = 0
+        if torch.cuda.is_available():
+            try:
+                _alloc_before = torch.cuda.memory_allocated() // (1024 * 1024)
+            except Exception:
+                pass
+        logger.info("[shutdown] GPUWorker releasing model + CUDA caches "
+                    "(CUDA alloc=%d MiB)", _alloc_before)
         model_runner = getattr(self, "model_runner", None)
         if model_runner is not None:
+            # The model is wrapped (CUDAGraphWrapper / UBatchWrapper / LoRA)
+            # around the actual transformer. Set the attribute to None so
+            # the wrapper's ref count drops; GC then tears down the chain.
             if hasattr(model_runner, "model"):
                 model_runner.model = None
-            for attr in ("kv_caches", "attn_metadata_builder"):
+            # Runner-side buffers that also pin storage.
+            for attr in (
+                "kv_caches", "attn_metadata_builder",
+                "persistent_batch", "sampler", "draft_model_runner",
+            ):
                 if hasattr(model_runner, attr):
                     setattr(model_runner, attr, None)
             self.model_runner = None
+
+        # torch.compile AOT cache + Dynamo cache hold compiled Python
+        # closures that reference model Parameters — without reset they
+        # pin the very tensors we just tried to drop.
+        try:
+            import torch._dynamo as _dynamo
+            _dynamo.reset()
+        except Exception:
+            pass
 
         # Reset MultiQuant module-level kernel handles + singletons. The
         # JIT-compiled C++ extensions they cache hold CUDA-context-bound
@@ -1030,10 +1054,21 @@ class Worker(WorkerBase):
         except ImportError:
             pass
 
+        # Two GC passes: first collects the wrapper chain, the second
+        # picks up cycles the first pass exposed (compiled graphs often
+        # have mutual refs to the model modules).
+        gc.collect()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+            try:
+                _alloc_after = torch.cuda.memory_allocated() // (1024 * 1024)
+                logger.info("[shutdown] CUDA alloc after cleanup: %d MiB "
+                            "(freed %d MiB)", _alloc_after,
+                            _alloc_before - _alloc_after)
+            except Exception:
+                pass
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
