@@ -142,11 +142,120 @@ Stellschrauben für später:
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 - `kv_cache_memory_bytes` dynamisch je nach Modellgröße
 
+## Warm-Start: 18–25 min, nicht "2 min"
+
+Nachmittag: 4× Warm-Start durchgemessen. Alle identisch:
+
+| Phase | Zeit |
+|---|---:|
+| Cache-I/O (57 GB von Disk, 168 files × `.to(device)`) | **~9:30 min** |
+| torch.compile + AOT-Graph | ~73 s |
+| profile_run (dummy forward) | ~2 min |
+| Rest (init, kv-reserve) | ~2 min |
+| **Total** | **~15 min** |
+
+Die "2 min" von heute früh waren Wunschdenken: der Cache spart die
+Lloyd-Max-Quantisierung (Cold: ~20 min davon), aber nicht das I/O. Gegenüber
+Cold (46 min) spart der Cache **28 min** — nicht mehr, aber auch nicht wenig.
+Cache-Summary bestätigt sauber: `hits={xfp_linear=120, xfp_moe=48}
+misses={-} | saves=0`.
+
+## Shutdown-Bug untersucht — Driver-Level UVM-Leak
+
+Beim Stoppen des Containers (ob sauber via `podman stop` oder SIGKILL
+nach Timeout) bleiben auf GB10 UMA ~53 GiB als "used" stehen, obwohl
+kein Prozess sie hält. Vorher als "klassischer OOM-Leak" abgetan —
+User hat zurecht korrigiert: passiert auch bei sauberem Shutdown.
+
+### Plan implementiert (committed 9df4f7cc3)
+
+Drei Änderungen im Shutdown-Pfad:
+
+1. `vllm/v1/executor/uniproc_executor.py` — `destroy_model_parallel()` +
+   `destroy_distributed_environment()` dazu (war nur in multiproc).
+
+2. `vllm/v1/worker/gpu_worker.py` — Model + KV-Caches droppen,
+   `gc.collect()` × 2, `torch.cuda.empty_cache()`, `ipc_collect()`.
+   Plus `torch._dynamo.reset()` zum Flushen der AOT-Cache-Closures.
+
+3. `vllm/multiquant/__init__.py` — `_cleanup_multiquant_globals()`,
+   resetet die JIT-Kernel-Handles (`_xfp_gemm_kernel`,
+   `_xfp_moe_kernel`, `_mq_gemm_int{2,3}`) und die Singletons.
+
+### Test #1: `model_runner = None` reicht nicht (0 MiB freed)
+
+```
+[shutdown] GPUWorker releasing model + CUDA caches (CUDA alloc=77989 MiB)
+[shutdown] CUDA alloc after cleanup: 77989 MiB (freed 0 MiB)
+```
+
+Code lief in 48 ms — `empty_cache()` hatte nichts zu tun, weil die Tensoren
+noch Refs hatten. `model_runner.model = None` bricht nur EINE Referenz;
+`nn.Module._parameters` / `_modules` Dicts, Compiled-CUDA-Graphs,
+`torch.ops.vllm.xfp_apply`-Closures und der Dynamo-AOT-Cache halten
+Einzelparameter-Refs, die Refs-via-`= None` nicht erfasst.
+
+### Test #2: Param-Shrink-in-place greift (committed 5734dfa7b)
+
+Statt gegen den Ref-Graphen zu kämpfen: alle `model.parameters()` +
+`named_buffers()` iterieren und `.data = torch.empty(0, device=…, dtype=…)`
+setzen. Wrapper-Ketten (`CUDAGraphWrapper → UBatchWrapper → inner`) über
+Attribute `model/module/wrapped/_orig_mod` abwandern. Analog zum
+Cache-Hit-Path-Fix vom Vormittag auf Einzel-Layern.
+
+```
+[shutdown] GPUWorker releasing model + CUDA caches (CUDA alloc=77989 MiB)
+[shutdown] shrunk 1658 model params/buffers, freed 66.0 GiB of nominal storage
+[shutdown] CUDA alloc after cleanup: 10383 MiB (freed 67606 MiB)
+```
+
+**Caching-Allocator meldet korrekt 66 GiB frei**, verbleibende 10 GiB sind
+der KV-Cache (außerhalb von `model.parameters()`).
+
+### ABER: `free -h` zeigt trotzdem nur ~5 GiB Recovery
+
+```
+pre-stop:  89 GiB used,  30 GiB avail
+post-stop: 84 GiB used,  35 GiB avail
+```
+
+PyTorch-Seite ist alles korrekt — `torch.cuda.memory_allocated()` geht
+runter, der Caching-Allocator freed die Blocks. Aber die UVM-Physical-
+Pages gibt der NVIDIA-Driver **nicht** an den Kernel zurück, nicht
+einmal nach Prozess-Exit (`podman stop` bringt die Container-PID zum
+Verschwinden). Warnung im Log: `[W ProcessGroupNCCL.cpp:1569]
+destroy_process_group() was not called before program exit` — das
+passiert durch die `finally` in `run_engine_core` aber es deutet auch
+an, dass die abrupte Auflösung nicht alle CUDA-Ressourcen aufräumt.
+
+Mögliche nächste Stufe (nicht mehr heute getestet):
+
+- `ctypes.CDLL('libcudart.so').cudaDeviceReset()` am Ende der
+  Worker-Shutdown — erzwingt Context-Destroy.
+- `os._exit(0)` statt sauberem Python-Teardown nach dem Shrink.
+- KV-Cache explizit schrumpfen (die 10 GiB die noch übrig sind).
+
+Aktuell hilft nur Reboot zwischen Runs. Das ist ein **Driver-Level-
+Issue auf GB10**, kein Python/vLLM-Bug mehr — unsere Fixes sind im
+Python-Stack vollständig, der Caching-Allocator released wie erwartet.
+
+## Commits heute
+
+- `c8e427881` — XFP weight cache fix (per-tensor save, cache-hit BF16
+  free, Dockerfile kernels-mq Pfad, tq3w default, tq3/tq4 rejection)
+- `9df4f7cc3` — uniproc shutdown: destroy_* + model drop + multiquant
+  cleanup helper
+- `5455a8fa0` — dynamo.reset + double gc pass (didn't help yet, kept
+  for defense in depth)
+- `5734dfa7b` — param-shrink in place (the actually-working part)
+
 ## Offen
 
-- **Warm-Start-Test** aus dem geschriebenen Cache — sollte jetzt (mit
-  BF16-Leak-Fix) in ca. 2 min durchgehen. Das ist der eigentliche Zweck
-  des Caches.
-- Tagebuch 20260417 war nur halb-fertig und sagt im Text "cp.async v11
-  als nächster Schritt" — dieser Pfad ist seit Weight-Cache-Commit
-  (f492530e9) parallel, kein akuter Drop.
+- KV-Cache ebenfalls shrink-en im shutdown-Pfad (erspart die 10 GiB
+  die aktuell noch im CUDA-Allocator verbleiben nach dem Shrink).
+- `cudaDeviceReset`-Experiment für die OS-Level Recovery — wenn das
+  funktioniert, ist das der echte Fix gegen den Reboot-Zyklus.
+- Rebuild des vllm-multiquant-Images mit den finalen shutdown-Fixes
+  (aktuell via Live-Mount von gpu_worker.py und uniproc_executor.py
+  aktiv — Dockerfile-Patch ist in `c8e427881`, aber die shutdown-Files
+  werden beim Rebuild automatisch aus dem Fork-Branch geholt).
