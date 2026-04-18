@@ -1022,10 +1022,58 @@ class Worker(WorkerBase):
                     "(CUDA alloc=%d MiB)", _alloc_before)
         model_runner = getattr(self, "model_runner", None)
         if model_runner is not None:
-            # The model is wrapped (CUDAGraphWrapper / UBatchWrapper / LoRA)
-            # around the actual transformer. Set the attribute to None so
-            # the wrapper's ref count drops; GC then tears down the chain.
-            if hasattr(model_runner, "model"):
+            # Ref-breaking alone (setting .model = None) does not free CUDA
+            # memory: compiled CUDA graphs, torch.ops closures, dynamo AOT
+            # cache, and nn.Module._parameters/_modules dicts all keep
+            # dangling refs to individual Parameters. Instead of fighting
+            # the ref graph, shrink each Parameter's storage to zero bytes
+            # in place — allocator frees the underlying blocks immediately
+            # while the (now empty) Parameter wrappers can safely outlive
+            # us until process exit. Same trick the cache-hit path in
+            # multiquant/xfp/online_{linear,moe}.py uses.
+            inner_model = getattr(model_runner, "model", None)
+            if inner_model is not None:
+                try:
+                    # Walk wrappers (CUDAGraphWrapper, UBatchWrapper, LoRA) to
+                    # reach the real nn.Module. Wrappers stash the wrapped
+                    # model under a variety of attribute names; grab any that
+                    # expose .parameters().
+                    candidates = [inner_model]
+                    for attr in ("model", "module", "wrapped", "_orig_mod"):
+                        sub = getattr(inner_model, attr, None)
+                        if sub is not None and hasattr(sub, "parameters"):
+                            candidates.append(sub)
+                    seen = set()
+                    n_params = 0
+                    bytes_shrunk = 0
+                    for cand in candidates:
+                        for p in cand.parameters():
+                            if id(p) in seen:
+                                continue
+                            seen.add(id(p))
+                            sz = p.data.element_size() * p.data.numel()
+                            bytes_shrunk += sz
+                            p.data = torch.empty(
+                                0, device=p.data.device, dtype=p.data.dtype
+                            )
+                            n_params += 1
+                        for name, buf in list(cand.named_buffers()):
+                            if id(buf) in seen:
+                                continue
+                            seen.add(id(buf))
+                            sz = buf.element_size() * buf.numel()
+                            bytes_shrunk += sz
+                            buf.data = torch.empty(
+                                0, device=buf.device, dtype=buf.dtype
+                            )
+                            n_params += 1
+                    logger.info(
+                        "[shutdown] shrunk %d model params/buffers, freed "
+                        "%.1f GiB of nominal storage",
+                        n_params, bytes_shrunk / (1024 ** 3),
+                    )
+                except Exception as e:
+                    logger.warning("[shutdown] param shrink failed: %s", e)
                 model_runner.model = None
             # Runner-side buffers that also pin storage.
             for attr in (
