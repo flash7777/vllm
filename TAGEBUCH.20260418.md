@@ -249,13 +249,85 @@ Python-Stack vollständig, der Caching-Allocator released wie erwartet.
   for defense in depth)
 - `5734dfa7b` — param-shrink in place (the actually-working part)
 
+## Decode-Speed: v13 (SMEM-A + cp.async) — Negativ-Befund
+
+v12 (SMEM-A only) ist bereits aktueller Default (commit `3b097ba9e`).
+Tagebuch 04-17 hatte cp.async Double-Buffer als nächstes ROI-reines
+Speedup vermutet (+15-25% erwartet, Marlin-Pattern). Test.
+
+`kernels/multiquant/xfp_gemm_core.cuh` hat beide Core-Optimierungen
+als unabhängige Compile-Flags (`XFP_CORE_USE_SMEM_A` und
+`XFP_CORE_USE_CPASYNC`). Kombinierbar. Neu angelegt:
+`xfp_gemm_v13.cu` + `xfp_moe_gemm_v13.cu` mit beiden Defines gesetzt.
+
+### Correctness ✓
+
+`tests/xfp/bench_v13_vs_v12_vs_v11.py` prüft bitweise Equality für
+Linear und MoE, bits=2/3/4, K bis zum K_SMEM_MAX-Rand (8192 Linear /
+4096 MoE):
+
+```
+LINEAR: bits=2/3/4 × [3 shapes]  v11=v12=v13 ✓
+MoE:    bits=3/4   × [4 shapes]  v11=v12=v13 ✓
+```
+
+Der combined-Pfad ist korrekt.
+
+### Performance ✗ — cp.async killt den slot-Loop
+
+Bench auf DGX Spark (GB10, SM121), warmup=50 iters=500 median:
+
+Linear (M=1 decode):
+
+| bits | N | K | v11 µs | v12 µs | v13 µs | v13 vs v12 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 3072 | 2048 | 10.4 | 9.5 | 15.6 | **+64.5%** |
+| 4 | 9216 | 2048 | 23.6 | 19.7 | 38.1 | **+93.5%** |
+| 4 | 4608 | 4608 | 23.8 | 21.6 | 42.1 | **+95.1%** |
+| 4 | 8192 | 4096 | 37.8 | 29.9 | 64.7 | **+116.4%** |
+
+MoE (B=1, topk=8):
+
+| E | N | K | v11 µs | v12 µs | v13 µs | v13 vs v12 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 3072 | 2048 | 54.5 | 48.4 | 97.5 | **+101.6%** |
+| 64 | 3072 | 2048 | 54.6 | 50.3 | 97.5 | **+93.8%** |
+
+v13 ist konsistent ~2× langsamer als v12. Die cp.async-Pipeline amortisiert
+sich nicht — wahrscheinliche Ursachen:
+
+- Auf SM120/121 ist cp.async ohne `tcgen05`-Pipeline weniger effizient als
+  auf SM90/SM100. Die wait_group-Synchronisation vor jeder Iteration
+  serialisiert den slot-Loop, der bei v12 bereits durch Warp-Occupancy
+  latenz-versteckt war.
+- K-Loops sind klein (K=2048 bei bits=4 → K_packed=256, nur 8 groups).
+  cp.async-Commit + Wait pro Group ist Overhead > Prefetch-Nutzen.
+- Eine globale Memory-Transaktion pro Lane pro Group (4 Byte uint32) ist
+  zu klein für cp.async um Coalescing-Vorteile zu zeigen.
+
+### Konsequenz
+
+**v12 bleibt der schnellste Linear/MoE-Kernel für XFP auf GB10.** Marlin-
+Pattern überträgt sich NICHT 1:1 auf SM120/121 — cp.async ist dort
+situativ sinnvoll, nicht hier. Tagebuch 04-17's Annahme "+15-25%" war
+für SM90 plausibel, auf Blackwell-Consumer-Karten nicht bestätigt.
+
+v13-Dateien werden als "do not enable" im Repo belassen (kernels/
+multiquant/xfp_gemm_v13.cu + xfp_moe_gemm_v13.cu), das Bench-Script
+bleibt für spätere Re-Tests falls wir K auf >4096 hochziehen (größere
+Groups → cp.async-Amortisation könnte dann reinkicken).
+
+Nicht wired: `vllm/multiquant/xfp/xfp_kernel.py` wird nicht auf v13
+umgestellt. Kein Runtime-Override.
+
 ## Offen
 
-- KV-Cache ebenfalls shrink-en im shutdown-Pfad (erspart die 10 GiB
-  die aktuell noch im CUDA-Allocator verbleiben nach dem Shrink).
-- `cudaDeviceReset`-Experiment für die OS-Level Recovery — wenn das
-  funktioniert, ist das der echte Fix gegen den Reboot-Zyklus.
-- Rebuild des vllm-multiquant-Images mit den finalen shutdown-Fixes
-  (aktuell via Live-Mount von gpu_worker.py und uniproc_executor.py
-  aktiv — Dockerfile-Patch ist in `c8e427881`, aber die shutdown-Files
-  werden beim Rebuild automatisch aus dem Fork-Branch geholt).
+- **Speculative decoding** auf XFP (ngram/prompt-lookup) — der nächste
+  Speed-Hebel. Memory-Eintrag sagt "ngram MTP für XFP (nst=3,
+  prompt_lookup) — bench aktuell laufend". Status verifizieren, dann
+  auf Qwen 122B benchen.
+- KV-Cache shrink im shutdown-Pfad (10 GiB die aktuell im Allocator
+  verbleiben).
+- `cudaDeviceReset`-Experiment für die OS-Level Recovery.
+- Rebuild vllm-multiquant-Image mit shutdown-Fixes + v13-Dateien
+  (aktuell via Live-Mount aktiv).
