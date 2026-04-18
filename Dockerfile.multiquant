@@ -82,6 +82,7 @@ RUN mkdir -p /opt/tests && \
     cp -r vllm/turboquant /usr/local/lib/python3.12/dist-packages/vllm/turboquant && \
     cp -r kernels/turboquant /opt/tq_build && \
     cp -r kernels/archer /opt/archer_build && \
+    cp -r kernels/multiquant /opt/mq_kernels && \
     cp -r tests/multiquant /opt/tests/multiquant && \
     cp -r tests/turboquant /opt/tests/turboquant && \
     echo "Fused decode kernel:" && \

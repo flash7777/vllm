@@ -242,10 +242,15 @@ class MultiQuantWeightCache:
     # ─── Path resolution ──────────────────────────────────────────────
 
     def layer_path(self, layer_prefix: str) -> Path:
+        """Return the per-layer DIRECTORY. Each tensor lives in its own
+        .safetensors file inside this dir — keeps save-transient memory
+        bounded to one tensor at a time instead of N simultaneously.
+        Critical on GB10 UMA where .cpu() copies share physical DRAM with
+        the CUDA originals (doubles footprint during save)."""
         safe = layer_prefix.replace("/", "__").replace(":", "_")
         if not safe:
             safe = "__root__"
-        return self.cache_dir / f"{safe}.safetensors"
+        return self.cache_dir / safe
 
     # ─── Generic save / load (used by per-method adapters) ───────────
 
@@ -258,9 +263,12 @@ class MultiQuantWeightCache:
     ) -> bool:
         """Persist a per-layer artefact bundle. Returns True on success.
 
-        The method name (e.g. "xfp_linear", "xfp_moe", "tq_wht_linear") is
-        stored in the safetensors header so loads can verify the caller's
-        expected format matches the on-disk kind.
+        Writes each tensor to its own .safetensors file inside a directory
+        per layer. This bounds the save-transient memory to ONE tensor at
+        a time — critical on GB10 unified memory, where the .cpu() copy
+        needed for safetensors-write shares physical DRAM with the CUDA
+        original. Writing all N tensors at once (the old layout) peaked at
+        2× model size during the final save calls of a MoE layer.
         """
         if self.read_only or not layer_prefix:
             return False
@@ -272,7 +280,15 @@ class MultiQuantWeightCache:
                 "cache save disabled",
             )
             return False
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import gc as _gc
+
+        layer_dir = self.layer_path(layer_prefix)
+        tmp_dir = layer_dir.with_name(layer_dir.name + ".tmp")
+        # Clean up any stale tmp from prior crash
+        if tmp_dir.exists():
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
 
         meta: dict[str, str] = {"method": method, "cache_key": self.cache_key}
         if metadata:
@@ -280,14 +296,36 @@ class MultiQuantWeightCache:
                 # Safetensors metadata values MUST be strings.
                 meta[str(k)] = str(v)
 
-        contig = {k: _tensor_cpu_contig(v) for k, v in tensors.items()}
-
-        path = self.layer_path(layer_prefix)
-        tmp = path.with_suffix(".safetensors.tmp")
         t0 = time.perf_counter()
         try:
-            save_file(contig, str(tmp), metadata=meta)
-            tmp.replace(path)
+            # Stream each tensor individually — one CPU copy alive at a time.
+            # The old code did `{k: v.cpu() for k,v in tensors.items()}` which
+            # held N copies simultaneously.
+            for key, tensor in tensors.items():
+                safe_key = key.replace("/", "__").replace(":", "_")
+                tensor_cpu = _tensor_cpu_contig(tensor)
+                save_file(
+                    {key: tensor_cpu},
+                    str(tmp_dir / f"{safe_key}.safetensors"),
+                    metadata=meta,
+                )
+                # Drop the CPU copy before the next allocation.
+                del tensor_cpu
+                _gc.collect()
+            # Manifest lists the keys so load() doesn't need to scandir.
+            (tmp_dir / "_manifest.json").write_text(
+                json.dumps({
+                    "method": method,
+                    "cache_key": self.cache_key,
+                    "keys": list(tensors.keys()),
+                    "metadata": metadata or {},
+                }, sort_keys=True)
+            )
+            # Atomic swap: rename tmp_dir -> layer_dir
+            if layer_dir.exists():
+                import shutil
+                shutil.rmtree(layer_dir)
+            tmp_dir.rename(layer_dir)
             self._saves += 1
             self._t_saved_s += time.perf_counter() - t0
             return True
@@ -297,6 +335,13 @@ class MultiQuantWeightCache:
                 "MultiQuant cache: save failed for %s/%s (%s)",
                 method, layer_prefix, e,
             )
+            # Best-effort cleanup of partial tmp
+            try:
+                import shutil
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
             return False
 
     def load(
@@ -307,36 +352,73 @@ class MultiQuantWeightCache:
     ) -> Optional[tuple[dict[str, torch.Tensor], dict[str, str]]]:
         """Return (tensors_on_device, metadata) or None on miss/mismatch.
 
-        On a hit with a different ``method`` tag, returns None and logs.
+        Reads each per-key .safetensors file inside the layer directory
+        and moves its tensor to device, freeing the CPU copy before the
+        next read. Peak transient = one tensor at a time (same bound as
+        the save path).
         """
         if not layer_prefix:
             return None
-        path = self.layer_path(layer_prefix)
-        if not path.exists():
+        layer_dir = self.layer_path(layer_prefix)
+        if not layer_dir.exists() or not layer_dir.is_dir():
+            self._misses[expected_method] = \
+                self._misses.get(expected_method, 0) + 1
+            return None
+        manifest_path = layer_dir / "_manifest.json"
+        if not manifest_path.exists():
+            # Treat as miss — incomplete or stale layout.
             self._misses[expected_method] = \
                 self._misses.get(expected_method, 0) + 1
             return None
         try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                "MultiQuant cache: manifest unreadable for %s (%s)",
+                layer_prefix, e,
+            )
+            self._load_fail += 1
+            return None
+        on_disk_method = manifest.get("method")
+        if on_disk_method != expected_method:
+            logger.warning(
+                "MultiQuant cache: %s method=%r != expected %r → miss",
+                layer_dir, on_disk_method, expected_method,
+            )
+            self._load_fail += 1
+            return None
+        try:
             from safetensors import safe_open
+            import gc as _gc
             t0 = time.perf_counter()
             tensors: dict[str, torch.Tensor] = {}
-            with safe_open(str(path), framework="pt") as f:
-                meta = f.metadata() or {}
-                on_disk_method = meta.get("method")
-                if on_disk_method != expected_method:
+            meta_out: dict[str, str] = {"method": expected_method}
+            for key in manifest.get("keys", []):
+                safe_key = key.replace("/", "__").replace(":", "_")
+                fpath = layer_dir / f"{safe_key}.safetensors"
+                if not fpath.exists():
                     logger.warning(
-                        "MultiQuant cache: %s method=%r != expected %r "
-                        "→ treating as miss",
-                        path, on_disk_method, expected_method,
+                        "MultiQuant cache: missing %s for %s — miss",
+                        fpath.name, layer_prefix,
                     )
                     self._load_fail += 1
                     return None
-                for k in f.keys():  # noqa: SIM118
-                    tensors[k] = f.get_tensor(k).to(device)
+                with safe_open(str(fpath), framework="pt") as f:
+                    # Move to device immediately; CPU temp frees at close
+                    tensors[key] = f.get_tensor(key).to(device)
+                    fmeta = f.metadata() or {}
+                    # Merge string metadata; method fields stay consistent
+                    for mk, mv in fmeta.items():
+                        if mk not in meta_out:
+                            meta_out[mk] = mv
+                _gc.collect()
+            # Promote plain-dict "metadata" block into the output meta
+            for mk, mv in (manifest.get("metadata") or {}).items():
+                meta_out[str(mk)] = str(mv)
             self._hits[expected_method] = \
                 self._hits.get(expected_method, 0) + 1
             self._t_loaded_s += time.perf_counter() - t0
-            return tensors, dict(meta)
+            return tensors, meta_out
         except (OSError, RuntimeError, ValueError, KeyError) as e:
             self._load_fail += 1
             logger.warning(

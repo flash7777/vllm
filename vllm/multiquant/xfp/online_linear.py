@@ -260,6 +260,13 @@ class XFPLinearMethod(QuantizeMethodBase):
                 layer_prefix, layer._xfp_bits,
                 layer._xfp_K, layer._xfp_N,
             )
+            # Free the BF16 storage before dropping the attr (same reason as
+            # online_moe.py cache-hit path — plain del leaves the storage
+            # alive via layer._parameters until much later in the pipeline).
+            p = layer._parameters.get("weight")
+            if p is not None:
+                p.data = torch.empty(0, device=p.data.device,
+                                     dtype=p.data.dtype)
             try:
                 del layer.weight
             except AttributeError:

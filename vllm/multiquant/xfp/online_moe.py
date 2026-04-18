@@ -222,6 +222,18 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 layer._xfp_moe_K13, layer._xfp_moe_N13,
                 layer._xfp_moe_K2, layer._xfp_moe_N2,
             )
+            # Shrink the BF16 storage that streaming_loader materialized. A
+            # plain `del layer.wXX_weight` removes the attribute but the
+            # nn.Parameter keeps living in layer._parameters, so its CUDA
+            # storage (~5 GB per MoE layer on Qwen 122B) stays allocated
+            # until much later — over 48 MoE layers this accumulates ~240 GB
+            # of ghost BF16 in UMA and OOMs before profile_run. Reassigning
+            # .data to a zero-size tensor frees the original storage now.
+            for attr in ("w13_weight", "w2_weight"):
+                p = layer._parameters.get(attr)
+                if p is not None:
+                    p.data = torch.empty(0, device=p.data.device,
+                                         dtype=p.data.dtype)
             try:
                 del layer.w13_weight, layer.w2_weight
             except AttributeError:

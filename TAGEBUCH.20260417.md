@@ -104,3 +104,69 @@ verarbeitet wird. Erwartet: +15–25% tok/s (Marlin nutzt dieses Pattern).
 
 Wenn cp.async bitweise identisch zu v11 baseline bleibt (Unit-Test cos=1.0),
 ist das ein ROI-reines Speedup ohne Math-Risiko.
+
+## Pivot: v11 cp.async verschoben — erst Weight Cache testen
+
+Session-Crash (vorherige Instanz abgestürzt). Neu priorisiert: vor den weiteren
+Kernel-Optimierungen wollen wir den **Weight Cache** validieren, damit jeder
+Benchmark-Run nicht jedesmal die komplette Online-Quantisierung (Lloyd iters +
+auto-bits Suche) neu rechnen muss. Ziel: zweiter Start ~2 min statt 10+ min.
+
+### Infrastruktur-Status vorher
+
+- Code existiert bereits: `vllm/multiquant/weight_cache.py` (generischer
+  Cache mit SHA256-Key über config/shards/policy/pack-sources/tuning-knobs)
+  und `vllm/multiquant/xfp/xfp_weight_cache.py` (XFP-Adapter).
+- `start.multiquant` hatte **keinen** Cache-Env-Support, und
+  `WDTYPE` / `WLMHEAD` wurden nie an vllm durchgereicht — zwei Bugs.
+
+### Script-Patch `start.multiquant`
+
+1. `--cache-dir` (default `/data/tensordata/mq-cache`), `--no-cache`,
+   `--cache-ro`; setzt `MULTIQUANT_CACHE_DIR` / `MULTIQUANT_CACHE_READ_ONLY`
+   im Container.
+2. Fehlende Durchreiche von `--weight-dtype` und `--weight-dtype-lm-head`
+   an vllm nachgetragen — vorher hat `--weight-dtype xfp` im Script
+   *scheinbar* gegriffen (Banner zeigte "RTN per-class"), aber die Policy
+   blieb komplett bf16 (siehe abgebrochener erster Start-Versuch).
+
+### Aufruf
+
+```bash
+./start.multiquant --model Qwen3.5-122B-A10B --weight-dtype xfp \
+  --max-model-len 32768 --kv tq3
+```
+
+- `xfp` = auto-bits (XFP_MIN_COS=0.98, pro Layer 2/3/4-bit)
+- `tq3` KV-Cache unverändert
+- Cache: `/data/tensordata/mq-cache/Qwen3.5-122B-A10B/<hash16>/`
+
+### Cold-Start Versuch 1 — OOM durch Profiler-Bug
+
+Erster Versuch OOM-Kill um 19:30:49 (Kernel-Log: `Out of memory: Killed process 4567 (vllm) total-vm:21376716kB`, `NVRM: GPU0 Out of memory`).
+
+Container-Log endet bei 17:29:57 (MultiQuant-Attention-Compile fertig), **bevor
+ein einziger safetensors-Shard geladen wurde**. 2 h Stillstand → Kernel-Kill.
+
+**Root Cause**: `start.multiquant` defaultet `--gpu-memory-utilization 0.33`
+für UMA. Das ist der bekannte DGX Spark Profiler-Bug — der CUDA-Profiler
+meldet auf UMA `<9 GiB frei` unabhängig vom tatsächlichen Wert. vLLM
+reserviert dann 0.33 vom *gelogenen* Total → Phantom-Reserve → OOM beim
+ersten echten Allocation-Peak.
+
+Der erfolgreiche 16.04-Run hatte `--gpu-memory-utilization 0.05
+--kv-cache-memory-bytes 3G` (steht im eigenen Memory:
+"0.33 reicht NICHT, Profiler meldet <9 GiB frei"). Das hätte ich VOR dem
+Start prüfen müssen — habe ich nicht, User hat zurecht gemeckert.
+
+### Script-Patch `start.multiquant` (Fix)
+
+UMA-Detect: `GPU_MEM_UTIL=0.05`, `KV_CACHE_MEM_DEFAULT="10G"`. Discrete GPU
+bleibt `0.95`. So bekommt vLLM beim UMA-Pfad eine explizite KV-Größe und
+umgeht den Profiler komplett.
+
+Der Weight-Cache war in diesem Versuch gar nicht am Zuge — der OOM kam
+bevor der erste Layer gepackt wurde. Cache-Mechanismus also unverändert
+test-bereit; Versuch 2 läuft mit korrektem UMA-Setup.
+
+
