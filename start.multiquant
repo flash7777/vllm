@@ -24,6 +24,10 @@ WLMHEAD=""               # LM Head / Embedding: fp8 (leer=bf16)
 MODEL_DIR="/data/tensordata"
 MODEL=""
 MTP=false
+SPEC_TOKENS=0             # Speculative draft tokens (0 = disabled). nst=3 typical for ngram.
+SPEC_METHOD="ngram"        # ngram | eagle | eagle3 | medusa | mlp_speculator
+SPEC_PROMPT_LOOKUP_MAX=4
+SPEC_PROMPT_LOOKUP_MIN=2
 RIY_PROFILE=""
 TP=1
 PORT=8011
@@ -63,6 +67,10 @@ while [[ $# -gt 0 ]]; do
         --model)    MODEL="$2"; shift 2 ;;
         --tp)       TP="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
+        --spec)     SPEC_TOKENS="$2"; shift 2 ;;
+        --spec-method) SPEC_METHOD="$2"; shift 2 ;;
+        --spec-lookup-max) SPEC_PROMPT_LOOKUP_MAX="$2"; shift 2 ;;
+        --spec-lookup-min) SPEC_PROMPT_LOOKUP_MIN="$2"; shift 2 ;;
         --riy)      RIY_PROFILE="$2"; shift 2 ;;
         --served-model-name)    SERVED_NAME="$2"; shift 2 ;;
         --reasoning-parser)    REASONING_PARSER="$2"; shift 2 ;;
@@ -159,12 +167,22 @@ fi
 [[ -n "$ATTN" ]]   && QUANT_ARGS+=("--weight-dtype-attn" "$ATTN")
 [[ -n "$WMTP" ]]   && QUANT_ARGS+=("--weight-dtype-mtp" "$WMTP")
 
-# ── MTP ───────────────────────────────────────────────────
+# ── Speculative decoding (MTP / ngram / eagle) ─────────────
+# Legacy: --mtp implies nst=1 ngram. New: --spec N --spec-method M (vLLM 0.17+)
 MTP_LABEL="aus"
-if $MTP; then
-    EXTRA_ARGS+=("--num-speculative-tokens" "1")
-    EXTRA_ARGS+=("--speculative-model" "[ngram]")
-    MTP_LABEL="an (ngram, 1 token)"
+if $MTP && [[ "$SPEC_TOKENS" == "0" ]]; then
+    SPEC_TOKENS=1
+    SPEC_METHOD="ngram"
+fi
+if [[ "$SPEC_TOKENS" != "0" ]] && [[ -n "$SPEC_TOKENS" ]]; then
+    # vLLM 0.17+ --speculative-config JSON
+    if [[ "$SPEC_METHOD" == "ngram" ]]; then
+        SPEC_JSON="{\"method\":\"ngram\",\"num_speculative_tokens\":$SPEC_TOKENS,\"prompt_lookup_max\":$SPEC_PROMPT_LOOKUP_MAX,\"prompt_lookup_min\":$SPEC_PROMPT_LOOKUP_MIN}"
+    else
+        SPEC_JSON="{\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$SPEC_TOKENS}"
+    fi
+    EXTRA_ARGS+=("--speculative-config" "$SPEC_JSON")
+    MTP_LABEL="an ($SPEC_METHOD, $SPEC_TOKENS tokens)"
 fi
 
 # ── RIY ───────────────────────────────────────────────────
