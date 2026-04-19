@@ -119,6 +119,32 @@ assert old in t, 'patch target not found'; \
 open(p,'w').write(t.replace(old,new)); \
 print('torch_utils.py patched')"
 
+# Fix: NGC 26.03 PyTorch 2.11 register_opaque_type lost the 'hoist' kwarg
+# (vLLM 0.17.1 calls it with hoist=True). Wrap in try/except so the import
+# doesn't fail — OpaqueBase registration is non-critical for our path.
+RUN python3 -c "\
+p='/usr/local/lib/python3.12/dist-packages/vllm/utils/torch_utils.py'; \
+t=open(p).read(); \
+old='if HAS_OPAQUE_TYPE:\n    from torch._library.opaque_object import register_opaque_type\n\n    register_opaque_type(ModuleName, typ=\"value\", hoist=True)'; \
+new='if HAS_OPAQUE_TYPE:\n    try:\n        from torch._library.opaque_object import register_opaque_type\n        try:\n            register_opaque_type(ModuleName, typ=\"value\", hoist=True)\n        except TypeError:\n            register_opaque_type(ModuleName, typ=\"value\")\n    except (ImportError, ModuleNotFoundError):\n        pass'; \
+assert old in t, 'register_opaque_type patch target not found'; \
+open(p,'w').write(t.replace(old,new)); \
+print('register_opaque_type patched')"
+
+# Fix: NGC 26.03 PyTorch 2.11 FX __fx_repr__ contract changed. The tuple's
+# second element must be a dict (name -> type), vLLM 0.17.1 still returns
+# a set of classes. The failure surfaces during torch.compile codegen with
+# TypeError: __fx_repr__ for ModuleName must return a dict as the second
+# element, got set.
+RUN python3 -c "\
+p='/usr/local/lib/python3.12/dist-packages/vllm/utils/torch_utils.py'; \
+t=open(p).read(); \
+old='        return (f\"ModuleName({self.value!r})\", {ModuleName})'; \
+new='        return (f\"ModuleName({self.value!r})\", {\"ModuleName\": ModuleName})'; \
+assert old in t, 'fx_repr patch target not found'; \
+open(p,'w').write(t.replace(old,new)); \
+print('__fx_repr__ patched')"
+
 # ─── transformers 5.x ────────────────────────────────────────
 RUN pip install --cache-dir /pip-cache --no-deps "transformers>=5.2" && \
     pip install --cache-dir /pip-cache --upgrade "huggingface_hub>=0.32" && \
