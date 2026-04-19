@@ -52,7 +52,7 @@ __device__ __forceinline__ void xfp_gemm_core(
     int warp_id = threadIdx.x / XFP_WARP_SIZE;
     int lane    = threadIdx.x % XFP_WARP_SIZE;
 
-#ifdef XFP_CORE_USE_SMEM_A
+#if defined(XFP_CORE_USE_SMEM_A) || defined(XFP_CORE_USE_SMEM_A_DYNAMIC)
     // ── v12: block-uniform A-row resolution + cooperative SMEM load ──
     // block_A_row() must return nullptr iff the WHOLE block is inactive
     // (MoE padding expert/token, Linear m-out-of-range). If non-null,
@@ -60,8 +60,16 @@ __device__ __forceinline__ void xfp_gemm_core(
     const __nv_bfloat16* block_A = Policy::block_A_row(A, K, params);
     if (block_A == nullptr) return;  // all threads exit together → safe
 
+  #ifdef XFP_CORE_USE_SMEM_A_DYNAMIC
+    // Dynamic SMEM — launch with <<<grid, block, K*sizeof(bf16), stream>>>.
+    // Only K*2 bytes actually allocated per block (vs K_SMEM_MAX*2 static),
+    // letting more blocks co-reside on the same SM when K < K_SMEM_MAX.
+    extern __shared__ __nv_bfloat16 s_A_dyn[];
+    __nv_bfloat16* const s_A = s_A_dyn;
+  #else
     // Static SMEM — compile-time size per Policy. No dynamic smem launch.
     __shared__ __nv_bfloat16 s_A[Policy::K_SMEM_MAX];
+  #endif
 
     // Vectorized bf162 cooperative copy. K must be even (asserted host-side).
     {
@@ -85,8 +93,8 @@ __device__ __forceinline__ void xfp_gemm_core(
         A, B_packed_base, codebook_base, N, K, warp_id, lane, params);
     if (!ctx.active) return;
 
-    // A-source pointer: SMEM (v12) or per-warp global (v11).
-#ifdef XFP_CORE_USE_SMEM_A
+    // A-source pointer: SMEM (v12/v15) or per-warp global (v11).
+#if defined(XFP_CORE_USE_SMEM_A) || defined(XFP_CORE_USE_SMEM_A_DYNAMIC)
     const __nv_bfloat16* __restrict__ A_src = s_A;
 #else
     const __nv_bfloat16* __restrict__ A_src = ctx.A_row;
@@ -102,7 +110,59 @@ __device__ __forceinline__ void xfp_gemm_core(
     int n_offset = ctx.n * XFP_WARP_SIZE + lane;
     int n_groups = (K_packed + XFP_WARP_SIZE - 1) / XFP_WARP_SIZE;
 
-#ifdef XFP_CORE_USE_CPASYNC
+#ifdef XFP_CORE_USE_CPASYNC_BULK
+    // ── Bulk cp.async preload: issue all n_groups B-loads up front, ONE
+    // commit, ONE wait, then K-loop reads from SMEM. Avoids v13's per-group
+    // wait_group serialization while keeping the same 4B-per-lane transfer
+    // granularity (no TMA descriptor needed — host-side zero-cost).
+    //
+    // SMEM budget per block:  s_B = 16 * 256 * 4 = 16 KiB (fixed cap),
+    //                          s_A = Policy::K_SMEM_MAX * 2 (16 KiB Linear,
+    //                                                        8  KiB MoE).
+    // Combined ≤ 32 KiB, well below the 48 KiB/block limit on SM121.
+    // K cap (bits=4): 16 groups × 32 lanes × 8 vals = 4096. Larger K must
+    // use v11/v12. Host enforces via TORCH_CHECK in the v14 wrapper.
+    constexpr int V14_N_GROUPS_MAX = 16;
+    __shared__ uint32_t s_B[V14_N_GROUPS_MAX][XFP_WARPS_PER_BLOCK * XFP_WARP_SIZE];
+
+    // Each (warp, lane) issues its own uint32 per group — same addressing
+    // as v13's per-group prefetch but WITHOUT commit/wait between groups.
+    for (int gi = 0; gi < n_groups; gi++) {
+        uint32_t* dst_ptr = &s_B[gi][warp_id * XFP_WARP_SIZE + lane];
+        int kw = lane + gi * XFP_WARP_SIZE;
+        if (kw < K_packed) {
+            const uint32_t* src_ptr =
+                &ctx.B_packed[gi * N * XFP_WARP_SIZE + n_offset];
+            unsigned s_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(dst_ptr));
+            asm volatile(
+                "cp.async.ca.shared.global [%0], [%1], 4;\n"
+                :: "r"(s_addr), "l"(src_ptr));
+        } else {
+            *dst_ptr = 0u;
+        }
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+    for (int gi = 0; gi < n_groups; gi++) {
+        uint32_t packed = s_B[gi][warp_id * XFP_WARP_SIZE + lane];
+        int kw = lane + gi * XFP_WARP_SIZE;
+        int k_base = kw * VALS_PER_WORD;
+
+        #pragma unroll
+        for (int slot = 0; slot < VALS_PER_WORD; slot++) {
+            int idx = (int)((packed >> (slot * BITS)) & MASK);
+            float w = __shfl_sync(0xffffffff, my_cb_val, idx);
+            int k = k_base + slot;
+            if (k < K && kw < K_packed) {
+                float a = __bfloat162float(A_src[k]);
+                acc = fmaf(w, a, acc);
+            }
+        }
+    }
+#elif defined(XFP_CORE_USE_CPASYNC)
     // ── cp.async double-buffered K-loop ──
     // Prefetch B_packed for stage gi+1 while processing stage gi. Each lane
     // loads 4 bytes (one uint32) per group. SMEM: 2 × WARPS × 32 × 4 = 2 KiB.
