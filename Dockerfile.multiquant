@@ -11,7 +11,7 @@
 # Caches unter /data/sources/{pip-cache,ccache,torch-extensions,cutlass}
 # ============================================================
 
-ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.03-py3
 FROM ${BASE_IMAGE}
 
 ARG CUDA_ARCHS="12.0a;12.1a"

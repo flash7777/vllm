@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 IMAGE="vllm-multiquant"
-BASE="nvcr.io/nvidia/vllm:26.02-py3"
+BASE="nvcr.io/nvidia/vllm:26.03-py3"
 ARCHS="12.0a;12.1a"
 JOBS=16
 EXTRA="--no-cache"  # Default: fresh git clone (ccache handles C++ speed)

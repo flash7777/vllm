@@ -283,6 +283,7 @@ podman run -d \
   -v "$HOME/vllm-riy/vllm/multiquant:/usr/local/lib/python3.12/dist-packages/vllm/multiquant:ro" \
   -v "$HOME/vllm-riy/vllm/v1/executor/uniproc_executor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/uniproc_executor.py:ro" \
   -v "$HOME/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro" \
   -e VLLM_MLA_DISABLE=1 \
   -e VLLM_WORKER_MULTIPROC_METHOD=fork \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \

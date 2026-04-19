@@ -1118,6 +1118,51 @@ class Worker(WorkerBase):
             except Exception:
                 pass
 
+            # Last-resort: force-destroy the primary CUDA context via
+            # cudaDeviceReset. On GB10 UMA the driver does NOT return
+            # UVM pages to the OS kernel on process exit alone —
+            # empty_cache releases the PyTorch caching-allocator pool
+            # but the driver still tracks the pages as live. Explicit
+            # cudaDeviceReset() should (a) tear down the primary
+            # context, (b) unmap all UVM pages, (c) let the OS reclaim
+            # the physical memory. Safe here because we've already
+            # dropped the model and the worker is about to exit.
+            try:
+                import ctypes
+                cudart = ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
+                cudart.cudaDeviceSynchronize.restype = ctypes.c_int
+                cudart.cudaDeviceReset.restype = ctypes.c_int
+                cudart.cudaDeviceSynchronize()
+                rc = cudart.cudaDeviceReset()
+                logger.info("[shutdown] cudaDeviceReset -> rc=%d", int(rc))
+            except OSError:
+                # libcudart not findable via dlopen — try the full path.
+                try:
+                    import ctypes
+                    for cand in (
+                        "libcudart.so.13", "libcudart.so.12",
+                        "libcudart.so.11", "libcudart.so.13.0",
+                    ):
+                        try:
+                            cudart = ctypes.CDLL(cand)
+                            cudart.cudaDeviceReset.restype = ctypes.c_int
+                            rc = cudart.cudaDeviceReset()
+                            logger.info(
+                                "[shutdown] cudaDeviceReset via %s -> rc=%d",
+                                cand, int(rc))
+                            break
+                        except OSError:
+                            continue
+                    else:
+                        logger.warning(
+                            "[shutdown] libcudart not found; "
+                            "cudaDeviceReset skipped")
+                except Exception as e:
+                    logger.warning(
+                        "[shutdown] cudaDeviceReset fallback failed: %s", e)
+            except Exception as e:
+                logger.warning("[shutdown] cudaDeviceReset failed: %s", e)
+
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
