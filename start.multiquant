@@ -72,6 +72,8 @@ while [[ $# -gt 0 ]]; do
         --spec-lookup-max) SPEC_PROMPT_LOOKUP_MAX="$2"; shift 2 ;;
         --spec-lookup-min) SPEC_PROMPT_LOOKUP_MIN="$2"; shift 2 ;;
         --riy)      RIY_PROFILE="$2"; shift 2 ;;
+        --nvtx)     EXTRA_ARGS+=("--enable-layerwise-nvtx-tracing"); shift ;;
+        --profile)  EXTRA_ARGS+=("--profiler-config" "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"/measurements\",\"active_iterations\":20,\"warmup_iterations\":2}"); shift ;;
         --served-model-name)    SERVED_NAME="$2"; shift 2 ;;
         --reasoning-parser)    REASONING_PARSER="$2"; shift 2 ;;
         --tool-call-parser)    TOOL_PARSER="$2"; shift 2 ;;
@@ -279,17 +281,21 @@ podman run -d \
   --network host \
   -v /data/tensordata:/data/tensordata \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/vllm-riy/measurements:/measurements:rw" \
   -v "$HOME/vllm-riy/kernels/multiquant:/opt/mq_kernels:ro" \
   -v "$HOME/vllm-riy/vllm/multiquant:/usr/local/lib/python3.12/dist-packages/vllm/multiquant:ro" \
   -v "$HOME/vllm-riy/vllm/v1/executor/uniproc_executor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/uniproc_executor.py:ro" \
   -v "$HOME/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_next.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_next.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:ro" \
   -e VLLM_MLA_DISABLE=1 \
   -e VLLM_WORKER_MULTIPROC_METHOD=fork \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e FLASHINFER_DISABLE_AUTOTUNER=1 \
   -e VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
   -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  ${VLLM_NVTX_PROFILE:+-e VLLM_NVTX_PROFILE="${VLLM_NVTX_PROFILE}"} \
   "${CACHE_ENV[@]}" \
   "${QUANT_ENV[@]}" \
   "$IMAGE" \
@@ -312,10 +318,8 @@ echo "  Logs:     podman logs -f $CONTAINER_NAME"
 echo "  API:      http://localhost:$PORT/v1/chat/completions"
 echo "  Stoppen:  podman stop $CONTAINER_NAME"
 echo ""
-echo "  Beispiele:"
-echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound"
-echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4"
-echo "    ./start.multiquant --model GLM-4.7-Flash --weights tq3"
-echo "    ./start.multiquant --model GLM-4.7-Flash --routed int3 --kv tq3"
-echo "    ./start.multiquant --model GLM-4.7-Flash --routed int4 --attn int4 --shared bf16"
-echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp"
+echo "  Beispiele (Qwen 3.5 MoE Referenzen — alle mit fp8 KV + fp8 LM-head):"
+echo "    ./start.multiquant --model Qwen3.5-122B-A10B --weight-dtype xfp --kv fp8 --weight-dtype-lm-head fp8"
+echo "    ./start.multiquant --model Qwen3.5-122B-A10B-int4-AutoRound --kv fp8 --weight-dtype-lm-head fp8"
+echo "    ./start.multiquant --model Qwen3.5-122B-A10B-GPTQ-Int4 --kv fp8 --weight-dtype-lm-head fp8"
+echo "    ./start.multiquant --model Qwen3.5-397B-A17B-int4-AutoRound --kv fp8 --weight-dtype-lm-head fp8 --riy /data/tensordata/riy_profile_397b_24pct.json --tp 2"

@@ -136,8 +136,10 @@ def classify_layer(prefix: str) -> str:
     # DeltaNet
     if "deltanet" in p:
         return "deltanet"
-    # Attention
-    if "self_attn" in p or "attention" in p:
+    # Attention — covers full_attention (self_attn), linear_attention
+    # (Qwen3-Next GatedDeltaNet: .linear_attn.in_proj_qkvz, in_proj_ba, out_proj)
+    # and any generic "attention" substring.
+    if "self_attn" in p or "linear_attn" in p or "attention" in p:
         return "attn"
     # Shared experts (check before routed — "shared" substring match)
     if "shared_expert" in p:

@@ -1,0 +1,30 @@
+
+============================================================
+Benchmark: Marlin-INT4-AutoRound+fp8KV+fp8LMH
+URL: http://localhost:8011  Model: glm-4.7-flash
+============================================================
+
+--- Performance (n=5) ---
+  short   :    2.5 tok/s  (20 tok in 7.89s, n=5)
+  medium  :   29.6 tok/s  (150 tok in 5.07s, n=5)
+  long    :   25.8 tok/s  (400 tok in 15.52s, n=5)
+
+--- Math Accuracy (n=50) ---
+  Math: 47/50 (94%)
+  469-613=-144, got: 144
+
+1. The numbers 469 and 613 are give
+  859*653=560927, got: 561927
+
+Let me try 859 * 653 = 561927
+
+L
+  243-801=-558, got: 801 - 243 = 558.
+The difference between 
+
+--- Memory ---
+  Memory: KV cache: 0.0%
+
+============================================================
+
+JSON: {"label": "Marlin-INT4-AutoRound+fp8KV+fp8LMH", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 7.89, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 5.07, "avg_tok_s": 29.6}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 15.52, "avg_tok_s": 25.8}], "math": {"correct": 47, "total": 50, "pct": 94.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}

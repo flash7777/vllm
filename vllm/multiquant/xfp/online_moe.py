@@ -78,28 +78,27 @@ def _xfp_moe_forward_impl(
         no_w, int(bits), int(K13), int(N13), int(topk),
         int(fpe13), num_valid)
 
-    # SiLU
-    gate = F.silu(gate_up[:, :half_n])
-    up = gate_up[:, half_n:]
-    activated = gate * up
+    # SiLU — fused silu_and_mul: 1 kernel (was 3: silu, slice-mul, slice)
+    activated = torch.empty(BT, half_n, dtype=torch.bfloat16, device=x.device)
+    torch.ops._C.silu_and_mul(activated, gate_up)
 
-    # Down
+    # Down — pass topk_weights into kernel so epilogue multiplies by weight
+    #   (was: down in bf16 → .float() → *weight → .to(bf16) → scatter_add_;
+    #    now: weighted values written directly; scatter_add on bf16 no conversion.)
     down = torch.zeros(BT, N2, dtype=torch.bfloat16, device=x.device)
     down_expert_ids = topk_ids.reshape(-1).to(torch.int32)
     down_sorted = torch.arange(BT, dtype=torch.int32, device=x.device)
+    tw_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
     moe_kernel.xfp_moe_gemm(
         activated, w2_packed, w2_codebook,
         down, down_sorted, down_expert_ids,
-        no_w, int(bits), int(K2), int(N2), 1,
+        tw_flat, int(bits), int(K2), int(N2), 1,
         int(fpe2), BT)
 
-    # Scatter-reduce
+    # Scatter-reduce (weights already applied in kernel epilogue)
     orig = torch.arange(BT, device=x.device, dtype=torch.int64) // topk
-    weighted = down.float() * topk_weights.reshape(-1).unsqueeze(1)
     output = torch.zeros(B, N2, dtype=torch.bfloat16, device=x.device)
-    output.scatter_add_(
-        0, orig.unsqueeze(1).expand_as(weighted),
-        weighted.to(output.dtype))
+    output.scatter_add_(0, orig.unsqueeze(1).expand_as(down), down)
     return output
 
 

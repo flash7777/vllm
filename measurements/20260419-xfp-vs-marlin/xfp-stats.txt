@@ -1,0 +1,11 @@
+
+NOTICE: Existing SQLite export found: /measurements/xfp.sqlite
+        It is assumed file was previously exported from: /measurements/xfp.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/measurements/xfp.sqlite] with [/opt/nvidia/nsight-systems-cli/2024.2.3/target-linux-sbsa-armv8/reports/nvtx_pushpop_sum.py]... 
+SKIPPED: /measurements/xfp.sqlite does not contain NV Tools Extension (NVTX) data.
+
+Processing [/measurements/xfp.sqlite] with [/opt/nvidia/nsight-systems-cli/2024.2.3/target-linux-sbsa-armv8/reports/cuda_gpu_kern_sum.py]... 
+SKIPPED: /measurements/xfp.sqlite does not contain CUDA kernel data.
+
