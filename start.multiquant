@@ -288,6 +288,7 @@ podman run -d \
   -v "$HOME/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_next.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_next.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5_mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5_mtp.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:ro" \
   -e VLLM_MLA_DISABLE=1 \
   -e VLLM_WORKER_MULTIPROC_METHOD=fork \
