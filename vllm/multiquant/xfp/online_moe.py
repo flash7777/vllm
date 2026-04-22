@@ -252,7 +252,9 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # SAME lloyd_iters as the actual packing to avoid quality mismatch.
         if bits == 0:
             from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
-            sample_experts = min(4, E)
+            # XFP_MOE_SAMPLE_EXPERTS=0 → alle Experten; default 4.
+            se_env = int(os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
+            sample_experts = E if se_env == 0 else min(se_env, E)
             sample = w13[:sample_experts].reshape(-1, w13.shape[2]).float()
             bits = xfp_auto_select(
                 sample,
@@ -261,8 +263,14 @@ class XFPMoEMethod(FusedMoEMethodBase):
                     if hasattr(self.quant_config, 'auto_min_cos') else 0.98,
                 lloyd_iters=moe_lloyd_iters,
             )
-            logger.info("XFP MoE auto-select: bits=%d (from %d expert sample, "
-                        "lloyd=%d)", bits, sample_experts, moe_lloyd_iters)
+            logger.info("XFP MoE auto-select: bits=%d (from %d/%d expert sample, "
+                        "lloyd=%d)", bits, sample_experts, E, moe_lloyd_iters)
+            # Sample kann bei sample_experts=E mehrere GB belegen → explizit
+            # freigeben bevor die teure Packing-Stufe den HBM braucht.
+            del sample
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
 
         _load_xfp_gemm(bits)
         _load_xfp_moe_gemm()

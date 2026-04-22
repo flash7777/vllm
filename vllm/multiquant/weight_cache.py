@@ -228,12 +228,14 @@ class MultiQuantWeightCache:
         # Quant-tuning knobs not in the registry (env-configurable).
         moe_lloyd = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
         auto_min_cos = float(os.environ.get("XFP_MIN_COS", "0.98"))
+        moe_sample = int(os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
         h.update(
             f"|sigma={_DEFAULT_OUTLIER_SIGMA}"
             f"|maxf={_DEFAULT_OUTLIER_MAX_FRACTION}"
             f"|lloyd_lin={_LLOYD_ITERS_LINEAR}"
             f"|moe_lloyd={moe_lloyd}"
             f"|min_cos={auto_min_cos}"
+            f"|moe_sample={moe_sample}"
             f"|tp={tp_size}|ep={ep_size}"
             f"|schema={_MANIFEST_SCHEMA_VERSION}".encode()
         )

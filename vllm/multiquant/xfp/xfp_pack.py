@@ -387,29 +387,47 @@ def xfp_auto_select(
         W_bulk = W
         mask = None
 
-    # Test each candidate from lowest to highest
+    # Test each candidate from lowest to highest.
+    # Intermediate tensors (idx, rec) are huge for large MoE stacks
+    # (e.g. 256-expert Qwen 122B → idx ≈ 12 GB int64, rec ≈ 6 GB float).
+    # Explicit del + empty_cache between candidates prevents UMA blowup.
+    result_bits = best_bits
     for bits in candidates:
         if bits == best_bits:
             # Highest candidate always qualifies as fallback
-            return bits
+            result_bits = bits
+            break
 
         n_centroids = 1 << bits
         cb = _lloyd_per_channel(W_bulk, n_centroids, lloyd_iters)
         idx = _assign_indices(W_bulk, cb)
         rec = torch.gather(cb, 1, idx)
         if mask is not None:
-            flat_r = rec.reshape(-1).clone()
-            flat_r[mask.reshape(-1)] = W.reshape(-1)[mask.reshape(-1)]
-            rec = flat_r.reshape_as(W)
+            # Overwrite outliers in-place on rec — avoids a full clone
+            # that would double peak allocation on huge MoE stacks.
+            mask_flat = mask.reshape(-1)
+            rec_flat = rec.reshape(-1)
+            rec_flat[mask_flat] = W.reshape(-1)[mask_flat]
 
         # Per-channel cos similarity — sole quality gate
         cos_per_ch = F.cosine_similarity(W, rec, dim=1)  # [N_out]
         median_cos = float(cos_per_ch.median().item())
 
-        if median_cos >= min_cos:
-            return bits
+        del cb, idx, rec
+        if W.is_cuda:
+            torch.cuda.empty_cache()
 
-    return best_bits
+        if median_cos >= min_cos:
+            result_bits = bits
+            break
+
+    # Release bulky intermediates before returning (UMA pressure matters)
+    del W_bulk
+    if mask is not None:
+        del mask
+    if W.is_cuda:
+        torch.cuda.empty_cache()
+    return result_bits
 
 
 # ─── Public entry point ────────────────────────────────────────────
