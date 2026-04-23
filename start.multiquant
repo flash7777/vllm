@@ -70,6 +70,9 @@ while [[ $# -gt 0 ]]; do
         --tp)       TP="$2"; shift 2 ;;
         --load-format) LOAD_FORMAT="$2"; shift 2 ;;
         --quant-only) QUANT_ONLY=true; shift ;;
+        --min-cos)    XFP_MIN_COS="$2"; shift 2 ;;
+        --moe-sample-experts) XFP_MOE_SAMPLE_EXPERTS="$2"; shift 2 ;;
+        --moe-lloyd-iters)    XFP_MOE_LLOYD_ITERS="$2"; shift 2 ;;
         --mtp)      MTP=true; shift ;;
         --spec)     SPEC_TOKENS="$2"; shift 2 ;;
         --spec-method) SPEC_METHOD="$2"; shift 2 ;;
@@ -110,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
             echo "  --mtp            Multi-Token Prediction aktivieren"
             echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
+            echo "  --quant-only     Pack to cache, exit without serving"
+            echo "  --min-cos F      XFP auto-select threshold (default 0.98; 0.95 = more xfp2)"
+            echo "  --moe-sample-experts N  Expert-Sample für MoE auto-select (default 4; 0=alle)"
+            echo "  --moe-lloyd-iters N     Lloyd-Max k-means Iterationen (default 5)"
             echo "  --max-model-len N          Max Kontext-Länge (default: 100000)"
             echo "  --gpu-memory-utilization F GPU Memory Fraction (default: 0.05, GB10 Unified)"
             echo "  --kv-cache-memory-bytes N  KV-Cache Speicher, z.B. 10G (default: auto)"
