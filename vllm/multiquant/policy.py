@@ -672,6 +672,77 @@ class MultiQuantPolicyRegistry:
             )
         logger.info("")
 
+    def build_summary_json(self) -> dict:
+        """Serialize aggregated stats as JSON-safe dict for cache persistence.
+
+        Same data as `log_stats_summary()` writes to stdout, plus per-class
+        full mse/bits-distribution breakdown suitable for cross-run
+        analysis by tools/pack_report.py. Fires even if _stats is empty
+        (returns minimal stub).
+        """
+        self._ensure_stats_storage()
+        groups: dict[str, list[object]] = {}
+        for lt, st in self._stats:
+            groups.setdefault(lt, []).append(st)
+
+        from collections import Counter
+        by_layer_class: dict = {}
+        total_params = 0
+        total_bits_weighted = 0.0
+        total_outlier_weighted = 0.0
+        for lt, items in groups.items():
+            n = len(items)
+            class_params = sum(s.shape[0] * s.shape[1] for s in items)
+            bit_counts = dict(Counter(int(s.bits) for s in items))
+            # Aggregate stats (mean over layers of this class)
+            mean_cos = sum(s.cos_sim for s in items) / n
+            mean_mse = sum(s.mse for s in items) / n
+            mean_outlier_fraction = sum(
+                getattr(s, "outlier_fraction", 0) for s in items) / n
+            eff_bits_class = (
+                sum(s.shape[0] * s.shape[1] * s.bits for s in items)
+                / class_params if class_params else 0.0)
+            by_layer_class[lt] = {
+                "count": n,
+                "total_params": class_params,
+                "bits_histogram": bit_counts,
+                "avg_cos_sim": round(mean_cos, 6),
+                "avg_mse": round(mean_mse, 9),
+                "avg_outlier_fraction": round(mean_outlier_fraction, 6),
+                "eff_bits_per_param": round(eff_bits_class, 4),
+            }
+            total_params += class_params
+            total_bits_weighted += sum(
+                s.shape[0] * s.shape[1] * s.bits for s in items)
+            total_outlier_weighted += sum(
+                s.shape[0] * s.shape[1] * getattr(s, "outlier_fraction", 0)
+                for s in items)
+
+        totals = {
+            "n_layers": len(self._stats),
+            "n_classes": len(groups),
+            "total_params": total_params,
+            "eff_bits_per_param": (
+                round(total_bits_weighted / total_params, 4)
+                if total_params > 0 else 0.0),
+            "avg_outlier_fraction": (
+                round(total_outlier_weighted / total_params, 6)
+                if total_params > 0 else 0.0),
+        }
+
+        # Snapshot all XFP_* / MULTIQUANT_* env vars (knob sweeps)
+        import os
+        hyperparams = {
+            k: v for k, v in os.environ.items()
+            if k.startswith(("XFP_", "MULTIQUANT_"))
+        }
+
+        return {
+            "by_layer_class": by_layer_class,
+            "totals": totals,
+            "hyperparams": hyperparams,
+        }
+
 
 # ─── Central weight-method dispatcher ──────────────────────────────
 

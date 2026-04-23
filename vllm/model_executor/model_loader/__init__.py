@@ -13,6 +13,9 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesMod
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.multiquant_loader import (
+    MultiQuantCacheOnlyLoader,
+)
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
@@ -37,6 +40,7 @@ LoadFormats = Literal[
     "gguf",
     "instanttensor",
     "mistral",
+    "multiquant",
     "npcache",
     "pt",
     "runai_streamer",
@@ -54,6 +58,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "gguf": GGUFModelLoader,
     "instanttensor": DefaultModelLoader,
     "mistral": DefaultModelLoader,
+    "multiquant": MultiQuantCacheOnlyLoader,
     "npcache": DefaultModelLoader,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,

@@ -108,9 +108,27 @@ class BaseModelLoader(ABC):
 
             process_weights_after_loading(model, model_config, target_device)
 
-            # Finalize cache (write manifest + log summary) after all
-            # per-layer process_weights_after_loading calls have fired.
-            _finalize_multiquant_cache()
+            # Finalize cache (write manifest + log summary + dump
+            # residuals) after all per-layer process_weights_after_loading
+            # calls have fired.
+            _finalize_multiquant_cache(model)
+
+            # MULTIQUANT_QUANT_ONLY: we've written the full cache shard
+            # + residuals to disk. Exit cleanly before vLLM proceeds to
+            # profile_run / CUDA-graph-capture / server bootstrap, which
+            # would OOM because the packed tensors were intentionally
+            # stripped from the layers (see online_moe.py /
+            # online_linear.py quant-only blocks).
+            import os as _os
+            if _os.environ.get("MULTIQUANT_QUANT_ONLY", "").lower() in (
+                "1", "true", "yes", "on",
+            ):
+                import sys
+                logger.info(
+                    "MULTIQUANT_QUANT_ONLY=1 — cache+residuals written, "
+                    "exiting without serving."
+                )
+                sys.exit(0)
 
         return model.eval()
 
@@ -180,8 +198,16 @@ def _initialize_multiquant_cache(
     MultiQuantWeightCache.set_active(cache)
 
 
-def _finalize_multiquant_cache() -> None:
-    """Write manifest + summary log at the end of model load."""
+def _finalize_multiquant_cache(model: nn.Module | None = None) -> None:
+    """Write manifest + summary log at the end of model load.
+
+    When ``model`` is provided and the cache is writable, also dump
+    ``residuals.safetensors`` — all Parameters/buffers that still hold
+    non-zero data after the MultiQuant-packed layers zeroed theirs.
+    That file is the missing half for a future cache-only reload
+    (tp-xfp workflow): cache shards carry the quantized weights,
+    residuals carry embed_tokens / RMSNorms / biases / non-fp8 lm_head.
+    """
     try:
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         from vllm.multiquant.weight_cache import MultiQuantWeightCache
@@ -195,6 +221,27 @@ def _finalize_multiquant_cache() -> None:
         registry = MultiQuantPolicyRegistry.get_active()
         inventory = [p.stem for p in cache.cache_dir.glob("*.safetensors")]
         cache.write_manifest(registry, inventory)
+        if model is not None:
+            cache.save_residuals(model)
         cache.log_summary()
+
+        # Persist structured xfp_summary.json for offline analysis
+        # (see tools/pack_report.py). Sits next to manifest.json.
+        if registry is not None and hasattr(registry, "build_summary_json"):
+            try:
+                import json as _json
+                summary = registry.build_summary_json()
+                summary_path = cache.cache_dir / "xfp_summary.json"
+                summary_path.write_text(
+                    _json.dumps(summary, indent=2, sort_keys=True))
+                logger.info(
+                    "MultiQuant cache: wrote xfp_summary.json "
+                    "(%d classes, %d layers)",
+                    summary["totals"]["n_classes"],
+                    summary["totals"]["n_layers"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "MultiQuant cache: xfp_summary.json write failed: %s", e)
     except Exception as e:
         logger.warning("MultiQuant cache: finalize failed (%s)", e)

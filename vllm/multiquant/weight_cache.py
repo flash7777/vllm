@@ -78,6 +78,18 @@ def _tensor_cpu_contig(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous()
 
 
+def _guess_device(model) -> torch.device:
+    """Pick a sensible device for materializing a meta-Parameter from
+    residuals. Looks for any already-materialized param on the model and
+    copies its device; falls back to cuda:0 (most common), then cpu."""
+    for p in model.parameters():
+        if p is not None and p.data.numel() > 0 and p.data.device.type != "meta":
+            return p.data.device
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
 class MultiQuantWeightCache:
     """Per-process disk cache. Singleton via ``get_active()``."""
 
@@ -229,6 +241,17 @@ class MultiQuantWeightCache:
         moe_lloyd = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
         auto_min_cos = float(os.environ.get("XFP_MIN_COS", "0.98"))
         moe_sample = int(os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
+        # TP/EP are intentionally NOT in the cache key by default: the
+        # packed bytes (codebook + indices) are per-layer complete
+        # [E, N, K] tensors; slicing by rank happens at cache-load time.
+        # That means one pack serves any TP/EP config. Set
+        # MULTIQUANT_CACHE_TP_SPECIFIC=1 to opt back into TP-specific
+        # shards if a quant method stores pre-sliced data.
+        tp_in_hash = (
+            f"|tp={tp_size}|ep={ep_size}"
+            if _env_truthy("MULTIQUANT_CACHE_TP_SPECIFIC")
+            else ""
+        )
         h.update(
             f"|sigma={_DEFAULT_OUTLIER_SIGMA}"
             f"|maxf={_DEFAULT_OUTLIER_MAX_FRACTION}"
@@ -236,7 +259,7 @@ class MultiQuantWeightCache:
             f"|moe_lloyd={moe_lloyd}"
             f"|min_cos={auto_min_cos}"
             f"|moe_sample={moe_sample}"
-            f"|tp={tp_size}|ep={ep_size}"
+            f"{tp_in_hash}"
             f"|schema={_MANIFEST_SCHEMA_VERSION}".encode()
         )
         return h.hexdigest()[:16]
@@ -435,6 +458,13 @@ class MultiQuantWeightCache:
         if self.read_only:
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Capture all XFP_* and MULTIQUANT_* env vars so offline analysis
+        # (tools/pack_report.py) can diff hyperparameter sweeps across
+        # shards without having to parse stdout logs.
+        env_snapshot = {
+            k: v for k, v in os.environ.items()
+            if k.startswith(("XFP_", "MULTIQUANT_"))
+        }
         mf = {
             "schema": _MANIFEST_SCHEMA_VERSION,
             "cache_key": self.cache_key,
@@ -443,11 +473,7 @@ class MultiQuantWeightCache:
             "policy": registry.to_dict() if registry is not None else {},
             "inventory": sorted(inventory),
             "vllm_version": _best_effort_vllm_version(),
-            "env": {
-                "XFP_MOE_LLOYD_ITERS":
-                    os.environ.get("XFP_MOE_LLOYD_ITERS", "5"),
-                "XFP_MIN_COS": os.environ.get("XFP_MIN_COS", "0.98"),
-            },
+            "env": env_snapshot,
         }
         path = self.cache_dir / "manifest.json"
         tmp = path.with_suffix(".json.tmp")
@@ -490,6 +516,188 @@ class MultiQuantWeightCache:
                 mf.get("cache_key"), self.cache_key,
             )
             return False
+        return True
+
+    # ─── Residuals (for cache-only load) ─────────────────────────────
+    #
+    # After MultiQuant-packed layers have replaced their bf16 storage with
+    # packed/codebook/outlier tensors (and shrunk the bf16 Parameter to
+    # numel=0), whatever non-zero Parameter data remains on the model are
+    # the "residuals": embed_tokens, RMSNorms, e_score_correction_bias,
+    # non-fp8 lm_heads. For 397B these are ~2–3 GB total.
+    #
+    # Dumping them to <cache_dir>/residuals.safetensors lets a later run
+    # reconstruct the full model from just (cache + residuals) — no bf16
+    # source on disk required. That's what enables TP=2 XFP on a 397B
+    # model that won't fit on PGX's 916 GB disk as bf16 source.
+
+    def save_residuals(self, model) -> bool:
+        """Dump all non-zero-numel parameters to residuals.safetensors.
+
+        Call once at end of load_model after all
+        process_weights_after_loading ran — at that point, MultiQuant
+        layers have zeroed their bf16 params and only non-quant params
+        (embed, norms, etc) still carry data.
+        """
+        if self.read_only:
+            return False
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            logger.warning(
+                "MultiQuant cache: safetensors unavailable — residuals skipped",
+            )
+            return False
+
+        # MultiQuant quant methods store their per-layer packed/codebook/
+        # outlier tensors as regular nn.Parameters on the layer (so vllm's
+        # state_dict sees them). Those live in the per-layer cache shards
+        # already, so they MUST be excluded from the residuals bundle or we
+        # double-store the entire model (~70 GB bf16 → 19 GB residuals +
+        # 17 GB cache for 35B before this filter).
+        # Param names end with e.g. ".linear_attn.in_proj_ba.xfp_packed"
+        # (Linear path) or ".mlp.experts.w13_xfp_packed" (MoE path). The
+        # leading "." matters — plain "xfp_packed" would also match a
+        # hypothetical ".foo_xfp_packed" which we'd want to treat as
+        # residual. Explicit prefixes keep this conservative.
+        _MQ_PARAM_SUFFIXES = (
+            ".xfp_packed", ".xfp_codebook",
+            ".xfp_outlier_row", ".xfp_outlier_col", ".xfp_outlier_val",
+            ".w13_xfp_packed", ".w13_xfp_codebook",
+            ".w2_xfp_packed", ".w2_xfp_codebook",
+        )
+
+        def _is_mq_packed_param(name: str) -> bool:
+            return any(name.endswith(s) for s in _MQ_PARAM_SUFFIXES)
+
+        tensors: dict[str, torch.Tensor] = {}
+        seen_ptrs: set[int] = set()
+        skipped_mq = 0
+        for name, p in model.named_parameters():
+            if p is None or p.data.numel() == 0:
+                continue
+            if _is_mq_packed_param(name):
+                skipped_mq += 1
+                continue
+            # Deduplicate tied weights (e.g. lm_head <-> embed_tokens)
+            ptr = p.data.data_ptr() if p.data.is_contiguous() else id(p.data)
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            tensors[name] = _tensor_cpu_contig(p.data)
+
+        # Also capture registered buffers (e.g. rotary inv_freq,
+        # e_score_correction_bias if stored as buffer not param)
+        for name, b in model.named_buffers():
+            if b is None or b.numel() == 0:
+                continue
+            ptr = b.data_ptr() if b.is_contiguous() else id(b)
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            # Prefix with "__buffer__/" so loader can distinguish
+            tensors[f"__buffer__/{name}"] = _tensor_cpu_contig(b)
+
+        if not tensors:
+            logger.info("MultiQuant cache: no residuals to dump (empty)")
+            return True
+
+        path = self.cache_dir / "residuals.safetensors"
+        tmp = path.with_suffix(".safetensors.tmp")
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            save_file(
+                tensors,
+                str(tmp),
+                metadata={
+                    "cache_key": self.cache_key,
+                    "schema": str(_MANIFEST_SCHEMA_VERSION),
+                    "count": str(len(tensors)),
+                },
+            )
+            tmp.replace(path)
+            total_bytes = sum(t.numel() * t.element_size()
+                              for t in tensors.values())
+            logger.info(
+                "MultiQuant cache: wrote residuals → %s "
+                "(%d tensors, %.2f GB, %d mq-packed params excluded)",
+                path, len(tensors), total_bytes / (1024 ** 3), skipped_mq,
+            )
+            return True
+        except (OSError, RuntimeError) as e:
+            logger.warning(
+                "MultiQuant cache: residuals dump failed (%s): %s", path, e,
+            )
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            return False
+
+    def load_residuals(self, model) -> bool:
+        """Load residuals.safetensors into the model.
+
+        Expects `save_residuals()` was called on a previous run. Copies
+        tensors in-place into matching Parameter/buffer tensors. Raises
+        if the file is missing and returns False for soft failures.
+        """
+        path = self.cache_dir / "residuals.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MultiQuant cache-only load: residuals missing at {path}. "
+                f"Run once with bf16 source to populate the cache."
+            )
+
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            logger.error("MultiQuant cache: safetensors unavailable")
+            return False
+
+        name_to_param = {n: p for n, p in model.named_parameters()}
+        name_to_buffer = {n: b for n, b in model.named_buffers()}
+        loaded = 0
+        skipped: list[str] = []
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                if key.startswith("__buffer__/"):
+                    target_name = key[len("__buffer__/"):]
+                    target = name_to_buffer.get(target_name)
+                else:
+                    target = name_to_param.get(key)
+                    target_name = key
+                if target is None:
+                    skipped.append(target_name)
+                    continue
+                # Materialize if meta, then copy
+                if target.device.type == "meta" or target.numel() == 0:
+                    # Parameter's storage is meta — materialize on
+                    # its "intended" device. Best guess: same as the
+                    # model's other params. Fallback: cpu.
+                    if isinstance(target, torch.nn.Parameter):
+                        target.data = tensor.to(
+                            dtype=target.data.dtype,
+                            device=_guess_device(model),
+                        ).contiguous()
+                    else:
+                        target.data = tensor.to(device=target.device).contiguous()
+                else:
+                    target.data.copy_(tensor.to(
+                        dtype=target.data.dtype, device=target.device,
+                    ))
+                loaded += 1
+
+        logger.info(
+            "MultiQuant cache: loaded residuals ← %s (%d tensors, %d skipped)",
+            path, loaded, len(skipped),
+        )
+        if skipped:
+            logger.warning(
+                "MultiQuant cache: residuals had unknown keys (first 5): %s",
+                skipped[:5],
+            )
         return True
 
     # ─── Summary ──────────────────────────────────────────────────────

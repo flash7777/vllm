@@ -39,12 +39,24 @@ def save_linear(
         tensors["xfp_outlier_row"] = layer.xfp_outlier_row.data
         tensors["xfp_outlier_col"] = layer.xfp_outlier_col.data
         tensors["xfp_outlier_val"] = layer.xfp_outlier_val.data
-    metadata = {
+    metadata: dict = {
         "bits": int(layer._xfp_bits),
         "K": int(layer._xfp_K),
         "N": int(layer._xfp_N),
         "has_outliers": 1 if has_outliers else 0,
     }
+    # Attach full XFPPackStats (cos_sim, mse, outlier_fraction, cos_hist,
+    # outlier_hist, recommended_bits, mse_per_bits, ...) for paper-time
+    # offline analysis via tools/pack_report.py. Negligible size.
+    stats = getattr(layer, "_xfp_stats", None)
+    if stats is not None and hasattr(stats, "to_dict"):
+        try:
+            metadata["stats"] = stats.to_dict()
+        except Exception as e:
+            logger.warning(
+                "XFP cache: stats.to_dict failed for %s (%s) — saving without",
+                layer_prefix, e,
+            )
     return cache.save(layer_prefix, _XFP_LINEAR_METHOD, tensors, metadata)
 
 
@@ -95,7 +107,7 @@ def save_moe(
         "w2_xfp_packed":    layer.w2_xfp_packed.data,
         "w2_xfp_codebook":  layer.w2_xfp_codebook.data,
     }
-    metadata = {
+    metadata: dict = {
         "bits":  int(layer._xfp_moe_bits),
         "K13":   int(layer._xfp_moe_K13),
         "N13":   int(layer._xfp_moe_N13),
@@ -105,6 +117,26 @@ def save_moe(
         "fpe13": int(layer._xfp_moe_fpe13),
         "fpe2":  int(layer._xfp_moe_fpe2),
     }
+    # Attach per-projection stats (w13 = gate_up, w2 = down) for offline
+    # analysis. They are the mean-over-experts stats of the pack.
+    stats13 = getattr(layer, "_xfp_moe_stats13", None)
+    stats2 = getattr(layer, "_xfp_moe_stats2", None)
+    if stats13 is not None and hasattr(stats13, "to_dict"):
+        try:
+            metadata["w13_stats"] = stats13.to_dict()
+        except Exception as e:
+            logger.warning(
+                "XFP MoE cache: stats13.to_dict failed for %s (%s)",
+                layer_prefix, e,
+            )
+    if stats2 is not None and hasattr(stats2, "to_dict"):
+        try:
+            metadata["w2_stats"] = stats2.to_dict()
+        except Exception as e:
+            logger.warning(
+                "XFP MoE cache: stats2.to_dict failed for %s (%s)",
+                layer_prefix, e,
+            )
     return cache.save(layer_prefix, _XFP_MOE_METHOD, tensors, metadata)
 
 

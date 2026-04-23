@@ -35,6 +35,8 @@ SERVED_NAME="glm-4.7-flash"
 REASONING_PARSER=""
 TOOL_PARSER=""
 MAX_MODEL_LEN=32768
+LOAD_FORMAT=""            # auto (default) | multiquant (cache-only, no bf16 source needed)
+QUANT_ONLY=false          # pack to cache, exit without serving (no VRAM retention)
 # Auto-detect: GB10 Unified Memory needs very low util — the CUDA profiler
 # lies on UMA (reports <9 GiB free regardless of actual), so anything above
 # ~0.05 causes vLLM to reserve phantom memory and OOM during BF16 load.
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
         --weight-dtype-lm-head) WLMHEAD="$2"; shift 2 ;;
         --model)    MODEL="$2"; shift 2 ;;
         --tp)       TP="$2"; shift 2 ;;
+        --load-format) LOAD_FORMAT="$2"; shift 2 ;;
+        --quant-only) QUANT_ONLY=true; shift ;;
         --mtp)      MTP=true; shift ;;
         --spec)     SPEC_TOKENS="$2"; shift 2 ;;
         --spec-method) SPEC_METHOD="$2"; shift 2 ;;
@@ -168,6 +172,11 @@ fi
 [[ -n "$SHARED" ]] && QUANT_ARGS+=("--weight-dtype-shared" "$SHARED")
 [[ -n "$ATTN" ]]   && QUANT_ARGS+=("--weight-dtype-attn" "$ATTN")
 [[ -n "$WMTP" ]]   && QUANT_ARGS+=("--weight-dtype-mtp" "$WMTP")
+
+# ── Load format (multiquant = cache-only, no bf16 source needed) ─────
+if [[ -n "$LOAD_FORMAT" ]]; then
+    EXTRA_ARGS+=("--load-format" "$LOAD_FORMAT")
+fi
 
 # ── Speculative decoding (MTP / ngram / eagle) ─────────────
 # Legacy: --mtp implies nst=1 ngram. New: --spec N --spec-method M (vLLM 0.17+)
@@ -286,6 +295,9 @@ podman run -d \
   -v "$HOME/vllm-riy/vllm/multiquant:/usr/local/lib/python3.12/dist-packages/vllm/multiquant:ro" \
   -v "$HOME/vllm-riy/vllm/v1/executor/uniproc_executor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/uniproc_executor.py:ro" \
   -v "$HOME/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/model_loader/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/__init__.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/model_loader/base_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/model_loader/multiquant_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/multiquant_loader.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_next.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_next.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5_mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5_mtp.py:ro" \
@@ -298,6 +310,7 @@ podman run -d \
   -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
   ${VLLM_NVTX_PROFILE:+-e VLLM_NVTX_PROFILE="${VLLM_NVTX_PROFILE}"} \
   ${XFP_MOE_SAMPLE_EXPERTS:+-e XFP_MOE_SAMPLE_EXPERTS="${XFP_MOE_SAMPLE_EXPERTS}"} \
+  $($QUANT_ONLY && echo "-e MULTIQUANT_QUANT_ONLY=1") \
   "${CACHE_ENV[@]}" \
   "${QUANT_ENV[@]}" \
   "$IMAGE" \

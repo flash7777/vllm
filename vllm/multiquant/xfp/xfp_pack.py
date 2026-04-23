@@ -74,6 +74,93 @@ class XFPPackStats:
     recommended_bits: int = 0
     recommended_gap: float = 1.0  # mse[chosen] / mse[recommended], ≥1.0
 
+    # Per-channel cosine-similarity histogram: 20 bins in [0.0, 1.0].
+    # Captures the full quality landscape of the layer in 20 ints without
+    # saving all per-channel cos values. See _compute_cos_hist().
+    cos_hist: tuple = field(default_factory=tuple)  # length 20
+
+    # Outlier magnitude histogram: bins for (|w - μ|/σ) ∈
+    # [4σ, 5σ, 6σ, 7σ, 8σ+]. Always length 5; zeros when no outliers.
+    outlier_hist: tuple = field(default_factory=tuple)  # length 5
+
+    # Candidate-gate survival: list aligned to candidates (2, 3, 4) —
+    # True if that bit width met the cos-gate. Picks first True;
+    # `recommended_bits` above is the chosen one (same info cross-check).
+    bits_survived_gate: tuple = field(default_factory=tuple)
+
+    def to_dict(self) -> dict:
+        """Flatten to JSON-safe dict for cache manifest storage.
+
+        Floats rounded to 6 sig figs, dicts/tuples serialised natively.
+        Stays small: ~50 keys × ~10 bytes = <1 KB per layer.
+        """
+        def r(x):
+            return round(float(x), 6) if isinstance(x, (int, float)) else x
+        d = {
+            "bits": int(self.bits),
+            "shape": list(self.shape),
+            "w_mean": r(self.w_mean),
+            "w_std": r(self.w_std),
+            "w_abs_max": r(self.w_abs_max),
+            "outlier_ratio_k3": r(self.outlier_ratio_k3),
+            "outlier_ratio_k4": r(self.outlier_ratio_k4),
+            "mse": r(self.mse),
+            "rmse_rel": r(self.rmse_rel),
+            "max_abs_err": r(self.max_abs_err),
+            "cos_sim": r(self.cos_sim),
+            "outlier_count": int(self.outlier_count),
+            "outlier_sigma": r(self.outlier_sigma),
+            "outlier_fraction": r(self.outlier_fraction),
+            "mse_per_bits": {str(k): r(v)
+                             for k, v in self.mse_per_bits.items()},
+            "recommended_bits": int(self.recommended_bits),
+            "recommended_gap": r(self.recommended_gap),
+            "cos_hist": [int(x) for x in self.cos_hist],
+            "outlier_hist": [int(x) for x in self.outlier_hist],
+            "bits_survived_gate": list(self.bits_survived_gate),
+        }
+        return d
+
+
+def _compute_cos_hist(W: torch.Tensor, rec: torch.Tensor,
+                     n_bins: int = 20) -> tuple:
+    """Per-channel cos-sim distribution over [0, 1] in n_bins (default 20).
+
+    Returns tuple of length n_bins with channel counts per bin. W and rec
+    are [N_out, K]. Robust to all-zero channels (cos=0 put in first bin).
+    """
+    import torch.nn.functional as F
+    if W.dim() != 2 or rec.dim() != 2:
+        return tuple([0] * n_bins)
+    cos = F.cosine_similarity(W.float(), rec.float(), dim=1)  # [N_out]
+    # Replace NaN (zero-norm rows) with 0.0
+    cos = torch.nan_to_num(cos, nan=0.0)
+    # Clamp into [0, 1] (cos can be negative but we care about quality)
+    cos = cos.clamp(0.0, 1.0)
+    # Bin edges: [0, 1/n, 2/n, ..., 1]; last bin inclusive.
+    bin_idx = (cos * n_bins).floor().to(torch.int64)
+    bin_idx = bin_idx.clamp(0, n_bins - 1)
+    counts = torch.bincount(bin_idx, minlength=n_bins)[:n_bins]
+    return tuple(int(x) for x in counts.cpu().tolist())
+
+
+def _compute_outlier_hist(W: torch.Tensor, mu: float, sigma: float) -> tuple:
+    """Outlier magnitude histogram: bins for |w - μ|/σ ∈ {4,5,6,7,8+}.
+
+    Returns tuple of length 5 with absolute counts per sigma-band. mu/sigma
+    from W's own distribution. Sigma=0 returns zeros (no outliers defined).
+    """
+    if sigma == 0:
+        return (0, 0, 0, 0, 0)
+    dev = (W.float() - mu).abs() / max(sigma, 1e-12)
+    # Bands: [4,5), [5,6), [6,7), [7,8), [8,∞)
+    b4 = int(((dev >= 4) & (dev < 5)).sum().item())
+    b5 = int(((dev >= 5) & (dev < 6)).sum().item())
+    b6 = int(((dev >= 6) & (dev < 7)).sum().item())
+    b7 = int(((dev >= 7) & (dev < 8)).sum().item())
+    b8 = int((dev >= 8).sum().item())
+    return (b4, b5, b6, b7, b8)
+
 
 # ─── Lloyd iteration ──────────────────────────────────────────────────
 
@@ -592,6 +679,11 @@ def xfp_pack(
         recommended_bits = bits
         recommended_gap = 1.0
 
+    # Paper-analysis histograms (cheap: O(N_out*K) on already-materialised
+    # tensors). <1 KB per layer after to_dict() → negligible in manifest.
+    cos_hist = _compute_cos_hist(W, W_rec, n_bins=20)
+    outlier_hist = _compute_outlier_hist(W, float(w_mean), float(w_std))
+
     stats = XFPPackStats(
         bits=bits,
         shape=(N_out, K),
@@ -610,6 +702,11 @@ def xfp_pack(
         mse_per_bits=mse_per_bits,
         recommended_bits=recommended_bits,
         recommended_gap=recommended_gap,
+        cos_hist=cos_hist,
+        outlier_hist=outlier_hist,
+        # Gate-survival is only populated in xfp_auto_select path;
+        # xfp_pack itself runs at a pre-chosen bits, so empty here.
+        bits_survived_gate=tuple(),
     )
 
     return (

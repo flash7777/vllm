@@ -301,6 +301,23 @@ class XFPLinearMethod(QuantizeMethodBase):
         # Repack for coalesced warp reads (v4opt kernel expects 1D repacked)
         from vllm.multiquant.xfp.xfp_pack import xfp_repack
         repacked = xfp_repack(packed)
+
+        K = int(W.shape[1])
+        N_out = int(W.shape[0])
+
+        # MULTIQUANT_QUANT_ONLY: cache only, no VRAM retention. Used for
+        # models that don't fit quantized in single-node UMA (e.g. 397B
+        # XFP ~200 GB on 128 GB GB10). Serving happens in a later
+        # --load-format multiquant run on potentially multiple nodes.
+        import os as _os
+        _quant_only = _os.environ.get(
+            "MULTIQUANT_QUANT_ONLY", "").lower() in ("1", "true", "yes", "on")
+
+        # Attach packed tensors to the layer. save_linear() (below)
+        # reads them from layer.xfp_packed/.xfp_codebook/.xfp_outlier_*,
+        # so the attach must happen regardless of mode. In quant-only
+        # mode we strip them AFTER save, leaving nn.Parameters with
+        # size-0 stubs so nothing lingers in VRAM.
         layer.xfp_packed = nn.Parameter(
             repacked.to(device), requires_grad=False
         )
@@ -308,11 +325,6 @@ class XFPLinearMethod(QuantizeMethodBase):
             codebook.to(device), requires_grad=False
         )
 
-        # Outlier sparse residual (v3). Split the flat index back into
-        # (row, col) to make the apply path's scatter-add easy and
-        # torch.compile friendly (no runtime divmod in the hot path).
-        K = int(W.shape[1])
-        N_out = int(W.shape[0])
         if o_idx is not None and o_val is not None and o_idx.numel() > 0:
             o_idx_dev = o_idx.to(device)
             layer.xfp_outlier_row = nn.Parameter(
@@ -367,6 +379,21 @@ class XFPLinearMethod(QuantizeMethodBase):
             del layer.weight
         except AttributeError:
             pass
+
+        # MULTIQUANT_QUANT_ONLY: after cache.save has persisted the
+        # packed artefacts, strip the attached Parameters' storage so
+        # this layer's VRAM footprint returns to ~zero. Critical for
+        # models that are too big to keep quantized in UMA (397B).
+        if _quant_only:
+            for _attr in ("xfp_packed", "xfp_codebook",
+                          "xfp_outlier_row", "xfp_outlier_col",
+                          "xfp_outlier_val"):
+                p = getattr(layer, _attr, None)
+                if p is None:
+                    continue
+                p.data = torch.empty(0, dtype=p.data.dtype, device=p.data.device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def apply(
         self,

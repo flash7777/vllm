@@ -242,6 +242,24 @@ class XFPMoEMethod(FusedMoEMethodBase):
         bits = self.bits
         w13 = layer.w13_weight.data  # [E, N_gate_up, K]
         w2 = layer.w2_weight.data    # [E, N_down, K_down]
+
+        # Diagnostic: under TP>1 Ray, w2 has been observed with <3 dims
+        # (IndexError at shape[2] below). Log the offenders with their
+        # ranks + shapes so we can figure out the sharding pattern.
+        if w13.ndim != 3 or w2.ndim != 3:
+            try:
+                import torch.distributed as _dist
+                _rank = _dist.get_rank() if _dist.is_initialized() else -1
+            except Exception:
+                _rank = -1
+            logger.warning(
+                "XFP MoE: unexpected weight rank at %s "
+                "(dist_rank=%d): w13.shape=%s device=%s | w2.shape=%s device=%s",
+                getattr(layer, "layer_name", "?") or
+                getattr(layer, "prefix", "?"),
+                _rank, tuple(w13.shape), w13.device,
+                tuple(w2.shape), w2.device,
+            )
         E = int(w13.shape[0])
 
         # MoE Lloyd iters: defined BEFORE auto-select so both use the same.
@@ -332,7 +350,25 @@ class XFPMoEMethod(FusedMoEMethodBase):
             reg.record_stats("routed_expert", stats13)
             reg.record_stats("routed_expert", stats2)
 
-        # Store as flat tensors for fused kernel
+        # Attach stats to the layer so save_moe can embed them in the
+        # per-layer _manifest.json metadata for offline analysis.
+        layer._xfp_moe_stats13 = stats13
+        layer._xfp_moe_stats2 = stats2
+
+        # Persist to disk cache *before* any decision about whether to
+        # keep packed tensors on the Layer — quant-only runs exit after
+        # this, so the cache write must have happened first.
+        _quant_only = os.environ.get("MULTIQUANT_QUANT_ONLY", "").lower() in (
+            "1", "true", "yes", "on",
+        )
+
+        # (cache persistence happens below in the existing `if cache is
+        # not None` block — we preserve that order; MULTIQUANT_QUANT_ONLY
+        # only changes what we do AFTER cache.save)
+
+        # Attach packed tensors unconditionally — save_moe reads them
+        # from layer.w13_xfp_packed/.w2_xfp_packed/etc. In quant-only
+        # mode we strip them AFTER save_moe (see below).
         layer.w13_xfp_packed = nn.Parameter(p13.to(device), requires_grad=False)
         layer.w13_xfp_codebook = nn.Parameter(cb13.to(device), requires_grad=False)
         layer.w2_xfp_packed = nn.Parameter(p2.to(device), requires_grad=False)
@@ -357,6 +393,25 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # Persist to disk cache (if enabled) so future loads skip Lloyd.
         if cache is not None and layer_prefix:
             xfp_cache.save_moe(cache, layer_prefix, layer)
+
+        # MULTIQUANT_QUANT_ONLY: now that cache.save has persisted the
+        # packed artefacts, strip the attached Parameters' storage so
+        # this layer's VRAM footprint returns to ~zero. Critical for
+        # 397B XFP on 128 GB UMA (quantized ≈ 200 GB, won't fit
+        # steady-state; only during pack-then-free per layer).
+        if _quant_only:
+            for _attr in ("w13_xfp_packed", "w13_xfp_codebook",
+                          "w2_xfp_packed", "w2_xfp_codebook"):
+                p = getattr(layer, _attr, None)
+                if p is None:
+                    continue
+                p.data = torch.empty(0, dtype=p.data.dtype, device=p.data.device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info(
+                "XFP MoE %s quant-only: cache saved, VRAM stripped",
+                layer_prefix or "?",
+            )
 
         logger.info(
             "XFP MoE: %d experts w13[%dx%d] + w2[%dx%d] -> %s "
