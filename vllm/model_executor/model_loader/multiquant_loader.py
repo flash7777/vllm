@@ -89,12 +89,16 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
         #    We keep size=0 here (no bf16 materialization!) because the
         #    cache-hit code shortly after reassigns .data to the packed
         #    tensor directly anyway.
+        # [xfp_tp] Stub on the *current* device of each TP worker, not
+        # hard-coded cuda:0. Without CUDA_VISIBLE_DEVICES per worker, two
+        # TP ranks would both stub onto physical GPU 0 → second rank OOMs
+        # trying to fit both shares on one GPU. `torch.cuda.current_device()`
+        # returns the per-worker local index vllm's distributed init set.
         import torch as _torch
-        real_dev = (
-            _torch.device("cuda:0")
-            if _torch.cuda.is_available()
-            else _torch.device("cpu")
-        )
+        if _torch.cuda.is_available():
+            real_dev = _torch.device(f"cuda:{_torch.cuda.current_device()}")
+        else:
+            real_dev = _torch.device("cpu")
         n_meta_fixed = 0
         for _, module in model.named_modules():
             for attr in ("w13_weight", "w2_weight", "weight"):
