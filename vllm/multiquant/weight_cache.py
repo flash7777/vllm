@@ -81,12 +81,18 @@ def _tensor_cpu_contig(t: torch.Tensor) -> torch.Tensor:
 def _guess_device(model) -> torch.device:
     """Pick a sensible device for materializing a meta-Parameter from
     residuals. Looks for any already-materialized param on the model and
-    copies its device; falls back to cuda:0 (most common), then cpu."""
+    copies its device; falls back to current CUDA device (per-worker in
+    TP), then cpu.
+
+    [xfp_tp] Must NOT hard-code cuda:0 — a TP>1 serve has each rank using
+    its own physical GPU and hard-coding cuda:0 would make rank N>0 write
+    residuals to rank 0's GPU, doubling its memory footprint.
+    """
     for p in model.parameters():
         if p is not None and p.data.numel() > 0 and p.data.device.type != "meta":
             return p.data.device
     if torch.cuda.is_available():
-        return torch.device("cuda:0")
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
     return torch.device("cpu")
 
 
