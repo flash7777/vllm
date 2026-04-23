@@ -89,25 +89,41 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
         #    We keep size=0 here (no bf16 materialization!) because the
         #    cache-hit code shortly after reassigns .data to the packed
         #    tensor directly anyway.
-        # [xfp_tp] Stub on this worker's physical GPU. Depending on how
-        # the worker was launched, cuda:0 may refer to the shared GPU 0
-        # for every rank (CUDA_VISIBLE_DEVICES unset) — that's the bug
-        # that made TP>1 serves OOM on rank 0 while rank 1's GPU sat idle.
-        # Fix: pick device = cuda:{tp_rank} when >1 GPUs are visible, else
-        # cuda:0 (CUDA_VISIBLE_DEVICES already restricted our view).
+        # [xfp_tp] Stub on this worker's physical GPU.
         import torch as _torch
         if _torch.cuda.is_available():
+            _tp_rank = -1
+            _tp_source = "default"
             try:
                 from vllm.distributed import (
                     get_tensor_model_parallel_rank,
                 )
-                _rank = get_tensor_model_parallel_rank()
-            except Exception:
-                _rank = 0
-            if _torch.cuda.device_count() > 1:
-                real_dev = _torch.device(f"cuda:{_rank}")
+                _tp_rank = get_tensor_model_parallel_rank()
+                _tp_source = "vllm.distributed"
+            except Exception as _e:
+                try:
+                    import torch.distributed as _td
+                    if _td.is_initialized():
+                        _tp_rank = _td.get_rank()
+                        _tp_source = "torch.distributed"
+                except Exception:
+                    pass
+            if _tp_rank < 0:
+                _tp_rank = 0
+                _tp_source = "fallback=0"
+            _cur = _torch.cuda.current_device()
+            _count = _torch.cuda.device_count()
+            # Pick: if CUDA_VISIBLE_DEVICES restricts to 1 GPU, our cuda:0
+            # is already the right GPU. Otherwise, use cuda:{tp_rank}.
+            if _count > 1:
+                real_dev = _torch.device(f"cuda:{_tp_rank}")
             else:
                 real_dev = _torch.device("cuda:0")
+            logger.info(
+                "[xfp_tp] stub device=%s (tp_rank=%d [%s], "
+                "current_device=%d, device_count=%d)",
+                real_dev, _tp_rank, _tp_source, _cur, _count,
+            )
         else:
             real_dev = _torch.device("cpu")
         n_meta_fixed = 0
