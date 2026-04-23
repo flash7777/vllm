@@ -144,27 +144,90 @@ def load_moe(
     cache: MultiQuantWeightCache, layer_prefix: str,
     layer: nn.Module, device: torch.device,
 ) -> bool:
-    res = cache.load(layer_prefix, _XFP_MOE_METHOD, device)
+    # RIY-aware: if the layer has been set up with a pruned expert map
+    # (local_num_experts < global_num_experts), stage the cache tensors on
+    # CPU so we can drop masked experts *before* they consume VRAM. Without
+    # this filter the cache-only loader would always allocate the full
+    # cached expert set and defeat RIY's whole purpose.
+    _expert_map = getattr(layer, "_expert_map", None)
+    _local_E = getattr(layer, "local_num_experts", None)
+    _global_E = getattr(layer, "global_num_experts", None)
+    has_riy_filter = (
+        _expert_map is not None
+        and _local_E is not None
+        and _global_E is not None
+        and _local_E < _global_E
+    )
+
+    stage_device = torch.device("cpu") if has_riy_filter else device
+    res = cache.load(layer_prefix, _XFP_MOE_METHOD, stage_device)
     if res is None:
         return False
     tensors, meta = res
     try:
-        layer.w13_xfp_packed = nn.Parameter(
-            tensors["w13_xfp_packed"], requires_grad=False)
-        layer.w13_xfp_codebook = nn.Parameter(
-            tensors["w13_xfp_codebook"], requires_grad=False)
-        layer.w2_xfp_packed = nn.Parameter(
-            tensors["w2_xfp_packed"], requires_grad=False)
-        layer.w2_xfp_codebook = nn.Parameter(
-            tensors["w2_xfp_codebook"], requires_grad=False)
-        layer._xfp_moe_bits = int(meta["bits"])
+        cached_E = int(meta["E"])
+        fpe13 = int(meta["fpe13"])
+        fpe2 = int(meta["fpe2"])
+        N13 = int(meta["N13"])
+        N2 = int(meta["N2"])
+        bits = int(meta["bits"])
+
+        if has_riy_filter and cached_E < _global_E:
+            logger.warning(
+                "XFP MoE %s: cached E=%d < model global_E=%d — cache was "
+                "packed with a different RIY profile; skipping filter",
+                layer_prefix, cached_E, _global_E,
+            )
+            has_riy_filter = False
+
+        if has_riy_filter:
+            lut = 1 << bits
+            emap_cpu = _expert_map.detach().to("cpu")
+            kept_mask = emap_cpu >= 0  # [cached_E] bool
+            n_kept = int(kept_mask.sum().item())
+            if n_kept != _local_E:
+                raise ValueError(
+                    f"RIY filter: _expert_map keeps {n_kept} but "
+                    f"local_num_experts={_local_E}")
+
+            def _filter(t: torch.Tensor, per_expert: int) -> torch.Tensor:
+                return t.view(cached_E, per_expert)[kept_mask].contiguous().view(-1)
+
+            w13p = _filter(tensors["w13_xfp_packed"], fpe13).to(device)
+            w13c = _filter(tensors["w13_xfp_codebook"], N13 * lut).to(device)
+            w2p = _filter(tensors["w2_xfp_packed"], fpe2).to(device)
+            w2c = _filter(tensors["w2_xfp_codebook"], N2 * lut).to(device)
+
+            layer.w13_xfp_packed = nn.Parameter(w13p, requires_grad=False)
+            layer.w13_xfp_codebook = nn.Parameter(w13c, requires_grad=False)
+            layer.w2_xfp_packed = nn.Parameter(w2p, requires_grad=False)
+            layer.w2_xfp_codebook = nn.Parameter(w2c, requires_grad=False)
+
+            effective_E = _local_E
+            logger.info(
+                "XFP MoE %s ← cache +RIY: kept %d/%d experts (−%.1f%% VRAM)",
+                layer_prefix, _local_E, cached_E,
+                100.0 * (cached_E - _local_E) / cached_E,
+            )
+        else:
+            layer.w13_xfp_packed = nn.Parameter(
+                tensors["w13_xfp_packed"], requires_grad=False)
+            layer.w13_xfp_codebook = nn.Parameter(
+                tensors["w13_xfp_codebook"], requires_grad=False)
+            layer.w2_xfp_packed = nn.Parameter(
+                tensors["w2_xfp_packed"], requires_grad=False)
+            layer.w2_xfp_codebook = nn.Parameter(
+                tensors["w2_xfp_codebook"], requires_grad=False)
+            effective_E = cached_E
+
+        layer._xfp_moe_bits = bits
         layer._xfp_moe_K13 = int(meta["K13"])
-        layer._xfp_moe_N13 = int(meta["N13"])
+        layer._xfp_moe_N13 = N13
         layer._xfp_moe_K2 = int(meta["K2"])
-        layer._xfp_moe_N2 = int(meta["N2"])
-        layer._xfp_moe_E = int(meta["E"])
-        layer._xfp_moe_fpe13 = int(meta["fpe13"])
-        layer._xfp_moe_fpe2 = int(meta["fpe2"])
+        layer._xfp_moe_N2 = N2
+        layer._xfp_moe_E = effective_E
+        layer._xfp_moe_fpe13 = fpe13
+        layer._xfp_moe_fpe2 = fpe2
         layer._xfp_moe_packed = True
         return True
     except (KeyError, ValueError) as e:
