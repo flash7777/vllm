@@ -289,8 +289,14 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
         except ImportError:
             FusedMoE = None
         if FusedMoE is not None and isinstance(module, FusedMoE):
-            _target = torch.device("cuda:0") if torch.cuda.is_available() \
-                else torch.device("cpu")
+            # [xfp_tp] Use per-worker current device, not hardcoded cuda:0.
+            # Otherwise every TP rank swaps its meta MoE params onto GPU 0,
+            # making rank 0's GPU hold the full (unsharded) model and OOM.
+            if torch.cuda.is_available():
+                _target = torch.device(
+                    f"cuda:{torch.cuda.current_device()}")
+            else:
+                _target = torch.device("cpu")
             for _pname in list(module._parameters.keys()):
                 _p = module._parameters[_pname]
                 if _p is None or _p.device.type != "meta":
