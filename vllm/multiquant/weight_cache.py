@@ -635,6 +635,45 @@ class MultiQuantWeightCache:
                 pass
             return False
 
+    @staticmethod
+    def _tp_slice_if_needed(
+        tensor: torch.Tensor, target_shape: tuple,
+    ) -> torch.Tensor:
+        """Slice cached tensor along its TP-split dim to match target.
+
+        The cache is TP-agnostic (pack can happen at TP=1, serve at any TP).
+        Residual params whose owning modules are ColumnParallel- /
+        RowParallelLinear / VocabParallelEmbedding will have a per-rank
+        target shape that is smaller than the cached full-size tensor.
+
+        Strategy: find the first dim where sizes differ, assert the ratio
+        equals TP world size, narrow along that dim. If no mismatch, return
+        tensor unchanged.
+        """
+        if tuple(tensor.shape) == tuple(target_shape):
+            return tensor
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            tp_world = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            return tensor
+        if tp_world == 1:
+            return tensor
+        for dim, (t_sz, c_sz) in enumerate(
+                zip(target_shape, tensor.shape)):
+            if t_sz == c_sz:
+                continue
+            if c_sz != t_sz * tp_world:
+                # Not a TP-slice mismatch — let the caller raise on
+                # copy_() so the operator sees the original error.
+                return tensor
+            return tensor.narrow(dim, tp_rank * t_sz, t_sz).contiguous()
+        return tensor
+
     def load_residuals(self, model) -> bool:
         """Load residuals.safetensors into the model.
 
@@ -671,6 +710,13 @@ class MultiQuantWeightCache:
                 if target is None:
                     skipped.append(target_name)
                     continue
+                # TP-slice: cache is TP-agnostic (pack can be TP=1, serve
+                # any TP). Slice cached tensor along its TP-parallel dim
+                # if the target (already laid out for this rank's slice)
+                # is smaller.
+                target_shape = tuple(target.data.shape)
+                if target.numel() > 0 and tuple(tensor.shape) != target_shape:
+                    tensor = self._tp_slice_if_needed(tensor, target_shape)
                 # Materialize if meta, then copy
                 if target.device.type == "meta" or target.numel() == 0:
                     # Parameter's storage is meta — materialize on
