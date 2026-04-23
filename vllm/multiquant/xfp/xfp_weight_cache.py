@@ -309,6 +309,13 @@ def load_moe(
         w2c = cb2_view.contiguous().reshape(-1)
 
         # Move to device + attach.
+        logger.info(
+            "[xfp_tp] load_moe %s writing to device=%s (tp_rank=%d, "
+            "current_device=%d, w13p on %s)",
+            layer_prefix, device, tp_rank,
+            torch.cuda.current_device() if torch.cuda.is_available() else -1,
+            w13p.device,
+        )
         layer.w13_xfp_packed = nn.Parameter(w13p.to(device), requires_grad=False)
         layer.w13_xfp_codebook = nn.Parameter(w13c.to(device), requires_grad=False)
         layer.w2_xfp_packed = nn.Parameter(w2p.to(device), requires_grad=False)
