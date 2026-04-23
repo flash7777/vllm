@@ -89,14 +89,25 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
         #    We keep size=0 here (no bf16 materialization!) because the
         #    cache-hit code shortly after reassigns .data to the packed
         #    tensor directly anyway.
-        # [xfp_tp] Stub on the *current* device of each TP worker, not
-        # hard-coded cuda:0. Without CUDA_VISIBLE_DEVICES per worker, two
-        # TP ranks would both stub onto physical GPU 0 → second rank OOMs
-        # trying to fit both shares on one GPU. `torch.cuda.current_device()`
-        # returns the per-worker local index vllm's distributed init set.
+        # [xfp_tp] Stub on this worker's physical GPU. Depending on how
+        # the worker was launched, cuda:0 may refer to the shared GPU 0
+        # for every rank (CUDA_VISIBLE_DEVICES unset) — that's the bug
+        # that made TP>1 serves OOM on rank 0 while rank 1's GPU sat idle.
+        # Fix: pick device = cuda:{tp_rank} when >1 GPUs are visible, else
+        # cuda:0 (CUDA_VISIBLE_DEVICES already restricted our view).
         import torch as _torch
         if _torch.cuda.is_available():
-            real_dev = _torch.device(f"cuda:{_torch.cuda.current_device()}")
+            try:
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                )
+                _rank = get_tensor_model_parallel_rank()
+            except Exception:
+                _rank = 0
+            if _torch.cuda.device_count() > 1:
+                real_dev = _torch.device(f"cuda:{_rank}")
+            else:
+                real_dev = _torch.device("cuda:0")
         else:
             real_dev = _torch.device("cpu")
         n_meta_fixed = 0
