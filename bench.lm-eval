@@ -1,0 +1,207 @@
+#!/bin/bash
+# bench.lm-eval — run lm-eval-harness benchmarks against a running
+# OpenAI-compat server (vLLM, TGI, llama.cpp, OpenAI-proper, …) using the
+# containerised eval harness (localhost/vllm-eval-harness:lm-0.4.11).
+#
+# Usage:
+#   ./bench.lm-eval --label xfp-35b-4sample                       # minimum
+#   ./bench.lm-eval --label smoke --tasks gsm8k --limit 20 --seeds 1
+#   ./bench.lm-eval --label paper-122b --tasks gsm8k,wikitext --seeds 3
+#
+# Notes:
+# - Server must already be running. This wrapper does not start vLLM.
+# - `--model` defaults to the first id from /v1/models.
+# - Output lands under measurements/$(date +%Y%m%d)-eval-harness/<label>/.
+
+set -euo pipefail
+
+# ── Defaults ─────────────────────────────────────────────────
+URL="http://localhost:8011"
+MODEL=""
+TASKS="gsm8k,wikitext"
+SEEDS=3
+LIMIT=0
+CONCURRENCY=32
+OUTDIR=""
+IMAGE="localhost/vllm-eval-harness:lm-0.4.11"
+LABEL=""
+EXTRA_GEN_KWARGS=""   # e.g. top_p=1 etc (already set by defaults below)
+
+# lm-eval task name conventions — gsm8k + wikitext + mmlu are what we care about
+declare -A TASK_FEWSHOT=( [gsm8k]=5 [wikitext]=0 [mmlu]=5 )
+declare -A TASK_MAX_GEN=(  [gsm8k]=256 [wikitext]=0 [mmlu]=8 )
+
+# ── Argparse ─────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --label)       LABEL="$2"; shift 2 ;;
+        --url)         URL="$2"; shift 2 ;;
+        --model)       MODEL="$2"; shift 2 ;;
+        --tasks)       TASKS="$2"; shift 2 ;;
+        --seeds)       SEEDS="$2"; shift 2 ;;
+        --limit)       LIMIT="$2"; shift 2 ;;
+        --concurrency) CONCURRENCY="$2"; shift 2 ;;
+        --outdir)      OUTDIR="$2"; shift 2 ;;
+        --image)       IMAGE="$2"; shift 2 ;;
+        --extra-gen)   EXTRA_GEN_KWARGS=",$2"; shift 2 ;;
+        -h|--help)
+            sed -n '1,25p' "$0"
+            exit 0 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+if [[ -z "$LABEL" ]]; then
+    echo "FEHLER: --label required" >&2
+    exit 1
+fi
+
+OUTDIR="${OUTDIR:-measurements/$(date +%Y%m%d)-eval-harness}"
+RUN_DIR="$OUTDIR/$LABEL"
+mkdir -p "$RUN_DIR"
+
+# ── Image existence check ─────────────────────────────────────
+if ! podman image exists "$IMAGE"; then
+    echo "FEHLER: Image '$IMAGE' nicht gefunden."
+    echo "Bauen mit: eval-harness/build.sh"
+    exit 1
+fi
+
+# ── Preflight against server ─────────────────────────────────
+if ! MODELS_JSON=$(curl -sf --max-time 5 "$URL/v1/models"); then
+    echo "FEHLER: Server unter $URL antwortet nicht (curl /v1/models failed)"
+    exit 1
+fi
+if [[ -z "$MODEL" ]]; then
+    # First id from response
+    MODEL=$(echo "$MODELS_JSON" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])")
+fi
+
+# Resolve a tokenizer that lm-eval can open locally. /v1/models exposes
+# the absolute model path as "root" — use that so we never depend on
+# huggingface-hub lookup for a served-model-name alias.
+TOKENIZER_PATH=$(echo "$MODELS_JSON" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin);
+print(d['data'][0].get('root') or d['data'][0]['id'])" 2>/dev/null || echo "$MODEL")
+
+# Snapshot server context (commit, running process, /v1/models, started-at)
+GIT_COMMIT=$(git -C "$(dirname "$0")" rev-parse HEAD 2>/dev/null || echo "?")
+GIT_DIRTY=$(git -C "$(dirname "$0")" diff --shortstat 2>/dev/null || echo "")
+SERVER_PROC=$(pgrep -af "vllm serve" | head -1 || echo "(no vllm serve process found)")
+
+python3 - "$RUN_DIR/server_config.json" <<PY
+import json, sys, time, os
+out = sys.argv[1]
+cfg = {
+    "label": "$LABEL",
+    "url": "$URL",
+    "model": "$MODEL",
+    "tasks": "$TASKS".split(","),
+    "seeds": $SEEDS,
+    "limit": $LIMIT,
+    "concurrency": $CONCURRENCY,
+    "git_commit": "$GIT_COMMIT",
+    "git_dirty": "$GIT_DIRTY".strip(),
+    "server_proc": """$SERVER_PROC""".strip(),
+    "models_endpoint": json.loads('''$MODELS_JSON'''),
+    "timestamp_start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "lm_eval_version": "0.4.11",
+    "image": "$IMAGE",
+}
+open(out, "w").write(json.dumps(cfg, indent=2, sort_keys=True))
+PY
+
+cat <<BANNER
+╔══════════════════════════════════════════════════════╗
+║  bench.lm-eval                                       ║
+║  Label:      $LABEL
+║  URL:        $URL
+║  Model:      $MODEL
+║  Tasks:      $TASKS
+║  Seeds:      $SEEDS
+║  Limit:      $LIMIT   (0 = full)
+║  Concurrency:$CONCURRENCY
+║  Out:        $RUN_DIR
+║  Image:      $IMAGE
+╚══════════════════════════════════════════════════════╝
+BANNER
+
+# ── Run lm_eval per task × seed ──────────────────────────────
+ANY_FAILED=0
+for task in ${TASKS//,/ }; do
+    nfs=${TASK_FEWSHOT[$task]:-0}
+    mgen=${TASK_MAX_GEN[$task]:-128}
+    for seed in $(seq 0 $((SEEDS-1))); do
+        SEED_DIR_HOST="$RUN_DIR/seed${seed}/${task}"
+        mkdir -p "$SEED_DIR_HOST"
+        echo ""
+        echo "── Task=$task Seed=$seed nfs=$nfs mgen=$mgen ──"
+
+        LIMIT_ARG=""
+        [[ "$LIMIT" != "0" ]] && LIMIT_ARG="--limit $LIMIT"
+
+        # local-completions against the OpenAI-compat /v1/completions endpoint
+        # tokenized_requests=False → server tokenises (what we're measuring)
+        podman run --rm \
+          --network host \
+          -v "$(realpath "$RUN_DIR")":/measurements:rw \
+          -v /data/tensordata:/data/tensordata:ro \
+          -v "$HOME/.cache/huggingface:/root/.cache/huggingface:rw" \
+          -e HF_HOME=/root/.cache/huggingface \
+          "$IMAGE" \
+          lm_eval \
+            --model local-completions \
+            --model_args "base_url=${URL}/v1/completions,model=${MODEL},tokenizer=${TOKENIZER_PATH},num_concurrent=${CONCURRENCY},max_retries=3,tokenized_requests=False" \
+            --tasks "$task" \
+            --num_fewshot "$nfs" \
+            --batch_size 1 \
+            --seed "$seed" \
+            --gen_kwargs "temperature=0,top_p=1,max_gen_toks=${mgen},seed=${seed}${EXTRA_GEN_KWARGS}" \
+            --output_path "/measurements/seed${seed}/${task}" \
+            --log_samples \
+            $LIMIT_ARG \
+            2>&1 | tee "$SEED_DIR_HOST/run.log" \
+          || { echo "task $task seed $seed failed — continuing"; ANY_FAILED=1; }
+
+        # lm-eval writes results.json at an inner subdir named after the
+        # served model id. Normalise: symlink the first results*.json it
+        # finds up to <seed>/<task>/results.json. Target must be RELATIVE
+        # to the symlink's parent so the link works across bind-mount
+        # paths (host and container see different roots).
+        rm -f "$SEED_DIR_HOST/results.json"
+        RES_FILE=$(find "$SEED_DIR_HOST" -mindepth 2 -name "results*.json" 2>/dev/null | head -1)
+        if [[ -n "$RES_FILE" ]]; then
+            # Compute relative path from $SEED_DIR_HOST → $RES_FILE
+            REL_PATH=$(realpath --relative-to="$SEED_DIR_HOST" "$RES_FILE")
+            ln -sf "$REL_PATH" "$SEED_DIR_HOST/results.json"
+        fi
+    done
+done
+
+# ── Aggregate seed results ───────────────────────────────────
+echo ""
+echo "── Aggregating ──"
+podman run --rm \
+  -v "$(realpath "$(dirname "$0")/eval-harness")":/opt/eval:ro \
+  -v "$(realpath "$RUN_DIR")":/run:rw \
+  "$IMAGE" \
+  python -m bench_lm_eval.aggregate --run-dir /run --tasks "$TASKS"
+
+# ── Record end timestamp ─────────────────────────────────────
+python3 - "$RUN_DIR/server_config.json" <<PY
+import json, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+d["timestamp_end"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+open(p, "w").write(json.dumps(d, indent=2, sort_keys=True))
+PY
+
+echo ""
+echo "Done."
+echo "  Summary files:  $RUN_DIR/*.summary.json"
+echo "  Render cross-label table:"
+echo "    podman run --rm -v \$(realpath $OUTDIR):/d -v \$(realpath $(dirname $0)/eval-harness):/opt/eval:ro $IMAGE \\"
+echo "      python -m bench_lm_eval.render_table --date-dir /d --out /d/REPORT.md"
+
+exit $ANY_FAILED
