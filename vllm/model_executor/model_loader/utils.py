@@ -293,8 +293,13 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
             # Otherwise every TP rank swaps its meta MoE params onto GPU 0,
             # making rank 0's GPU hold the full (unsharded) model and OOM.
             if torch.cuda.is_available():
-                _target = torch.device(
-                    f"cuda:{torch.cuda.current_device()}")
+                _cur = torch.cuda.current_device()
+                _target = torch.device(f"cuda:{_cur}")
+                if moe_count == 0:
+                    logger.info(
+                        "[xfp_tp] initialize_streaming_quantload: "
+                        "current_device=%d → _target=%s",
+                        _cur, _target)
             else:
                 _target = torch.device("cpu")
             for _pname in list(module._parameters.keys()):
