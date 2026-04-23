@@ -140,15 +140,35 @@ def save_moe(
     return cache.save(layer_prefix, _XFP_MOE_METHOD, tensors, metadata)
 
 
+_WARP_SIZE = 32
+
+
 def load_moe(
     cache: MultiQuantWeightCache, layer_prefix: str,
     layer: nn.Module, device: torch.device,
 ) -> bool:
-    # RIY-aware: if the layer has been set up with a pruned expert map
-    # (local_num_experts < global_num_experts), stage the cache tensors on
-    # CPU so we can drop masked experts *before* they consume VRAM. Without
-    # this filter the cache-only loader would always allocate the full
-    # cached expert set and defeat RIY's whole purpose.
+    """Load XFP-packed MoE weights for a single layer.
+
+    Applies two load-time filters that the classic vLLM weight_loader does
+    inline but that this cache-only path needs to do explicitly:
+
+    1. **RIY expert-skip** — if ``layer._expert_map`` marks a subset as
+       pruned (``local_num_experts < global_num_experts``), only kept
+       experts are materialized in VRAM.
+    2. **TP slice** — the cache stores TP=1 full-width packed tensors. For
+       TP>1 serves, each rank reads its own slice:
+         * w13 is ColumnParallel (output N-dim split): narrow N on dim=1
+           in the repacked view ``[E, K_groups, N, WS]``.
+         * w2 is RowParallel (input K-dim split): un-repack into
+           ``[E, K_packed_padded, N]``, narrow K_packed on dim=1, re-repack.
+           Un-repack/re-repack is zero-copy + one contiguous() call, plus
+           F.pad when K_packed_tp is not a multiple of warp_size (affects
+           e.g. bits=3 at TP=2: K_packed_tp=48 → padded to 64).
+
+    The cache-save side is unchanged; a single shard serves any TP world
+    size as long as ``K * bits`` is divisible by ``32 * tp_world`` (holds
+    for the usual (K, bits, TP) combinations with K = intermediate_size).
+    """
     _expert_map = getattr(layer, "_expert_map", None)
     _local_E = getattr(layer, "local_num_experts", None)
     _global_E = getattr(layer, "global_num_experts", None)
@@ -159,7 +179,19 @@ def load_moe(
         and _local_E < _global_E
     )
 
-    stage_device = torch.device("cpu") if has_riy_filter else device
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        tp_world = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+    except Exception:
+        tp_world, tp_rank = 1, 0
+
+    # Stage on CPU if either RIY or TP-slice changes the final shape.
+    needs_stage = has_riy_filter or tp_world > 1
+    stage_device = torch.device("cpu") if needs_stage else device
     res = cache.load(layer_prefix, _XFP_MOE_METHOD, stage_device)
     if res is None:
         return False
@@ -170,7 +202,11 @@ def load_moe(
         fpe2 = int(meta["fpe2"])
         N13 = int(meta["N13"])
         N2 = int(meta["N2"])
+        K13 = int(meta["K13"])
+        K2 = int(meta["K2"])
         bits = int(meta["bits"])
+        lut = 1 << bits
+        WS = _WARP_SIZE
 
         if has_riy_filter and cached_E < _global_E:
             logger.warning(
@@ -180,8 +216,26 @@ def load_moe(
             )
             has_riy_filter = False
 
+        if tp_world > 1:
+            if N13 % tp_world != 0 or K2 % tp_world != 0:
+                raise ValueError(
+                    f"TP slice: N13={N13}, K2={K2} must be divisible by "
+                    f"tp_world={tp_world}")
+            # For w2 bit-slice: K2*bits must align at 32*tp_world boundary.
+            if (K2 * bits) % (32 * tp_world) != 0:
+                raise ValueError(
+                    f"TP slice w2: K2*bits={K2*bits} not divisible by "
+                    f"32*tp_world={32*tp_world}; re-pack at target TP")
+
+        # Packed shapes (post-repack): per expert w13 flat of size
+        # K_g13 * N13 * WS, w2 flat of size K_g2 * N2 * WS.
+        K13_packed = (K13 * bits) // 32
+        K_g13 = (K13_packed + WS - 1) // WS
+        K2_packed = (K2 * bits) // 32
+        K_g2 = (K2_packed + WS - 1) // WS
+
+        # Step 1: RIY expert filter (if active) on E-dim.
         if has_riy_filter:
-            lut = 1 << bits
             emap_cpu = _expert_map.detach().to("cpu")
             kept_mask = emap_cpu >= 0  # [cached_E] bool
             n_kept = int(kept_mask.sum().item())
@@ -189,46 +243,106 @@ def load_moe(
                 raise ValueError(
                     f"RIY filter: _expert_map keeps {n_kept} but "
                     f"local_num_experts={_local_E}")
-
-            def _filter(t: torch.Tensor, per_expert: int) -> torch.Tensor:
-                return t.view(cached_E, per_expert)[kept_mask].contiguous().view(-1)
-
-            w13p = _filter(tensors["w13_xfp_packed"], fpe13).to(device)
-            w13c = _filter(tensors["w13_xfp_codebook"], N13 * lut).to(device)
-            w2p = _filter(tensors["w2_xfp_packed"], fpe2).to(device)
-            w2c = _filter(tensors["w2_xfp_codebook"], N2 * lut).to(device)
-
-            layer.w13_xfp_packed = nn.Parameter(w13p, requires_grad=False)
-            layer.w13_xfp_codebook = nn.Parameter(w13c, requires_grad=False)
-            layer.w2_xfp_packed = nn.Parameter(w2p, requires_grad=False)
-            layer.w2_xfp_codebook = nn.Parameter(w2c, requires_grad=False)
-
-            effective_E = _local_E
-            logger.info(
-                "XFP MoE %s ← cache +RIY: kept %d/%d experts (−%.1f%% VRAM)",
-                layer_prefix, _local_E, cached_E,
-                100.0 * (cached_E - _local_E) / cached_E,
-            )
         else:
-            layer.w13_xfp_packed = nn.Parameter(
-                tensors["w13_xfp_packed"], requires_grad=False)
-            layer.w13_xfp_codebook = nn.Parameter(
-                tensors["w13_xfp_codebook"], requires_grad=False)
-            layer.w2_xfp_packed = nn.Parameter(
-                tensors["w2_xfp_packed"], requires_grad=False)
-            layer.w2_xfp_codebook = nn.Parameter(
-                tensors["w2_xfp_codebook"], requires_grad=False)
-            effective_E = cached_E
+            kept_mask = None
+            n_kept = cached_E
 
+        def _select_experts(t: torch.Tensor) -> torch.Tensor:
+            """Slice the E-dim if RIY active, else pass through."""
+            if kept_mask is None:
+                return t
+            return t[kept_mask]
+
+        # Step 2: per-tensor reshape → optional RIY filter → optional TP slice → flatten.
+        # w13 packed [E, K_g13, N13, WS] — slice N on dim 2 for TP
+        w13_view = tensors["w13_xfp_packed"].view(cached_E, K_g13, N13, WS)
+        w13_view = _select_experts(w13_view)
+        if tp_world > 1:
+            N13_tp = N13 // tp_world
+            w13_view = w13_view.narrow(2, tp_rank * N13_tp, N13_tp)
+        else:
+            N13_tp = N13
+        w13p = w13_view.contiguous().reshape(-1)
+        fpe13_tp = K_g13 * N13_tp * WS
+
+        # w13 codebook [E, N13, lut]
+        cb13_view = tensors["w13_xfp_codebook"].view(cached_E, N13, lut)
+        cb13_view = _select_experts(cb13_view)
+        if tp_world > 1:
+            cb13_view = cb13_view.narrow(1, tp_rank * N13_tp, N13_tp)
+        w13c = cb13_view.contiguous().reshape(-1)
+
+        # w2 packed [E, K_g2, N2, WS] — un-repack → slice K → re-repack
+        w2_view = tensors["w2_xfp_packed"].view(cached_E, K_g2, N2, WS)
+        w2_view = _select_experts(w2_view)
+        # un-repack: [E, K_g2, N2, WS] → [E, K_g2, WS, N2] → reshape [E, K_g2*WS, N2]
+        w2_2d = (
+            w2_view.permute(0, 1, 3, 2)
+            .contiguous()
+            .reshape(n_kept, K_g2 * WS, N2)
+        )
+        # Slice K_packed along dim 1
+        if tp_world > 1:
+            K2_packed_tp = K2_packed // tp_world
+            w2_2d = w2_2d.narrow(1, tp_rank * K2_packed_tp, K2_packed_tp)
+            K2_tp = K2 // tp_world
+            K_g2_tp = (K2_packed_tp + WS - 1) // WS
+            pad_needed = K_g2_tp * WS - K2_packed_tp
+            if pad_needed > 0:
+                import torch.nn.functional as F
+                w2_2d = F.pad(w2_2d, (0, 0, 0, pad_needed), value=0)
+        else:
+            K2_tp = K2
+            K_g2_tp = K_g2
+        # Re-repack: [E, K_g2_tp*WS, N2] → [E, K_g2_tp, WS, N2] → permute → [E, K_g2_tp, N2, WS] → flat
+        w2p = (
+            w2_2d.view(n_kept, K_g2_tp, WS, N2)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .reshape(-1)
+        )
+        fpe2_tp = K_g2_tp * N2 * WS
+
+        # w2 codebook [E, N2, lut] — N2 is NOT TP-split (output dim of w2)
+        cb2_view = tensors["w2_xfp_codebook"].view(cached_E, N2, lut)
+        cb2_view = _select_experts(cb2_view)
+        w2c = cb2_view.contiguous().reshape(-1)
+
+        # Move to device + attach.
+        layer.w13_xfp_packed = nn.Parameter(w13p.to(device), requires_grad=False)
+        layer.w13_xfp_codebook = nn.Parameter(w13c.to(device), requires_grad=False)
+        layer.w2_xfp_packed = nn.Parameter(w2p.to(device), requires_grad=False)
+        layer.w2_xfp_codebook = nn.Parameter(w2c.to(device), requires_grad=False)
+
+        effective_E = n_kept
         layer._xfp_moe_bits = bits
-        layer._xfp_moe_K13 = int(meta["K13"])
-        layer._xfp_moe_N13 = N13
-        layer._xfp_moe_K2 = int(meta["K2"])
+        layer._xfp_moe_K13 = K13
+        layer._xfp_moe_N13 = N13_tp
+        layer._xfp_moe_K2 = K2_tp
         layer._xfp_moe_N2 = N2
         layer._xfp_moe_E = effective_E
-        layer._xfp_moe_fpe13 = fpe13
-        layer._xfp_moe_fpe2 = fpe2
+        layer._xfp_moe_fpe13 = fpe13_tp
+        layer._xfp_moe_fpe2 = fpe2_tp
         layer._xfp_moe_packed = True
+
+        if has_riy_filter or tp_world > 1:
+            riy_tag = (
+                f"+RIY({_local_E}/{cached_E})" if has_riy_filter else ""
+            )
+            tp_tag = (
+                f"+TP{tp_world}[rank{tp_rank}] "
+                f"N13 {N13}->{N13_tp} K2 {K2}->{K2_tp}"
+                if tp_world > 1 else ""
+            )
+            # VRAM ratio vs full-cached, per-rank.
+            saved_pct = 100.0 * (
+                1.0 - (n_kept * (fpe13_tp + fpe2_tp))
+                / (cached_E * (fpe13 + fpe2))
+            )
+            logger.info(
+                "XFP MoE %s ← cache %s %s (−%.1f%% VRAM/rank)",
+                layer_prefix, riy_tag, tp_tag, saved_pct,
+            )
         return True
     except (KeyError, ValueError) as e:
         logger.warning(
