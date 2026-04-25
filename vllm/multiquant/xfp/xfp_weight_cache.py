@@ -107,9 +107,16 @@ def save_linear(
                 "tp_role": "row", "input_dim_packed": input_dim_packed},
             "xfp_codebook": {"tp_role": "replicated"},
         }
+    elif tp_role == "qkv":
+        # QKV-fused: if shard_offsets are computable (output_sizes known)
+        # we'd record them here; otherwise the slicer falls back to plain
+        # column slicing on output_dim, which is correct when the fused
+        # output dim is evenly divisible by tp_world.
+        tensor_meta = {
+            "xfp_packed": {"tp_role": "qkv", "output_dim": output_dim},
+            "xfp_codebook": {"tp_role": "qkv", "output_dim": 0},
+        }
     else:
-        # qkv / replicated → callers should provide role-specific kwargs;
-        # default to replicated as safest fallback.
         tensor_meta = {
             "xfp_packed": {"tp_role": tp_role or "replicated"},
             "xfp_codebook": {"tp_role": "replicated"},

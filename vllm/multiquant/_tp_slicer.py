@@ -193,7 +193,20 @@ def slice_for_tp(
         return _slice_dim(tensor, entry["input_dim"], tp_rank, tp_world)
 
     if role == "qkv":
-        return _slice_qkv(tensor, entry, tp_rank, tp_world)
+        # If full qkv shard metadata is present, do per-Q-K-V slicing.
+        # Otherwise fall back to plain column slice — works when the
+        # QKV-fused output dim is evenly divisible by tp_world (which is
+        # the common case for q_heads + 2*kv_heads with kv_heads >= tp_world).
+        if "shard_offsets" in entry and "output_dim" in entry:
+            return _slice_qkv(tensor, entry, tp_rank, tp_world)
+        try:
+            return _slice_dim(
+                tensor, entry.get("output_dim", 1), tp_rank, tp_world)
+        except ValueError as e:
+            logger.warning(
+                "qkv tp_slice fallback (no shard_offsets) failed (%s) — "
+                "keeping replicated", e)
+            return tensor
 
     if role == "merged_column":
         # Fall back to plain column slicing when shard_offsets aren't
