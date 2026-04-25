@@ -317,21 +317,19 @@ class Qwen2_5_VisionAttention(nn.Module):
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
-        # [xfp_tp] Force vision attention to data-parallel under TP > 1.
-        # Qwen3.5-VL config consistently triggers head/rotary mismatches
-        # in profile_run when vision is weight-parallel; running it
-        # data-parallel (full vision per rank) is mathematically correct
-        # and avoids the upstream qk reshape + rotary clamp issues.
-        use_data_parallel = (
-            is_vit_use_data_parallel()
-            or parallel_state.get_tensor_model_parallel_world_size() > 1
+        use_data_parallel = is_vit_use_data_parallel()
+        self.tp_size = (
+            1
+            if use_data_parallel
+            else parallel_state.get_tensor_model_parallel_world_size()
         )
-        self.tp_size = 1
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-        self.num_attention_heads_per_partition = num_heads
+        self.num_attention_heads_per_partition = dist_utils.divide(
+            num_heads, self.tp_size
+        )
 
         self.qkv = QKVParallelLinear(
             hidden_size=embed_dim,
@@ -388,24 +386,10 @@ class Qwen2_5_VisionAttention(nn.Module):
                 qk, "b s two head head_dim -> (two b) s head head_dim", two=2
             )
             qk_reshaped = qk_reshaped.contiguous()
-            # [xfp_tp] Upstream apply_rotary asserts rotary_dim <= head_dim.
-            # Some Qwen3.5-VL configs produce cos/sin with last dim > head_dim
-            # (e.g. partial_rotary_factor=0.5 but cos generated for full
-            # head_dim path) — under TP=2 profile_run this assertion fires.
-            # Clamp cos/sin to the actual head_dim so the rotary kernel
-            # only consumes the leading rotary slice. Mathematically
-            # equivalent for partial-rotary models that designed the leading
-            # K bits as the rotary range.
-            _hd = qk_reshaped.shape[-1]
-            _cos = rotary_pos_emb_cos
-            _sin = rotary_pos_emb_sin
-            if _cos.shape[-1] > _hd:
-                _cos = _cos[..., :_hd]
-                _sin = _sin[..., :_hd]
             qk_rotated = self.apply_rotary_emb(
                 qk_reshaped,
-                _cos,
-                _sin,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
             )
             qk_rotated = qk_rotated.view(
                 2,
