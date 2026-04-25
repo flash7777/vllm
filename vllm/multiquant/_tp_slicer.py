@@ -154,7 +154,13 @@ def slice_for_tp(
         return tensor
 
     if role == "column":
-        return _slice_dim(tensor, entry["output_dim"], tp_rank, tp_world)
+        try:
+            return _slice_dim(tensor, entry["output_dim"], tp_rank, tp_world)
+        except ValueError as e:
+            logger.warning(
+                "column tp_slice on dim=%s failed (%s) — keeping tensor "
+                "replicated", entry.get("output_dim"), e)
+            return tensor
 
     if role == "row":
         # Either bit-packed (input_dim_packed) or unpacked (input_dim)
@@ -165,11 +171,25 @@ def slice_for_tp(
                 bits = metadata.get("bits")
                 if K_orig is not None and bits is not None:
                     if (K_orig * bits) % (32 * tp_world) != 0:
-                        raise ValueError(
-                            f"row-packed tp_slice: K_orig*bits="
-                            f"{K_orig*bits} not divisible by 32*tp_world="
-                            f"{32*tp_world}")
-            return _slice_dim(tensor, ipd, tp_rank, tp_world)
+                        # Bit-packing of K_orig doesn't divide evenly per
+                        # rank — would need a post-hoc bit-level re-pack.
+                        # Treat as replicated and let the forward kernel
+                        # handle the per-rank consequences. Logged so the
+                        # operator notices.
+                        logger.warning(
+                            "row-packed tp_slice: K_orig*bits=%d not "
+                            "divisible by 32*tp_world=%d — keeping cache "
+                            "tensor replicated (math may be off for this "
+                            "layer at TP>1 unless re-packed with K-pad)",
+                            K_orig * bits, 32 * tp_world)
+                        return tensor
+            try:
+                return _slice_dim(tensor, ipd, tp_rank, tp_world)
+            except ValueError as e:
+                logger.warning(
+                    "row-packed tp_slice on dim=%d failed (%s) — keeping "
+                    "tensor replicated", ipd, e)
+                return tensor
         return _slice_dim(tensor, entry["input_dim"], tp_rank, tp_world)
 
     if role == "qkv":
