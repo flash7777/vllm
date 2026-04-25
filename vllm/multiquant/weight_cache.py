@@ -741,17 +741,6 @@ class MultiQuantWeightCache:
 
         # Load the per-param tp_role sidecar for v2 caches.
         from vllm.multiquant._tp_slicer import slice_for_tp
-        # Reuse vllm's own per-Parameter weight_loader when present — it
-        # already encodes the qkv-aware / merged-shard / column / row TP
-        # split semantics for every Parameter class vllm produces. For
-        # residuals (vision QKV, embed_tokens, attn linears, etc.) we just
-        # hand it the full TP=1 tensor and let it slice itself.
-        try:
-            from vllm.model_executor.model_loader.weight_utils import (
-                default_weight_loader,
-            )
-        except ImportError:
-            default_weight_loader = None
         tp_meta_path = self.cache_dir / "residuals_tp_meta.json"
         if tp_meta_path.exists():
             try:
@@ -787,40 +776,14 @@ class MultiQuantWeightCache:
                 if target is None:
                     skipped.append(target_name)
                     continue
-                # Step 1: prefer vllm's own per-Parameter weight_loader
-                # when it's a specialized one (qkv-aware, merged-shard,
-                # column/row-parallel). It already implements every TP
-                # slicing rule vllm needs and yields exact-correct
-                # per-rank tensors. Skip if loader is the default
-                # (non-slicing) one or absent — those need our fallback.
-                wl = getattr(target, "weight_loader", None)
-                if (
-                    tp_world > 1
-                    and wl is not None
-                    and default_weight_loader is not None
-                    and wl is not default_weight_loader
-                    and not key.startswith("__buffer__/")
-                ):
-                    try:
-                        # Materialize meta-device target before the loader
-                        # writes into it.
-                        if target.device.type == "meta" or target.numel() == 0:
-                            target.data = torch.empty(
-                                target.shape,
-                                dtype=target.data.dtype,
-                                device=_guess_device(model),
-                            )
-                        wl(target, tensor)
-                        loaded += 1
-                        continue
-                    except Exception as e:
-                        logger.warning(
-                            "residuals: vllm weight_loader for %s failed "
-                            "(%s) — falling back to manifest slice",
-                            key, e)
-
-                # Step 2: manifest tp_role-based slicing (for params w/o
-                # specialized weight_loader, or where the loader rejected).
+                # v2 path: consult tp_meta for the tp_role and slice via
+                # the generic slicer. After role-based slicing, also run
+                # the shape-based auto-detect fallback when (a) no metadata
+                # is present (legacy residuals) or (b) the role was
+                # "replicated" but the loaded tensor still doesn't fit
+                # the per-rank target shape (e.g. GatedDeltaNet's A_log /
+                # dt_bias which vllm does not annotate with output_dim,
+                # but which still need TP-slicing along their head dim).
                 entry = tp_meta.get(key)
                 if entry is not None and tp_world > 1:
                     try:
@@ -830,7 +793,7 @@ class MultiQuantWeightCache:
                             "residuals tp_slice failed for %s (%s) — "
                             "falling back to shape-based slice",
                             key, e)
-                # Step 3: shape-based fallback (legacy + un-annotated params).
+                # Shape-based fallback (legacy + un-annotated params).
                 if target.numel() > 0:
                     target_shape = tuple(target.data.shape)
                     if tuple(tensor.shape) != target_shape:
