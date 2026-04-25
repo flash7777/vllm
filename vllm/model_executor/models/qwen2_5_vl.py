@@ -386,10 +386,24 @@ class Qwen2_5_VisionAttention(nn.Module):
                 qk, "b s two head head_dim -> (two b) s head head_dim", two=2
             )
             qk_reshaped = qk_reshaped.contiguous()
+            # [xfp_tp] Upstream apply_rotary asserts rotary_dim <= head_dim.
+            # Some Qwen3.5-VL configs produce cos/sin with last dim > head_dim
+            # (e.g. partial_rotary_factor=0.5 but cos generated for full
+            # head_dim path) — under TP=2 profile_run this assertion fires.
+            # Clamp cos/sin to the actual head_dim so the rotary kernel
+            # only consumes the leading rotary slice. Mathematically
+            # equivalent for partial-rotary models that designed the leading
+            # K bits as the rotary range.
+            _hd = qk_reshaped.shape[-1]
+            _cos = rotary_pos_emb_cos
+            _sin = rotary_pos_emb_sin
+            if _cos.shape[-1] > _hd:
+                _cos = _cos[..., :_hd]
+                _sin = _sin[..., :_hd]
             qk_rotated = self.apply_rotary_emb(
                 qk_reshaped,
-                rotary_pos_emb_cos,
-                rotary_pos_emb_sin,
+                _cos,
+                _sin,
             )
             qk_rotated = qk_rotated.view(
                 2,
