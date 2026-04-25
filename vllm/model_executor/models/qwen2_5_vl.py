@@ -317,19 +317,21 @@ class Qwen2_5_VisionAttention(nn.Module):
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
-        use_data_parallel = is_vit_use_data_parallel()
-        self.tp_size = (
-            1
-            if use_data_parallel
-            else parallel_state.get_tensor_model_parallel_world_size()
+        # [xfp_tp] Force vision attention to data-parallel under TP > 1.
+        # Qwen3.5-VL config consistently triggers head/rotary mismatches
+        # in profile_run when vision is weight-parallel; running it
+        # data-parallel (full vision per rank) is mathematically correct
+        # and avoids the upstream qk reshape + rotary clamp issues.
+        use_data_parallel = (
+            is_vit_use_data_parallel()
+            or parallel_state.get_tensor_model_parallel_world_size() > 1
         )
+        self.tp_size = 1
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-        self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, self.tp_size
-        )
+        self.num_attention_heads_per_partition = num_heads
 
         self.qkv = QKVParallelLinear(
             hidden_size=embed_dim,
