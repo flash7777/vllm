@@ -777,8 +777,13 @@ class MultiQuantWeightCache:
                     skipped.append(target_name)
                     continue
                 # v2 path: consult tp_meta for the tp_role and slice via
-                # the generic slicer. Falls back to the legacy auto-detect
-                # if no metadata is present (covers v1 residuals).
+                # the generic slicer. After role-based slicing, also run
+                # the shape-based auto-detect fallback when (a) no metadata
+                # is present (legacy residuals) or (b) the role was
+                # "replicated" but the loaded tensor still doesn't fit
+                # the per-rank target shape (e.g. GatedDeltaNet's A_log /
+                # dt_bias which vllm does not annotate with output_dim,
+                # but which still need TP-slicing along their head dim).
                 entry = tp_meta.get(key)
                 if entry is not None and tp_world > 1:
                     try:
@@ -788,13 +793,10 @@ class MultiQuantWeightCache:
                             "residuals tp_slice failed for %s (%s) — "
                             "falling back to shape-based slice",
                             key, e)
-                        target_shape = tuple(target.data.shape)
-                        if target.numel() > 0 and tuple(tensor.shape) != target_shape:
-                            tensor = self._tp_slice_if_needed(tensor, target_shape)
-                else:
-                    # Legacy fallback (v1 caches without sidecar)
+                # Shape-based fallback (legacy + un-annotated params).
+                if target.numel() > 0:
                     target_shape = tuple(target.data.shape)
-                    if target.numel() > 0 and tuple(tensor.shape) != target_shape:
+                    if tuple(tensor.shape) != target_shape:
                         tensor = self._tp_slice_if_needed(tensor, target_shape)
                 # Materialize if meta, then copy
                 if target.device.type == "meta" or target.numel() == 0:
