@@ -26,6 +26,33 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.multiquant.policy import DTYPE_BITS
 
+def _infer_linear_tp_role(layer: nn.Module) -> str:
+    """Map a vllm Linear-base subclass to its TP-role keyword.
+
+    Used by save_linear to record the slicing axis the generic loader
+    will need at load time. Returns one of:
+        ``column`` | ``row`` | ``qkv`` | ``merged_column`` | ``replicated``
+    """
+    try:
+        from vllm.model_executor.layers.linear import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+            QKVParallelLinear,
+            MergedColumnParallelLinear,
+        )
+    except ImportError:
+        return "replicated"
+    if isinstance(layer, QKVParallelLinear):
+        return "qkv"
+    if isinstance(layer, MergedColumnParallelLinear):
+        return "merged_column"
+    if isinstance(layer, RowParallelLinear):
+        return "row"
+    if isinstance(layer, ColumnParallelLinear):
+        return "column"
+    return "replicated"
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -298,10 +325,11 @@ class XFPLinearMethod(QuantizeMethodBase):
             outlier_max_fraction=self.outlier_max_fraction,
         )
 
-        # Repack for coalesced warp reads (v4opt kernel expects 1D repacked)
-        from vllm.multiquant.xfp.xfp_pack import xfp_repack
-        repacked = xfp_repack(packed)
-
+        # Schema v2: store pre-repack 2D ``[K_packed, N]`` so the cache is
+        # TP-slicable. The on-device warp-interleaved repack happens
+        # below for non-quant-only runs (so the forward kernel sees the
+        # familiar flat layout) and inside ``load_linear`` for cache
+        # warmstarts.
         K = int(W.shape[1])
         N_out = int(W.shape[0])
 
@@ -319,7 +347,7 @@ class XFPLinearMethod(QuantizeMethodBase):
         # mode we strip them AFTER save, leaving nn.Parameters with
         # size-0 stubs so nothing lingers in VRAM.
         layer.xfp_packed = nn.Parameter(
-            repacked.to(device), requires_grad=False
+            packed.to(device), requires_grad=False
         )
         layer.xfp_codebook = nn.Parameter(
             codebook.to(device), requires_grad=False
@@ -371,14 +399,29 @@ class XFPLinearMethod(QuantizeMethodBase):
         )
 
         # Persist to disk cache (if enabled) so future loads skip Lloyd.
+        # Determine the TP role from the linear-layer's class so the
+        # generic load-time slicer can recover this rank's slice.
         if cache is not None and layer_prefix:
-            xfp_cache.save_linear(cache, layer_prefix, layer)
+            tp_role = _infer_linear_tp_role(layer)
+            xfp_cache.save_linear(
+                cache, layer_prefix, layer,
+                tp_role=tp_role,
+                input_dim_packed=0,  # packed is [K_packed, N]
+                output_dim=1,
+            )
 
         # Free the BF16 weight
         try:
             del layer.weight
         except AttributeError:
             pass
+
+        # On-device warp-interleave repack so the forward kernel sees
+        # the familiar flat layout. Skip in quant-only (no forward).
+        if not _quant_only:
+            from vllm.multiquant.xfp._repack import repack_2d_to_warp_flat
+            layer.xfp_packed.data = repack_2d_to_warp_flat(
+                layer.xfp_packed.data)
 
         # MULTIQUANT_QUANT_ONLY: after cache.save has persisted the
         # packed artefacts, strip the attached Parameters' storage so

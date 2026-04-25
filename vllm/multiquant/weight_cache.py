@@ -51,7 +51,14 @@ logger = init_logger(__name__)
 _DEFAULT_OUTLIER_SIGMA = 4.0
 _DEFAULT_OUTLIER_MAX_FRACTION = 0.02
 _LLOYD_ITERS_LINEAR = 20
-_MANIFEST_SCHEMA_VERSION = 1
+# Schema 2: per-shard ``_manifest.json`` carries ``format_version`` plus
+# a ``tensor_meta`` dict that names each cached tensor's tp_role +
+# slicing axes. The XFP packed tensors are stored pre-repack (2D for
+# linear, 3D for MoE) so they slice with simple ``narrow()`` calls; the
+# warp-interleaved repack happens on-device at load time. Schema 1
+# baked repack into storage and had no per-tensor TP metadata — caches
+# from schema 1 are not load-compatible and must be regenerated.
+_MANIFEST_SCHEMA_VERSION = 2
 
 
 def _env_truthy(name: str) -> bool:
@@ -291,6 +298,7 @@ class MultiQuantWeightCache:
         method: str,
         tensors: dict[str, torch.Tensor],
         metadata: Optional[dict[str, str]] = None,
+        tensor_meta: Optional[dict[str, dict]] = None,
     ) -> bool:
         """Persist a per-layer artefact bundle. Returns True on success.
 
@@ -344,12 +352,17 @@ class MultiQuantWeightCache:
                 del tensor_cpu
                 _gc.collect()
             # Manifest lists the keys so load() doesn't need to scandir.
+            # Schema 2: also embed ``tensor_meta`` (per-tensor tp_role +
+            # slicing axes) so the load path can reconstruct per-rank
+            # shards from a TP-agnostic cache.
             (tmp_dir / "_manifest.json").write_text(
                 json.dumps({
+                    "format_version": _MANIFEST_SCHEMA_VERSION,
                     "method": method,
                     "cache_key": self.cache_key,
                     "keys": list(tensors.keys()),
                     "metadata": metadata or {},
+                    "tensor_meta": tensor_meta or {},
                 }, sort_keys=True)
             )
             # Atomic swap: rename tmp_dir -> layer_dir
@@ -380,13 +393,17 @@ class MultiQuantWeightCache:
         layer_prefix: str,
         expected_method: str,
         device: torch.device,
-    ) -> Optional[tuple[dict[str, torch.Tensor], dict[str, str]]]:
-        """Return (tensors_on_device, metadata) or None on miss/mismatch.
+    ) -> Optional[tuple[dict[str, torch.Tensor], dict[str, str], dict[str, dict]]]:
+        """Return (tensors_on_device, metadata, tensor_meta) or None on miss/mismatch.
 
         Reads each per-key .safetensors file inside the layer directory
         and moves its tensor to device, freeing the CPU copy before the
         next read. Peak transient = one tensor at a time (same bound as
         the save path).
+
+        Schema 2: rejects any shard whose ``_manifest.json`` does not
+        carry ``format_version: 2`` — schema 1 caches stored a baked
+        warp-interleaved repack that's not slicable for TP > 1.
         """
         if not layer_prefix:
             return None
@@ -418,6 +435,16 @@ class MultiQuantWeightCache:
             )
             self._load_fail += 1
             return None
+        on_disk_format = manifest.get("format_version", 1)
+        if on_disk_format != _MANIFEST_SCHEMA_VERSION:
+            logger.warning(
+                "MultiQuant cache: %s format_version=%r != expected %d "
+                "(schema 1 had baked warp-interleaved repack and no tp_role "
+                "metadata; re-pack required) → miss",
+                layer_dir, on_disk_format, _MANIFEST_SCHEMA_VERSION,
+            )
+            self._load_fail += 1
+            return None
         try:
             from safetensors import safe_open
             import gc as _gc
@@ -446,10 +473,11 @@ class MultiQuantWeightCache:
             # Promote plain-dict "metadata" block into the output meta
             for mk, mv in (manifest.get("metadata") or {}).items():
                 meta_out[str(mk)] = str(mv)
+            tensor_meta_out: dict[str, dict] = manifest.get("tensor_meta") or {}
             self._hits[expected_method] = \
                 self._hits.get(expected_method, 0) + 1
             self._t_loaded_s += time.perf_counter() - t0
-            return tensors, meta_out
+            return tensors, meta_out, tensor_meta_out
         except (OSError, RuntimeError, ValueError, KeyError) as e:
             self._load_fail += 1
             logger.warning(
@@ -576,7 +604,12 @@ class MultiQuantWeightCache:
         def _is_mq_packed_param(name: str) -> bool:
             return any(name.endswith(s) for s in _MQ_PARAM_SUFFIXES)
 
+        from vllm.multiquant._tp_slicer import infer_tp_role_from_param
         tensors: dict[str, torch.Tensor] = {}
+        # tp_meta: per-param tp_role + axis hints, written next to
+        # residuals.safetensors so the load-time slicer can recover the
+        # rank-specific shard at TP > 1.
+        tp_meta: dict[str, dict] = {}
         seen_ptrs: set[int] = set()
         skipped_mq = 0
         for name, p in model.named_parameters():
@@ -585,12 +618,12 @@ class MultiQuantWeightCache:
             if _is_mq_packed_param(name):
                 skipped_mq += 1
                 continue
-            # Deduplicate tied weights (e.g. lm_head <-> embed_tokens)
             ptr = p.data.data_ptr() if p.data.is_contiguous() else id(p.data)
             if ptr in seen_ptrs:
                 continue
             seen_ptrs.add(ptr)
             tensors[name] = _tensor_cpu_contig(p.data)
+            tp_meta[name] = infer_tp_role_from_param(name, p)
 
         # Also capture registered buffers (e.g. rotary inv_freq,
         # e_score_correction_bias if stored as buffer not param)
@@ -601,15 +634,19 @@ class MultiQuantWeightCache:
             if ptr in seen_ptrs:
                 continue
             seen_ptrs.add(ptr)
-            # Prefix with "__buffer__/" so loader can distinguish
-            tensors[f"__buffer__/{name}"] = _tensor_cpu_contig(b)
+            buf_name = f"__buffer__/{name}"
+            tensors[buf_name] = _tensor_cpu_contig(b)
+            # Buffers are usually replicated (e.g. inv_freq, layer_idx).
+            tp_meta[buf_name] = {"tp_role": "replicated"}
 
         if not tensors:
             logger.info("MultiQuant cache: no residuals to dump (empty)")
             return True
 
         path = self.cache_dir / "residuals.safetensors"
+        tp_meta_path = self.cache_dir / "residuals_tp_meta.json"
         tmp = path.with_suffix(".safetensors.tmp")
+        tmp_meta = tp_meta_path.with_suffix(".json.tmp")
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             save_file(
@@ -622,6 +659,8 @@ class MultiQuantWeightCache:
                 },
             )
             tmp.replace(path)
+            tmp_meta.write_text(json.dumps(tp_meta, indent=2, sort_keys=True))
+            tmp_meta.replace(tp_meta_path)
             total_bytes = sum(t.numel() * t.element_size()
                               for t in tensors.values())
             logger.info(
@@ -700,6 +739,27 @@ class MultiQuantWeightCache:
             logger.error("MultiQuant cache: safetensors unavailable")
             return False
 
+        # Load the per-param tp_role sidecar for v2 caches.
+        from vllm.multiquant._tp_slicer import slice_for_tp
+        tp_meta_path = self.cache_dir / "residuals_tp_meta.json"
+        if tp_meta_path.exists():
+            try:
+                tp_meta = json.loads(tp_meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                tp_meta = {}
+        else:
+            tp_meta = {}
+
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            tp_world = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            tp_world, tp_rank = 1, 0
+
         name_to_param = {n: p for n, p in model.named_parameters()}
         name_to_buffer = {n: b for n, b in model.named_buffers()}
         loaded = 0
@@ -716,18 +776,28 @@ class MultiQuantWeightCache:
                 if target is None:
                     skipped.append(target_name)
                     continue
-                # TP-slice: cache is TP-agnostic (pack can be TP=1, serve
-                # any TP). Slice cached tensor along its TP-parallel dim
-                # if the target (already laid out for this rank's slice)
-                # is smaller.
-                target_shape = tuple(target.data.shape)
-                if target.numel() > 0 and tuple(tensor.shape) != target_shape:
-                    tensor = self._tp_slice_if_needed(tensor, target_shape)
+                # v2 path: consult tp_meta for the tp_role and slice via
+                # the generic slicer. Falls back to the legacy auto-detect
+                # if no metadata is present (covers v1 residuals).
+                entry = tp_meta.get(key)
+                if entry is not None and tp_world > 1:
+                    try:
+                        tensor = slice_for_tp(tensor, entry, tp_rank, tp_world)
+                    except (ValueError, KeyError) as e:
+                        logger.warning(
+                            "residuals tp_slice failed for %s (%s) — "
+                            "falling back to shape-based slice",
+                            key, e)
+                        target_shape = tuple(target.data.shape)
+                        if target.numel() > 0 and tuple(tensor.shape) != target_shape:
+                            tensor = self._tp_slice_if_needed(tensor, target_shape)
+                else:
+                    # Legacy fallback (v1 caches without sidecar)
+                    target_shape = tuple(target.data.shape)
+                    if target.numel() > 0 and tuple(tensor.shape) != target_shape:
+                        tensor = self._tp_slice_if_needed(tensor, target_shape)
                 # Materialize if meta, then copy
                 if target.device.type == "meta" or target.numel() == 0:
-                    # Parameter's storage is meta — materialize on
-                    # its "intended" device. Best guess: same as the
-                    # model's other params. Fallback: cpu.
                     if isinstance(target, torch.nn.Parameter):
                         target.data = tensor.to(
                             dtype=target.data.dtype,

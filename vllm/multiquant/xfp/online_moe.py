@@ -302,48 +302,48 @@ class XFPMoEMethod(FusedMoEMethodBase):
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
         reg = MultiQuantPolicyRegistry.get_active()
 
-        def _expertwise_pack_and_repack(W_stack: torch.Tensor):
-            """W_stack: [E, N, K] -> flat packed [E*fpe], flat codebook [E*N*lut].
+        def _expertwise_pack(W_stack: torch.Tensor):
+            """W_stack: [E, N, K] -> packed [E, K_packed, N], codebook [E, N, lut].
+
+            Schema v2: keep tensors **pre-repack** (3D for MoE, no
+            warp-interleave) so the cache can be TP-sliced with simple
+            ``narrow()`` calls. The forward kernel's warp-interleaved
+            repack happens on-device in ``load_moe`` after slicing.
 
             Packs one expert at a time: float32 transient = N×K×4 bytes
             (~25 MiB) instead of E×N×K×4 (~9 GiB). Critical for 122B+
             models on unified memory.
             """
             E_ = int(W_stack.shape[0])
-            N_ = int(W_stack.shape[1])
-            K_ = int(W_stack.shape[2])
-            lut_size = 1 << bits
-
-            repacked_list = []
+            packed_list = []
             codebook_list = []
             last_stats = None
 
             for e in range(E_):
-                W_e = W_stack[e].float()          # [N, K] float32, ~25 MiB
+                W_e = W_stack[e].float()          # [N, K] float32
                 packed_e, cb_e, _, _, stats_e = xfp_pack(
                     W_e, bits=bits, outlier_sigma=None,
                     lloyd_iters=moe_lloyd_iters,
                 )
                 del W_e
-                repacked_list.append(xfp_repack(packed_e))
+                # packed_e: [K_packed, N] int32 — keep as-is (no repack).
+                packed_list.append(packed_e)
                 codebook_list.append(cb_e)        # [N, lut_size]
-                del packed_e
                 last_stats = stats_e
 
             del W_stack
-            flat_per_expert = repacked_list[0].numel()
-            all_repacked = torch.cat(repacked_list, dim=0)
-            del repacked_list
-            all_codebook = torch.cat(codebook_list, dim=0)
+            # Stack into [E, K_packed, N] / [E, N, lut].
+            all_packed = torch.stack(packed_list, dim=0)
+            del packed_list
+            all_codebook = torch.stack(codebook_list, dim=0)
             del codebook_list
-
-            return all_repacked, all_codebook, flat_per_expert, last_stats
+            return all_packed, all_codebook, last_stats
 
         # Pack w13, then free BF16 w13 before packing w2
-        p13, cb13, fpe13, stats13 = _expertwise_pack_and_repack(w13)
+        p13, cb13, stats13 = _expertwise_pack(w13)
         layer.w13_weight.data = torch.empty(0)  # free BF16
 
-        p2, cb2, fpe2, stats2 = _expertwise_pack_and_repack(w2)
+        p2, cb2, stats2 = _expertwise_pack(w2)
         layer.w2_weight.data = torch.empty(0)  # free BF16
 
         if reg is not None:
@@ -369,6 +369,8 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # Attach packed tensors unconditionally — save_moe reads them
         # from layer.w13_xfp_packed/.w2_xfp_packed/etc. In quant-only
         # mode we strip them AFTER save_moe (see below).
+        # Schema v2: store pre-repack 3D tensors. The on-device
+        # warp-interleaved repack happens in load_moe (post TP-slice).
         layer.w13_xfp_packed = nn.Parameter(p13.to(device), requires_grad=False)
         layer.w13_xfp_codebook = nn.Parameter(cb13.to(device), requires_grad=False)
         layer.w2_xfp_packed = nn.Parameter(p2.to(device), requires_grad=False)
@@ -381,8 +383,14 @@ class XFPMoEMethod(FusedMoEMethodBase):
         layer._xfp_moe_K2 = K2
         layer._xfp_moe_N2 = N2
         layer._xfp_moe_E = E
-        layer._xfp_moe_fpe13 = fpe13
-        layer._xfp_moe_fpe2 = fpe2
+        # fpe = K_groups * N * WS, computed for the kernel's repacked shape.
+        WS = 32
+        K13_packed = (K13 * bits) // 32
+        K_g13 = (K13_packed + WS - 1) // WS
+        K2_packed = (K2 * bits) // 32
+        K_g2 = (K2_packed + WS - 1) // WS
+        layer._xfp_moe_fpe13 = K_g13 * N13 * WS
+        layer._xfp_moe_fpe2 = K_g2 * N2 * WS
         layer._xfp_moe_packed = True
 
         try:
@@ -393,6 +401,18 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # Persist to disk cache (if enabled) so future loads skip Lloyd.
         if cache is not None and layer_prefix:
             xfp_cache.save_moe(cache, layer_prefix, layer)
+
+        # If we're going to keep this layer in VRAM (not quant-only) and
+        # we hit the forward kernel during this run, we must on-device
+        # repack the 3D pre-repack tensors into the warp-interleaved
+        # flat form the kernel reads. quant-only exits before forward,
+        # so we skip the repack to save time.
+        if not _quant_only:
+            from vllm.multiquant.xfp._repack import repack_3d_moe_to_flat
+            w13_flat = repack_3d_moe_to_flat(layer.w13_xfp_packed.data)
+            w2_flat = repack_3d_moe_to_flat(layer.w2_xfp_packed.data)
+            layer.w13_xfp_packed.data = w13_flat
+            layer.w2_xfp_packed.data = w2_flat
 
         # MULTIQUANT_QUANT_ONLY: now that cache.save has persisted the
         # packed artefacts, strip the attached Parameters' storage so
