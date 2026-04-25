@@ -32,6 +32,12 @@ def _infer_linear_tp_role(layer: nn.Module) -> str:
     Used by save_linear to record the slicing axis the generic loader
     will need at load time. Returns one of:
         ``column`` | ``row`` | ``qkv`` | ``merged_column`` | ``replicated``
+
+    A MergedColumnParallelLinear with a *single* element in
+    ``output_sizes`` is effectively a plain ColumnParallelLinear
+    (Qwen3-Next / GatedDeltaNet uses this pattern for in_proj_qkvz and
+    in_proj_ba) — downgrade to ``column`` so the slicer doesn't expect
+    multi-shard ``shard_offsets`` we'd then have to populate.
     """
     try:
         from vllm.model_executor.layers.linear import (
@@ -45,6 +51,9 @@ def _infer_linear_tp_role(layer: nn.Module) -> str:
     if isinstance(layer, QKVParallelLinear):
         return "qkv"
     if isinstance(layer, MergedColumnParallelLinear):
+        out_sizes = getattr(layer, "output_sizes", None)
+        if out_sizes is not None and len(out_sizes) == 1:
+            return "column"
         return "merged_column"
     if isinstance(layer, RowParallelLinear):
         return "row"

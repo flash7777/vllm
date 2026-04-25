@@ -176,8 +176,17 @@ def slice_for_tp(
         return _slice_qkv(tensor, entry, tp_rank, tp_world)
 
     if role == "merged_column":
+        # Fall back to plain column slicing when shard_offsets aren't
+        # recorded (caches written before the merged-shard-offset logic
+        # landed, or single-output-element merged layers like
+        # GatedDeltaNet's in_proj_qkvz where the TP-slice is just a
+        # straight narrow on the output dim).
+        shard_offsets = entry.get("shard_offsets")
+        if shard_offsets is None:
+            return _slice_dim(
+                tensor, entry.get("output_dim", 1), tp_rank, tp_world)
         return _slice_merged(
-            tensor, entry["shard_offsets"], tp_rank, tp_world,
+            tensor, shard_offsets, tp_rank, tp_world,
             output_dim=entry.get("output_dim", 0))
 
     if role == "vocab_parallel":

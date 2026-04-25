@@ -93,9 +93,12 @@ def save_linear(
     # it's replicated (output channels = input dim of original W = K, which is
     # NOT TP-split; codebook is per-output-channel of W which after pack
     # corresponds to N rows, equal to hidden when row-parallel).
-    if tp_role == "column":
+    if tp_role in ("column", "merged_column"):
+        # merged_column with single output_sizes element behaves like
+        # plain column for slicing purposes; the slicer handles missing
+        # shard_offsets by falling back to a straight narrow.
         tensor_meta = {
-            "xfp_packed": {"tp_role": "column", "output_dim": output_dim},
+            "xfp_packed": {"tp_role": tp_role, "output_dim": output_dim},
             "xfp_codebook": {"tp_role": "column", "output_dim": 0},
         }
     elif tp_role == "row":
@@ -105,8 +108,8 @@ def save_linear(
             "xfp_codebook": {"tp_role": "replicated"},
         }
     else:
-        # qkv / merged_column / replicated → caller would need to provide
-        # role-specific kwargs. Default to replicated as safest fallback.
+        # qkv / replicated → callers should provide role-specific kwargs;
+        # default to replicated as safest fallback.
         tensor_meta = {
             "xfp_packed": {"tp_role": tp_role or "replicated"},
             "xfp_codebook": {"tp_role": "replicated"},
