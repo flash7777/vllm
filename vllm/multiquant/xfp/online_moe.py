@@ -438,7 +438,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
             "(fused, fpe=%d/%d, lloyd=%d)",
             E, layer._xfp_moe_N13, layer._xfp_moe_K13,
             layer._xfp_moe_N2, layer._xfp_moe_K2, self.dtype,
-            fpe13, fpe2, moe_lloyd_iters,
+            layer._xfp_moe_fpe13, layer._xfp_moe_fpe2, moe_lloyd_iters,
         )
 
     def apply(
