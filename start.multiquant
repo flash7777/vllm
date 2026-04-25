@@ -87,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --max-model-len)       MAX_MODEL_LEN="$2"; shift 2 ;;
         --max-num-seqs)        EXTRA_ARGS+=("--max-num-seqs" "$2"); shift 2 ;;
         --mm-encoder-tp-mode)  EXTRA_ARGS+=("--mm-encoder-tp-mode" "$2"); shift 2 ;;
+        --limit-mm-per-prompt) EXTRA_ARGS+=("--limit-mm-per-prompt" "$2"); shift 2 ;;
         --gpu-memory-utilization) GPU_MEM_UTIL="$2"; shift 2 ;;
         --kv-cache-memory-bytes) KV_CACHE_MEM="$2"; shift 2 ;;
         --port)     PORT="$2"; shift 2 ;;
