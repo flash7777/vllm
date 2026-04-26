@@ -1054,14 +1054,25 @@ class MultiQuantWeightCache:
         # safetensors keys may need a mapping. Try the param name as-is
         # first; if not found, try common rewrites.
         def _candidate_keys(param_name: str) -> list[str]:
-            return [
-                param_name,
-                # vllm wraps Qwen3-VL in language_model.* / visual.* but
-                # the HF checkpoint has the language model un-prefixed.
-                param_name.replace("language_model.", "", 1),
-                # Some checkpoints prefix the visual tower with "model.".
-                param_name.replace("visual.", "model.visual.", 1),
-            ]
+            cands = [param_name]
+            # Qwen3-VL HF layout: ``model.language_model.layers.*`` and
+            # ``model.visual.*`` while vllm exposes
+            # ``language_model.model.layers.*`` and ``visual.*``.
+            if param_name.startswith("language_model.model."):
+                cands.append(
+                    "model.language_model."
+                    + param_name[len("language_model.model."):])
+            if param_name.startswith("language_model.lm_head."):
+                # Top-level in HF (no model.* prefix).
+                cands.append(
+                    "lm_head."
+                    + param_name[len("language_model.lm_head."):])
+            if param_name.startswith("visual."):
+                cands.append("model." + param_name)
+            # Generic fallbacks for older HF layouts.
+            cands.append(
+                param_name.replace("language_model.", "", 1))
+            return cands
 
         from collections import defaultdict
         per_shard: dict[str, list[tuple[str, str, torch.nn.Parameter]]] = (
