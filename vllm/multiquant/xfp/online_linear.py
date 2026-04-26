@@ -281,7 +281,17 @@ class XFPLinearMethod(QuantizeMethodBase):
         from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
 
         W = layer.weight.data  # [N_out, K]
-        device = W.device
+        # Use the worker's current CUDA device, not W.device. Under
+        # streaming-quant init layer.weight.data was reset to a size-0
+        # stub on the constructor's default device (often cuda:0
+        # regardless of the worker's tp_rank), so W.device would route
+        # the per-rank tensors of an XFP cache-hit (packed, codebook,
+        # outliers) onto cuda:0 even on rank 1 — mismatch at forward
+        # time.
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            device = W.device
 
         # ─── Cache check (skip Lloyd + pack if we've done this before) ──
         cache = MultiQuantWeightCache.get_active()
