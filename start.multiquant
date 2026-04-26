@@ -307,6 +307,7 @@ podman run -d \
   -v "$HOME/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/model_loader/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/__init__.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/model_loader/base_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py:ro" \
+  -v "$HOME/vllm-riy/vllm/model_executor/model_loader/default_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/default_loader.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/model_loader/multiquant_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/multiquant_loader.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/model_loader/utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py:ro" \
   -v "$HOME/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro" \

@@ -24,11 +24,16 @@ logger = init_logger(__name__)
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
-    # Subclasses that materialize the cache from a fresh source (PACK)
-    # must set this to True. Cache-only LOAD paths leave it False so
-    # _finalize_multiquant_cache won't overwrite cached residuals with
-    # the per-rank shapes we just constructed during model init.
-    is_pack_loader: bool = False
+    # PACK loaders materialize the cache from a fresh source — they
+    # populate residuals.safetensors. LOAD-only loaders (e.g. the
+    # MultiQuantCacheOnlyLoader) override this to False so the
+    # save_residuals path doesn't overwrite the on-disk TP=1 file with
+    # per-rank tensors. We default to True at this base because:
+    # (a) the only LOAD-only loader is MultiQuantCacheOnlyLoader which
+    #     explicitly sets it to False, and (b) start.multiquant's
+    #     bind-mount whitelist may not always cover default_loader.py,
+    #     which would silently leave it at False otherwise.
+    is_pack_loader: bool = True
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
