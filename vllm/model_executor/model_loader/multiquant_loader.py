@@ -282,30 +282,35 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Drop MoE-expert keys that are filled by XFP cache-hit.
 
-        Each FusedMoE layer with cached XFP shards has a sibling cache
-        directory like ``<layer>.mlp.experts/``. For those layers we
-        skip the BF16 expert-projection keys
-        (``...experts.gate_up_proj.weight``,
-        ``...experts.down_proj.weight``) — they would otherwise force
-        the streaming-quant wrapper into a BF16 stub→materialize
-        round-trip per expert (~5 GB transient per layer) before being
-        replaced anyway by the cache-hit path.
+        FusedMoE layers cached by the PACK pipeline have a sibling
+        cache directory ``<prefix>.mlp.experts/``. The HF source then
+        contains tensors like
+        ``model.language_model.layers.X.mlp.experts.gate_up_proj``
+        (vllm renames the prefix later via the model's
+        ``hf_to_vllm_mapper``, so we can't compare against the cache
+        prefix directly). Drop any HF key whose suffix matches our
+        packed leaf names — vllm's expert_params_mapping would
+        otherwise route them to ``layer.w13_weight`` / ``w2_weight``,
+        which have already been replaced by ``w13_xfp_packed`` etc.
+        and don't exist as plain attributes anymore.
 
-        The check is conservative and only fires for layers that
-        actually have a cache directory; layers without cache fall
-        through to vllm's normal loader (which would expose any
-        coverage gap in the PACK pipeline).
+        The substring check ``.mlp.experts.gate_up_proj`` /
+        ``.mlp.experts.down_proj`` is robust against both the HF
+        ``model.language_model.*`` and the post-rename
+        ``language_model.model.*`` layouts.
         """
-        moe_prefixes = sorted({
-            p.name for p in cache_dir.glob("*.experts")
-            if p.is_dir()
-        })
-        if not moe_prefixes:
+        # Only filter when the cache actually contains MoE shards.
+        # Otherwise no MQ packing happened and we shouldn't drop
+        # anything.
+        has_moe_cache = any(
+            p.is_dir() for p in cache_dir.glob("*.experts")
+        )
+        if not has_moe_cache:
             yield from weights_iter
             return
         for name, tensor in weights_iter:
-            if any(name.startswith(prefix + ".")
-                   for prefix in moe_prefixes):
-                if any(leaf in name for leaf in _MQ_PACKED_LEAF_NAMES):
-                    continue
+            if (".mlp.experts." in name
+                    and any(leaf in name
+                            for leaf in _MQ_PACKED_LEAF_NAMES)):
+                continue
             yield name, tensor
