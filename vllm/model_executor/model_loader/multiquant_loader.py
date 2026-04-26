@@ -126,9 +126,21 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
             )
         else:
             real_dev = _torch.device("cpu")
+        # Stub MoE expert tensors only — these are the ones online_moe's
+        # cache-hit path replaces wholesale. Plain ``.weight`` of regular
+        # Linear layers must keep its original meta-or-real tensor with
+        # the per-rank shape so load_residuals (which uses target.shape
+        # to materialize) gets the correct shape; stubbing it to size-0
+        # would degrade target.shape to (0,) and break the materialize.
         n_meta_fixed = 0
+        try:
+            from vllm.model_executor.layers.fused_moe import FusedMoE
+        except ImportError:
+            FusedMoE = None
         for _, module in model.named_modules():
-            for attr in ("w13_weight", "w2_weight", "weight"):
+            if FusedMoE is not None and not isinstance(module, FusedMoE):
+                continue
+            for attr in ("w13_weight", "w2_weight"):
                 p = getattr(module, attr, None)
                 if p is None:
                     continue
