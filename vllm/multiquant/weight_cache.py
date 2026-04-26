@@ -804,10 +804,21 @@ class MultiQuantWeightCache:
                 ):
                     try:
                         # Materialize meta-device target if needed.
-                        if target.device.type == "meta" or target.numel() == 0:
+                        # initialize_streaming_quantload shrinks Linear
+                        # params to (0,) (1-D size-0 stub) and stashes the
+                        # original per-rank shape in ``_streaming_shape``.
+                        # Use that as the source of truth — ``target.shape``
+                        # at this point is (0,) and would produce a 1-D
+                        # stub that crashes the GEMM later.
+                        target_shape = getattr(target, "_streaming_shape",
+                                               None) or tuple(target.shape)
+                        target_dtype = getattr(target, "_streaming_dtype",
+                                               None) or target.data.dtype
+                        if (target.device.type == "meta"
+                                or target.numel() == 0):
                             target.data = torch.empty(
-                                target.shape,
-                                dtype=target.data.dtype,
+                                target_shape,
+                                dtype=target_dtype,
                                 device=_guess_device(model),
                             )
                         # _ColumnvLLMParameter has load_column_parallel_weight
@@ -845,10 +856,14 @@ class MultiQuantWeightCache:
                             "falling back to shape-based slice",
                             key, e)
                 # Step 3: shape-based fallback (legacy + un-annotated).
-                if target.numel() > 0:
+                # Prefer ``_streaming_shape`` over ``target.shape`` — the
+                # latter is (0,) for stubs from initialize_streaming_quantload.
+                target_shape = getattr(target, "_streaming_shape", None)
+                if target_shape is None and target.numel() > 0:
                     target_shape = tuple(target.data.shape)
-                    if tuple(tensor.shape) != target_shape:
-                        tensor = self._tp_slice_if_needed(tensor, target_shape)
+                if (target_shape is not None
+                        and tuple(tensor.shape) != tuple(target_shape)):
+                    tensor = self._tp_slice_if_needed(tensor, target_shape)
                 # Materialize if meta, then copy
                 if target.device.type == "meta" or target.numel() == 0:
                     if isinstance(target, torch.nn.Parameter):
