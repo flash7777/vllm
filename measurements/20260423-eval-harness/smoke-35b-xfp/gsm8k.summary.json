@@ -1,0 +1,49 @@
+{
+  "metrics": {
+    "exact_match,flexible-extract": {
+      "ci95": null,
+      "mean": 0.2,
+      "per_seed": [
+        0.2
+      ],
+      "std": null
+    },
+    "exact_match,strict-match": {
+      "ci95": null,
+      "mean": 0.0,
+      "per_seed": [
+        0.0
+      ],
+      "std": null
+    },
+    "exact_match_stderr,flexible-extract": {
+      "ci95": null,
+      "mean": 0.13333333333333333,
+      "per_seed": [
+        0.13333333333333333
+      ],
+      "std": null
+    },
+    "exact_match_stderr,strict-match": {
+      "ci95": null,
+      "mean": 0.0,
+      "per_seed": [
+        0.0
+      ],
+      "std": null
+    }
+  },
+  "n_seeds": 1,
+  "per_seed": [
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.2,
+        "exact_match,strict-match": 0.0,
+        "exact_match_stderr,flexible-extract": 0.13333333333333333,
+        "exact_match_stderr,strict-match": 0.0
+      },
+      "seed_dir": "seed0"
+    }
+  ],
+  "task": "gsm8k"
+}

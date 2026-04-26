@@ -1,0 +1,47 @@
+{
+  "concurrency": 8,
+  "git_commit": "e0afb9773b69369f0a5fba8032423db42110adac",
+  "git_dirty": "",
+  "image": "localhost/vllm-eval-harness:lm-0.4.11",
+  "label": "glm-xfp",
+  "limit": 0,
+  "lm_eval_version": "0.4.11",
+  "model": "glm-4.7-flash",
+  "models_endpoint": {
+    "data": [
+      {
+        "created": 1777188940,
+        "id": "glm-4.7-flash",
+        "max_model_len": 8192,
+        "object": "model",
+        "owned_by": "vllm",
+        "parent": null,
+        "permission": [
+          {
+            "allow_create_engine": false,
+            "allow_fine_tuning": false,
+            "allow_logprobs": true,
+            "allow_sampling": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "created": 1777188940,
+            "group": null,
+            "id": "modelperm-9430245b33b90e62",
+            "is_blocking": false,
+            "object": "model_permission",
+            "organization": "*"
+          }
+        ],
+        "root": "/data/tensordata/GLM-4.7-Flash"
+      }
+    ],
+    "object": "list"
+  },
+  "seeds": 3,
+  "server_proc": "160017 /usr/bin/python /usr/local/bin/vllm serve /data/tensordata/GLM-4.7-Flash --host 0.0.0.0 --port 8011 --served-model-name glm-4.7-flash --tensor-parallel-size 1 --gpu-memory-utilization 0.05 --max-model-len 8192 --kv-cache-dtype fp8 --trust-remote-code --quantization autoround_rtn --weight-dtype xfp --weight-dtype-lm-head fp8 --kv-cache-memory-bytes 10G --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45",
+  "tasks": [
+    "gsm8k"
+  ],
+  "timestamp_start": "2026-04-26T07:35:40Z",
+  "url": "http://localhost:8011"
+}

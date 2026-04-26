@@ -1,0 +1,40 @@
+
+============================================================
+Benchmark: Qwen3.5-35B-A3B XFP 4-sample + fp8 KV + fp8 LMH
+URL: http://localhost:8011  Model: glm-4.7-flash
+============================================================
+
+--- Performance (n=5) ---
+  short   :    2.8 tok/s  (20 tok in 7.16s, n=5)
+  medium  :   76.9 tok/s  (150 tok in 1.95s, n=5)
+  long    :   55.4 tok/s  (400 tok in 7.22s, n=5)
+
+--- Math Accuracy (n=50) ---
+  Math: 41/50 (82%)
+  248*527=130696, got: 130796
+
+248 * 527 = 130796
+
+248 * 527 = 
+  109-377=-268, got: 268.
+
+The correct answer is 268.
+
+**Ques
+  90-575=-485, got: 575 - 90 = 485.
+
+## 10. 解:
+
+(1) 设 $100 \
+  243-801=-558, got: 243 - 800 - 1 = 243 - 800 - 1 = 243 - 80
+  696*283=196968, got: 197, 368.
+197, 368 / 283 = 696.
+197, 368
+  ... und 4 weitere Fehler
+
+--- Memory ---
+  Memory: KV cache: 0.0%
+
+============================================================
+
+JSON: {"label": "Qwen3.5-35B-A3B XFP 4-sample + fp8 KV + fp8 LMH", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 7.16, "avg_tok_s": 2.8}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 1.95, "avg_tok_s": 76.9}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 7.22, "avg_tok_s": 55.4}], "math": {"correct": 41, "total": 50, "pct": 82.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}

@@ -1,0 +1,87 @@
+{
+  "metrics": {
+    "exact_match,flexible-extract": {
+      "ci95": [
+        0.07612475055494121,
+        0.10633671014761124
+      ],
+      "mean": 0.09123073035127623,
+      "per_seed": [
+        0.08491281273692192,
+        0.09704321455648218,
+        0.09173616376042457
+      ],
+      "std": 0.0060809751910618935
+    },
+    "exact_match,strict-match": {
+      "ci95": [
+        -0.0005819188096410065,
+        0.001592785627937696
+      ],
+      "mean": 0.0005054334091483447,
+      "per_seed": [
+        0.000758150113722517,
+        0.0,
+        0.000758150113722517
+      ],
+      "std": 0.00043771817224384064
+    },
+    "exact_match_stderr,flexible-extract": {
+      "ci95": [
+        0.007334845187654253,
+        0.008520436977242331
+      ],
+      "mean": 0.007927641082448292,
+      "per_seed": [
+        0.007678212824450797,
+        0.008153768274554735,
+        0.007950942148339347
+      ],
+      "std": 0.0002386324606683556
+    },
+    "exact_match_stderr,strict-match": {
+      "ci95": [
+        -0.0005819188096410215,
+        0.0015927856279377372
+      ],
+      "mean": 0.0005054334091483579,
+      "per_seed": [
+        0.0007581501137225378,
+        0.0,
+        0.0007581501137225357
+      ],
+      "std": 0.00043771817224385197
+    }
+  },
+  "n_seeds": 3,
+  "per_seed": [
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.08491281273692192,
+        "exact_match,strict-match": 0.000758150113722517,
+        "exact_match_stderr,flexible-extract": 0.007678212824450797,
+        "exact_match_stderr,strict-match": 0.0007581501137225378
+      },
+      "seed_dir": "seed0"
+    },
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.09704321455648218,
+        "exact_match,strict-match": 0.0,
+        "exact_match_stderr,flexible-extract": 0.008153768274554735,
+        "exact_match_stderr,strict-match": 0.0
+      },
+      "seed_dir": "seed1"
+    },
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.09173616376042457,
+        "exact_match,strict-match": 0.000758150113722517,
+        "exact_match_stderr,flexible-extract": 0.007950942148339347,
+        "exact_match_stderr,strict-match": 0.0007581501137225357
+      },
+      "seed_dir": "seed2"
+    }
+  ],
+  "task": "gsm8k"
+}

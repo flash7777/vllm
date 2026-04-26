@@ -1,0 +1,49 @@
+{
+  "concurrency": 32,
+  "git_commit": "f21d8a4fe1ee4d1539415b79408d7f258e220b04",
+  "git_dirty": "",
+  "image": "localhost/vllm-eval-harness:lm-0.4.11",
+  "label": "35b-xfp-fp8kv",
+  "limit": 0,
+  "lm_eval_version": "0.4.11",
+  "model": "glm-4.7-flash",
+  "models_endpoint": {
+    "data": [
+      {
+        "created": 1776945093,
+        "id": "glm-4.7-flash",
+        "max_model_len": 32768,
+        "object": "model",
+        "owned_by": "vllm",
+        "parent": null,
+        "permission": [
+          {
+            "allow_create_engine": false,
+            "allow_fine_tuning": false,
+            "allow_logprobs": true,
+            "allow_sampling": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "created": 1776945093,
+            "group": null,
+            "id": "modelperm-8c74810314c8857e",
+            "is_blocking": false,
+            "object": "model_permission",
+            "organization": "*"
+          }
+        ],
+        "root": "/data/tensordata/Qwen3.5-35B-A3B-BF16"
+      }
+    ],
+    "object": "list"
+  },
+  "seeds": 3,
+  "server_proc": "114862 /usr/bin/python /usr/local/bin/vllm serve /data/tensordata/Qwen3.5-35B-A3B-BF16 --host 0.0.0.0 --port 8011 --served-model-name glm-4.7-flash --tensor-parallel-size 1 --gpu-memory-utilization 0.05 --max-model-len 32768 --kv-cache-dtype fp8 --trust-remote-code --quantization autoround_rtn --weight-dtype xfp --weight-dtype-lm-head fp8 --load-format multiquant --kv-cache-memory-bytes 10G",
+  "tasks": [
+    "gsm8k",
+    "wikitext"
+  ],
+  "timestamp_end": "2026-04-23T17:44:05Z",
+  "timestamp_start": "2026-04-23T11:51:33Z",
+  "url": "http://localhost:8011"
+}

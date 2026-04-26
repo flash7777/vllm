@@ -1,0 +1,242 @@
+#!/bin/bash
+# MultiQuant TP=2 Multi-Node (DGX Spark + PGX ThinkStation, GB10 each)
+#
+# Ray cluster over direct 200 Gb/s link (enp1s0f0np0, 192.168.0.0/24).
+# Requires:
+#   - Image localhost/vllm-multiquant:top on both nodes
+#   - Repo /home/flash/vllm-riy checked out on both nodes (same commit)
+#   - Model directory /data/tensordata/<model>/ present on both nodes
+#   - SSH flash@192.168.0.116 works from DGX without password
+#
+# Usage:
+#   ./start.multiquant.tp2 --model Qwen3.5-397B-A17B-int4-AutoRound \
+#       --kv fp8 --weight-dtype-lm-head fp8
+# Optional:
+#   --riy /data/tensordata/riy_profile_397b_24pct.json
+#   --weight-dtype xfp --weight-dtype-lm-head fp8     (for XFP paths)
+#   --max-model-len 32768
+#   --peer flash@192.168.0.116                         (default)
+
+set -euo pipefail
+
+# ── Topology ─────────────────────────────────────────────────
+HEAD_IP="192.168.0.117"
+WORKER_SSH="flash@192.168.0.116"
+WORKER_IP="192.168.0.116"
+ETH_IF="enp1s0f0np0"
+IMAGE="localhost/vllm-multiquant:top"
+HEAD_CONTAINER="mq-head"
+WORKER_CONTAINER="mq-worker"
+PORT=8011
+SERVED_NAME="glm-4.7-flash"      # keep consistent with single-node setup
+
+# ── Arg parsing (simplified vs start.multiquant) ─────────────
+MODEL=""
+MODEL_DIR="/data/tensordata"
+KV_DTYPE="fp8"
+WDTYPE=""
+WLMHEAD=""
+ROUTED=""; SHARED=""; ATTN=""
+MAX_MODEL_LEN=32768
+GPU_MEM_UTIL="0.05"
+KV_CACHE_MEM="10G"
+RIY_PROFILE=""
+EAGER=false
+LOAD_FORMAT=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)                MODEL="$2"; shift 2 ;;
+        --model-dir)            MODEL_DIR="$2"; shift 2 ;;
+        --kv)                   KV_DTYPE="$2"; shift 2 ;;
+        --weight-dtype)         WDTYPE="$2"; shift 2 ;;
+        --weight-dtype-lm-head) WLMHEAD="$2"; shift 2 ;;
+        --weight-dtype-routed)  ROUTED="$2"; shift 2 ;;
+        --weight-dtype-shared)  SHARED="$2"; shift 2 ;;
+        --weight-dtype-attn)    ATTN="$2"; shift 2 ;;
+        --max-model-len)        MAX_MODEL_LEN="$2"; shift 2 ;;
+        --gpu-mem-util)         GPU_MEM_UTIL="$2"; shift 2 ;;
+        --kv-cache-memory)      KV_CACHE_MEM="$2"; shift 2 ;;
+        --riy)                  RIY_PROFILE="$2"; shift 2 ;;
+        --peer)                 WORKER_SSH="$2"; shift 2 ;;
+        --eager)                EAGER=true; shift ;;
+        --load-format)          LOAD_FORMAT="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '/^# /,/^$/p' "$0" | head -30
+            exit 0 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+if [[ -z "$MODEL" ]]; then echo "FEHLER: --model fehlt"; exit 1; fi
+MODEL_PATH="$MODEL_DIR/$MODEL"
+
+# ── Build QUANT_ARGS (subset of start.multiquant logic) ──────
+QUANT_ARGS=()
+_ANY_RTN=false
+[[ -n "$WDTYPE" || -n "$WLMHEAD" || -n "$ROUTED" || -n "$SHARED" || -n "$ATTN" ]] && _ANY_RTN=true
+if $_ANY_RTN; then
+    QUANT_ARGS+=("--quantization" "autoround_rtn")
+fi
+[[ -n "$WDTYPE" ]]  && QUANT_ARGS+=("--weight-dtype" "$WDTYPE")
+[[ -n "$WLMHEAD" ]] && QUANT_ARGS+=("--weight-dtype-lm-head" "$WLMHEAD")
+[[ -n "$ROUTED" ]]  && QUANT_ARGS+=("--weight-dtype-routed" "$ROUTED")
+[[ -n "$SHARED" ]]  && QUANT_ARGS+=("--weight-dtype-shared" "$SHARED")
+[[ -n "$ATTN" ]]    && QUANT_ARGS+=("--weight-dtype-attn" "$ATTN")
+
+[[ -n "$RIY_PROFILE" ]] && EXTRA_ARGS+=("--riy-expert-profile" "$RIY_PROFILE")
+$EAGER && EXTRA_ARGS+=("--enforce-eager")
+[[ -n "$LOAD_FORMAT" ]] && EXTRA_ARGS+=("--load-format" "$LOAD_FORMAT")
+
+KV_CACHE_BYTES=$(numfmt --from=iec "$KV_CACHE_MEM")
+EXTRA_ARGS+=("--kv-cache-memory-bytes" "$KV_CACHE_BYTES")
+
+cat <<BANNER
+╔══════════════════════════════════════════════════════╗
+║  MultiQuant TP=2 (DGX + PGX, direct 200 Gb/s link)   ║
+║  Image:    $IMAGE
+║  Model:    $MODEL
+║  KV:       $KV_DTYPE          LM head: ${WLMHEAD:-(model)}
+║  Weights:  ${WDTYPE:-(model)}        routed: ${ROUTED:-(wdtype)}
+║  Eager:    $EAGER
+║  RIY:      ${RIY_PROFILE:-aus}
+╚══════════════════════════════════════════════════════╝
+BANNER
+
+# ── Shared podman run template (mounts + env identical on head+worker) ──
+# Exported as an array via bash command builder; used by head+worker spawns.
+run_container() {
+    local name="$1"; shift
+    local host="$1"; shift
+    local ssh_prefix="$1"; shift   # empty for local, or "ssh flash@..."
+    local cmd
+    # Optional: NFS-mounted DGX tensordata (used on PGX when BF16 source
+    # lives only on DGX; host-side `nfsim.sh` sets up /data/tensordata-dgx
+    # and `ln -s /data/tensordata-dgx/... /data/tensordata/...`).
+    # If the mount-point exists on the host, bind-mount it inside too so
+    # symlinks under /data/tensordata resolve correctly in-container.
+    local nfs_mount=()
+    local nfs_check="[[ -d /data/tensordata-dgx ]] && echo yes || echo no"
+    if [[ -z "$ssh_prefix" ]]; then
+        [[ -d /data/tensordata-dgx ]] && nfs_mount=(-v /data/tensordata-dgx:/data/tensordata-dgx:ro)
+    else
+        if [[ "$($ssh_prefix $nfs_check 2>/dev/null)" == "yes" ]]; then
+            nfs_mount=(-v /data/tensordata-dgx:/data/tensordata-dgx:ro)
+        fi
+    fi
+    cmd=(podman run -d --replace --name "$name"
+         --device nvidia.com/gpu=all --security-opt=label=disable
+         --hooks-dir=/usr/share/containers/oci/hooks.d
+         --network host --ipc host
+         --log-driver=k8s-file
+         --log-opt "path=/data/tensordata/logs/$name.log"
+         -v /data/tensordata:/data/tensordata
+         "${nfs_mount[@]}"
+         -v "/home/flash/.cache/huggingface:/root/.cache/huggingface"
+         -v "/home/flash/vllm-riy/kernels/multiquant:/opt/mq_kernels:ro"
+         -v "/home/flash/vllm-riy/vllm/multiquant:/usr/local/lib/python3.12/dist-packages/vllm/multiquant:ro"
+         -v "/home/flash/vllm-riy/vllm/v1/executor/uniproc_executor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/uniproc_executor.py:ro"
+         -v "/home/flash/vllm-riy/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/model_loader/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/__init__.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/model_loader/base_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/model_loader/multiquant_loader.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/multiquant_loader.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/models/qwen3_5.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/models/qwen3_next.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_next.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/models/qwen3_5_mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5_mtp.py:ro"
+         -v "/home/flash/vllm-riy/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py:ro"
+         -e "VLLM_HOST_IP=$host"
+         -e "RAY_NODE_IP_ADDRESS=$host"
+         -e "NCCL_SOCKET_IFNAME=$ETH_IF"
+         -e "GLOO_SOCKET_IFNAME=$ETH_IF"
+         -e "NCCL_IB_DISABLE=1"
+         -e "NCCL_IGNORE_CPU_AFFINITY=1"
+         -e "VLLM_MLA_DISABLE=1"
+         -e "VLLM_WORKER_MULTIPROC_METHOD=fork"
+         -e "FLASHINFER_DISABLE_VERSION_CHECK=1"
+         -e "FLASHINFER_DISABLE_AUTOTUNER=1"
+         -e "VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel"
+         -e "FLASHINFER_CUDA_ARCH_LIST=12.0a 12.1a"
+         -e "MULTIQUANT_CACHE_DIR=/data/tensordata/mq-cache"
+         "$IMAGE" sleep infinity)
+    if [[ -z "$ssh_prefix" ]]; then
+        "${cmd[@]}"
+    else
+        # Build argument-safe remote command
+        local rcmd
+        printf -v rcmd '%q ' "${cmd[@]}"
+        $ssh_prefix "$rcmd"
+    fi
+}
+
+# ── Teardown prior run, spawn containers ─────────────────────
+echo "[1/5] Stopping any previous containers..."
+podman stop "$HEAD_CONTAINER" 2>/dev/null || true
+podman rm   "$HEAD_CONTAINER" 2>/dev/null || true
+ssh "$WORKER_SSH" "podman stop $WORKER_CONTAINER 2>/dev/null || true; podman rm $WORKER_CONTAINER 2>/dev/null || true"
+
+echo "[2/5] Spawning containers (DGX head + PGX worker)..."
+run_container "$HEAD_CONTAINER"   "$HEAD_IP"   ""
+run_container "$WORKER_CONTAINER" "$WORKER_IP" "ssh $WORKER_SSH"
+
+sleep 3
+
+echo "[3/5] Starting Ray head (DGX) + Ray worker (PGX)..."
+podman exec -d "$HEAD_CONTAINER" bash -c "
+  ray start --head --port 6379 --object-store-memory 1073741824 --num-cpus 2 \
+    --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
+  > /tmp/ray-head.log 2>&1
+"
+sleep 3
+ssh "$WORKER_SSH" "podman exec -d $WORKER_CONTAINER bash -c '
+  ray start --block --object-store-memory 1073741824 --num-cpus 2 \
+    --disable-usage-stats --address=\"$HEAD_IP:6379\" \
+    --node-ip-address $WORKER_IP \
+  > /tmp/ray-worker.log 2>&1
+'"
+
+echo "[4/5] Waiting for Ray cluster (2 nodes)..."
+ALIVE=0
+for i in $(seq 1 30); do
+    # ray status prints "Active:" section with one "1 node_<hash>" line per node
+    ALIVE=$(podman exec "$HEAD_CONTAINER" bash -c \
+        "ray status 2>/dev/null | awk '/^Active:/{f=1;next} /^Pending:/{f=0} f && /node_/ {c++} END{print c+0}'" 2>/dev/null | tail -1)
+    if [[ "${ALIVE:-0}" -ge 2 ]]; then
+        echo "  Ray cluster ready: $ALIVE nodes ALIVE"
+        break
+    fi
+    sleep 2
+done
+
+if [[ "${ALIVE:-0}" -lt 2 ]]; then
+    echo "FEHLER: Ray cluster konnte nicht in 60 s zu 2 Nodes kommen."
+    echo "Head-Log:"; podman exec "$HEAD_CONTAINER" tail -30 /tmp/ray-head.log 2>&1 || true
+    echo "Worker-Log:"; ssh "$WORKER_SSH" "podman exec $WORKER_CONTAINER tail -30 /tmp/ray-worker.log" 2>&1 || true
+    exit 1
+fi
+
+echo "[5/5] Starting vllm serve (TP=2, ray backend) — detached ..."
+# Detached: foreground would die when this orchestrator script exits
+# (e.g. when run in a background shell). vllm serve inside the head
+# container writes to /data/tensordata/logs/${HEAD_CONTAINER}-vllm.log
+# which is bind-mounted and readable via `podman exec ... tail`.
+podman exec -d "$HEAD_CONTAINER" bash -c "
+  vllm serve '$MODEL_PATH' \
+    --host 0.0.0.0 \
+    --port '$PORT' \
+    --served-model-name '$SERVED_NAME' \
+    --tensor-parallel-size 2 \
+    --pipeline-parallel-size 1 \
+    --distributed-executor-backend ray \
+    --gpu-memory-utilization '$GPU_MEM_UTIL' \
+    --max-model-len '$MAX_MODEL_LEN' \
+    --kv-cache-dtype '$KV_DTYPE' \
+    --trust-remote-code \
+    ${QUANT_ARGS[*]@Q} ${EXTRA_ARGS[*]@Q} \
+  > /data/tensordata/logs/${HEAD_CONTAINER}-vllm.log 2>&1
+"
+
+echo "  vllm serve detached. Logs (tail to follow):"
+echo "    podman exec $HEAD_CONTAINER tail -f /data/tensordata/logs/${HEAD_CONTAINER}-vllm.log"
+echo "  API:  http://localhost:$PORT/v1/chat/completions"
+echo "  Stoppen: podman stop $HEAD_CONTAINER && ssh $WORKER_SSH podman stop $WORKER_CONTAINER"

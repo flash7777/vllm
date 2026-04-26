@@ -1,0 +1,27 @@
+=== MTP NST=1 ===
+NST=1: long 29.2, medium 34.3, short 2.5, math 96%
+  short   :    2.5 tok/s  (20 tok in 8.04s, n=5)
+  medium  :   30.8 tok/s  (150 tok in 4.87s, n=5)
+  long    :   26.6 tok/s  (400 tok in 15.02s, n=5)
+  Math: 47/50 (94%)
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +ngram NST=2", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 8.04, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 4.87, "avg_tok_s": 30.8}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 15.02, "avg_tok_s": 26.6}], "math": {"correct": 47, "total": 50, "pct": 94.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}
+
+  short   :    2.5 tok/s  (20 tok in 8.01s, n=5)
+  medium  :   31.2 tok/s  (150 tok in 4.81s, n=5)
+  long    :   27.6 tok/s  (400 tok in 14.48s, n=5)
+  Math: 45/50 (90%)
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +ngram NST=3", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 8.01, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 4.81, "avg_tok_s": 31.2}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 14.48, "avg_tok_s": 27.6}], "math": {"correct": 45, "total": 50, "pct": 90.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}
+
+  short   :    2.4 tok/s  (20 tok in 8.27s, n=5)
+  medium  :   26.9 tok/s  (150 tok in 5.58s, n=5)
+  long    :   23.2 tok/s  (400 tok in 17.27s, n=5)
+  Math: 45/50 (90%)
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +ngram NST=4", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 8.27, "avg_tok_s": 2.4}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 5.58, "avg_tok_s": 26.9}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 17.27, "avg_tok_s": 23.2}], "math": {"correct": 45, "total": 50, "pct": 90.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}
+
+  short   :    2.5 tok/s  (20 tok in 8.06s, n=5)
+  medium  :   27.4 tok/s  (150 tok in 5.48s, n=5)
+  long    :   23.1 tok/s  (400 tok in 17.29s, n=5)
+  Math: 45/50 (90%)
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +ngram NST=5", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 8.06, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 5.48, "avg_tok_s": 27.4}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 17.29, "avg_tok_s": 23.1}], "math": {"correct": 45, "total": 50, "pct": 90.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}
+
+DONE

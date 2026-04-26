@@ -1,0 +1,35 @@
+
+============================================================
+Benchmark: XFP+linattn+fp8KV+fp8LMH +mtp NST=2
+URL: http://localhost:8011  Model: glm-4.7-flash
+============================================================
+
+--- Performance (n=5) ---
+  short   :    2.5 tok/s  (20 tok in 8.02s, n=5)
+  medium  :   33.7 tok/s  (150 tok in 4.45s, n=5)
+  long    :   29.1 tok/s  (400 tok in 13.75s, n=5)
+
+--- Math Accuracy (n=50) ---
+  Math: 46/50 (92%)
+  469-613=-144, got: 144.
+The result of the subtraction is 14
+  90-575=-485, got: 1000 - 575 = 425.
+So, 90 - 575 = -425.
+S
+  243-801=-558, got: ？
+
+<think>
+
+</think>
+
+计算 $243 - 801$ 的过程
+  227-681=-454, got: 1000 - 681 = 319.
+What is 1000 - 681?
+10
+
+--- Memory ---
+  Memory: KV cache: 0.0%
+
+============================================================
+
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +mtp NST=2", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 8.02, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 4.45, "avg_tok_s": 33.7}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 13.75, "avg_tok_s": 29.1}], "math": {"correct": 46, "total": 50, "pct": 92.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}

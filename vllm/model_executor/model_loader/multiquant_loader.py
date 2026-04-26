@@ -155,3 +155,37 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
             "process_weights_after_loading",
             n_meta_fixed,
         )
+
+        # Diagnostic: surface any Linear-style param that's still 1-D / size-0
+        # after residual load. This catches cases where a non-MoE Linear's
+        # weight failed to materialize (vision QKV, language attn, etc.) and
+        # would later crash the GEMM with "mat2 must be a matrix, got 1-D".
+        suspicious = []
+        for name, p in model.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            if p.data.dim() >= 2:
+                continue
+            # Skip legitimately 1-D weights: RMSNorm / LayerNorm scalars,
+            # rotary inv_freq, scale tensors, bias-like.
+            if any(k in name for k in (
+                    "norm", "rotary", "scale", "_bias",
+                    "score_correction", "inv_freq", "patch_embed.proj",
+            )):
+                continue
+            # MoE expert tensors are intentionally stubbed at this point —
+            # XFP cache-hit replaces them on process_weights_after_loading.
+            if name.endswith(".w13_weight") or name.endswith(".w2_weight"):
+                continue
+            suspicious.append((name, tuple(p.data.shape),
+                               str(p.data.dtype),
+                               p.data.device.type))
+        if suspicious:
+            logger.warning(
+                "[xfp_tp] suspicious sub-2D weights post-residual-load "
+                "(%d): %s%s",
+                len(suspicious),
+                suspicious[:8],
+                f" ... +{len(suspicious) - 8} more" if len(suspicious) > 8
+                else "",
+            )

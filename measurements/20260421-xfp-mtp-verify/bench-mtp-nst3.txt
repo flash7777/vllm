@@ -1,0 +1,23 @@
+
+============================================================
+Benchmark: XFP+linattn+fp8KV+fp8LMH +mtp NST=3
+URL: http://localhost:8011  Model: glm-4.7-flash
+============================================================
+
+--- Performance (n=5) ---
+  short   :    2.5 tok/s  (20 tok in 7.85s, n=5)
+  medium  :   37.2 tok/s  (150 tok in 4.03s, n=5)
+  long    :   32.7 tok/s  (400 tok in 12.23s, n=5)
+
+--- Math Accuracy (n=50) ---
+  Math: 49/50 (98%)
+  227-681=-454, got: 454.
+- 454 - 681 = -227.
+- -227 - 681 = 
+
+--- Memory ---
+  Memory: KV cache: 0.0%
+
+============================================================
+
+JSON: {"label": "XFP+linattn+fp8KV+fp8LMH +mtp NST=3", "url": "http://localhost:8011", "model": "glm-4.7-flash", "perf": [{"type": "short", "avg_tokens": 20.0, "avg_time_s": 7.85, "avg_tok_s": 2.5}, {"type": "medium", "avg_tokens": 150.0, "avg_time_s": 4.03, "avg_tok_s": 37.2}, {"type": "long", "avg_tokens": 400.0, "avg_time_s": 12.23, "avg_tok_s": 32.7}], "math": {"correct": 49, "total": 50, "pct": 98.0}, "memory": {"requests_running": 0, "kv_cache_usage_%": 0.0}}
