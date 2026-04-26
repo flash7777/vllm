@@ -462,6 +462,18 @@ def _make_streaming_loader(layer, param_name, original_loader,
 
     @functools.wraps(original_loader)
     def streaming_loader(*args, **kwargs):
+        # If process_weights_after_loading already fired for this
+        # layer, the original ``layer.weight`` may have been replaced by
+        # quant-specific attributes (xfp_packed, xfp_codebook, …) and
+        # ``del layer.weight`` was called. Subsequent shards (e.g. a
+        # second HF key that maps to the same merged param via
+        # stacked_params_mapping) would otherwise crash here with
+        # AttributeError. The packed tensors already carry the full
+        # weight, so dropping the leftover shard is the correct
+        # behavior.
+        if getattr(layer, "_sq_processed", False):
+            if not hasattr(layer, param_name):
+                return None
         # Materialize parameter data on first load — mutate .data in place
         # so the subclass object (and its custom methods) survive.
         param = getattr(layer, param_name)
