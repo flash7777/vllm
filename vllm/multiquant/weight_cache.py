@@ -741,6 +741,21 @@ class MultiQuantWeightCache:
 
         # Load the per-param tp_role sidecar for v2 caches.
         from vllm.multiquant._tp_slicer import slice_for_tp
+        # Reuse vllm's specialized weight_loader semantics for the
+        # Linear-base Parameter subclasses (Column / Row / QKV / Merged) —
+        # they implement Q-K-V-aware / merged-shard-offset slicing that
+        # plain narrow on output_dim cannot replicate. VocabParallelEmbedding
+        # has a custom weight_loader with tighter pre-conditions (expects
+        # unpadded vocab size as input) that doesn't match our padded
+        # cached tensors, so we keep it on the manifest slicer path.
+        try:
+            from vllm.model_executor.parameter import (
+                _ColumnvLLMParameter,
+                RowvLLMParameter,
+            )
+            _LINEAR_PARAM_CLASSES = (_ColumnvLLMParameter, RowvLLMParameter)
+        except ImportError:
+            _LINEAR_PARAM_CLASSES = ()
         tp_meta_path = self.cache_dir / "residuals_tp_meta.json"
         if tp_meta_path.exists():
             try:
@@ -776,14 +791,50 @@ class MultiQuantWeightCache:
                 if target is None:
                     skipped.append(target_name)
                     continue
-                # v2 path: consult tp_meta for the tp_role and slice via
-                # the generic slicer. After role-based slicing, also run
-                # the shape-based auto-detect fallback when (a) no metadata
-                # is present (legacy residuals) or (b) the role was
-                # "replicated" but the loaded tensor still doesn't fit
-                # the per-rank target shape (e.g. GatedDeltaNet's A_log /
-                # dt_bias which vllm does not annotate with output_dim,
-                # but which still need TP-slicing along their head dim).
+                # Step 1: prefer vllm's specialized load methods on
+                # _ColumnvLLMParameter / RowvLLMParameter — they handle
+                # qkv-aware, merged-shard-offset, and per-rank narrow
+                # correctly. Skip for buffers and non-linear params.
+                used_vllm_loader = False
+                if (
+                    tp_world > 1
+                    and _LINEAR_PARAM_CLASSES
+                    and isinstance(target, _LINEAR_PARAM_CLASSES)
+                    and not key.startswith("__buffer__/")
+                ):
+                    try:
+                        # Materialize meta-device target if needed.
+                        if target.device.type == "meta" or target.numel() == 0:
+                            target.data = torch.empty(
+                                target.shape,
+                                dtype=target.data.dtype,
+                                device=_guess_device(model),
+                            )
+                        # _ColumnvLLMParameter has load_column_parallel_weight
+                        # (also covers QKV and Merged via auto-shard). Row
+                        # has load_row_parallel_weight.
+                        from vllm.model_executor.parameter import (
+                            _ColumnvLLMParameter as _Col,
+                            RowvLLMParameter as _Row,
+                        )
+                        cpu_tensor = tensor.to(
+                            dtype=target.data.dtype, device=target.device)
+                        if isinstance(target, _Col):
+                            target.load_column_parallel_weight(cpu_tensor)
+                        else:
+                            target.load_row_parallel_weight(cpu_tensor)
+                        loaded += 1
+                        used_vllm_loader = True
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            "residuals: vllm parameter loader for %s "
+                            "raised (%s) — falling back to manifest slice",
+                            key, e)
+
+                # Step 2: manifest tp_role slicer (for buffers, embed,
+                # GatedDeltaNet weights, and any param the vllm loader
+                # rejected).
                 entry = tp_meta.get(key)
                 if entry is not None and tp_world > 1:
                     try:
@@ -793,7 +844,7 @@ class MultiQuantWeightCache:
                             "residuals tp_slice failed for %s (%s) — "
                             "falling back to shape-based slice",
                             key, e)
-                # Shape-based fallback (legacy + un-annotated params).
+                # Step 3: shape-based fallback (legacy + un-annotated).
                 if target.numel() > 0:
                     target_shape = tuple(target.data.shape)
                     if tuple(tensor.shape) != target_shape:
