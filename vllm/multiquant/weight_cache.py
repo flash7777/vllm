@@ -114,12 +114,18 @@ class MultiQuantWeightCache:
         model_basename: str,
         cache_key: str,
         read_only: bool = False,
+        model_path: str | None = None,
     ):
         self.cache_root = Path(cache_root)
         self.model_basename = model_basename
         self.cache_key = cache_key
         self.read_only = read_only
         self.cache_dir = self.cache_root / model_basename / cache_key
+        # Source HF safetensors path — fallback when residuals.safetensors
+        # is missing some entries (e.g. a v1-cache packed before vision
+        # tower weights were captured by save_residuals). Empty when the
+        # caller didn't pass it.
+        self.model_path = model_path
         # Stats for the end-of-load summary.
         self._hits: dict[str, int] = {}     # by method name
         self._misses: dict[str, int] = {}
@@ -170,7 +176,8 @@ class MultiQuantWeightCache:
         cache_key = cls.compute_cache_key(
             model_path, registry, hf_config, tp_size, ep_size,
         )
-        inst = cls(cache_root, model_basename, cache_key, read_only)
+        inst = cls(cache_root, model_basename, cache_key, read_only,
+                   model_path=model_path)
         try:
             inst.cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -921,7 +928,199 @@ class MultiQuantWeightCache:
                 "MultiQuant cache: residuals had unknown keys (first 5): %s",
                 skipped[:5],
             )
+
+        # ─── Source-safetensors fallback ───────────────────────────────
+        # If the cache was packed before save_residuals captured every
+        # non-quant Linear (e.g. vision tower in qwen3_vl with the older
+        # streaming-quant init that stubbed UnquantizedLinearMethod), we
+        # end up with params still at the (0,) streaming-stub. Recover
+        # them from the model's HF safetensors directly so we don't need
+        # to re-pack just to fill in unquantized BF16 weights.
+        self._fallback_load_from_source(model, name_to_param, tp_world,
+                                        tp_rank, _LINEAR_PARAM_CLASSES)
         return True
+
+    def _fallback_load_from_source(
+        self,
+        model,
+        name_to_param: dict,
+        tp_world: int,
+        tp_rank: int,
+        linear_param_classes: tuple,
+    ) -> None:
+        """Materialize stubbed Linear weights from source HF safetensors."""
+        if not self.model_path:
+            return
+        # Collect targets: Linear params still at (0,) with a known
+        # original shape (set by initialize_streaming_quantload).
+        targets: list[tuple[str, torch.nn.Parameter]] = []
+        for name, p in model.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            if p.data.numel() != 0:
+                continue
+            if not getattr(p, "_streaming_shape", None):
+                continue
+            if name.endswith(".w13_weight") or name.endswith(".w2_weight"):
+                continue  # MoE expert tensors handled by XFP cache hit
+            targets.append((name, p))
+        if not targets:
+            return
+
+        # Find the safetensors index. Different repos use different
+        # filenames; check the common ones.
+        from pathlib import Path as _Path
+        model_dir = _Path(self.model_path)
+        index_path = None
+        for candidate in (
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ):
+            cp = model_dir / candidate
+            if cp.exists():
+                index_path = cp
+                break
+        if index_path is None:
+            # Single-shard model: try a single safetensors directly.
+            single = model_dir / "model.safetensors"
+            if not single.exists():
+                logger.warning(
+                    "MultiQuant cache fallback: no safetensors index at %s "
+                    "and no model.safetensors — cannot recover %d stubbed "
+                    "params (will fail at forward)", model_dir, len(targets))
+                return
+            shard_map = {None: str(single)}
+            weight_map: dict[str, str] = {}
+        else:
+            try:
+                idx = json.loads(index_path.read_text())
+                weight_map = idx.get("weight_map", {})
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(
+                    "MultiQuant cache fallback: cannot read index %s (%s)",
+                    index_path, e)
+                return
+            shard_map = {}
+
+        # Group target params by their source shard so we open each file
+        # only once.
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return
+
+        # Some checkpoints prefix everything with "model." (the HF root)
+        # while vllm's model has language_model.* / visual.* — the
+        # safetensors keys may need a mapping. Try the param name as-is
+        # first; if not found, try common rewrites.
+        def _candidate_keys(param_name: str) -> list[str]:
+            return [
+                param_name,
+                # vllm wraps Qwen3-VL in language_model.* / visual.* but
+                # the HF checkpoint has the language model un-prefixed.
+                param_name.replace("language_model.", "", 1),
+                # Some checkpoints prefix the visual tower with "model.".
+                param_name.replace("visual.", "model.visual.", 1),
+            ]
+
+        from collections import defaultdict
+        per_shard: dict[str, list[tuple[str, str, torch.nn.Parameter]]] = (
+            defaultdict(list)
+        )
+        unresolved: list[str] = []
+        for name, p in targets:
+            resolved_key = None
+            shard = None
+            for k in _candidate_keys(name):
+                if k in weight_map:
+                    resolved_key = k
+                    shard = weight_map[k]
+                    break
+            if resolved_key is None and not weight_map:
+                # Single-shard fallback: defer key matching to safe_open.
+                resolved_key = name
+                shard = None
+            if resolved_key is None:
+                unresolved.append(name)
+                continue
+            per_shard[shard].append((name, resolved_key, p))
+
+        # device pick
+        target_device = _guess_device(model)
+
+        loaded_n = 0
+        for shard, items in per_shard.items():
+            shard_path = (str(model_dir / shard) if shard
+                          else shard_map.get(None))
+            try:
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    available = set(f.keys())
+                    for name, key, p in items:
+                        if key not in available:
+                            unresolved.append(name)
+                            continue
+                        full = f.get_tensor(key)
+                        # Apply TP slice via the same mechanism as the
+                        # main residual path: use the vllm Parameter's
+                        # specialized loader if it's column/row/qkv, else
+                        # fall back to a plain narrow against the stored
+                        # _streaming_shape.
+                        target_shape = tuple(getattr(
+                            p, "_streaming_shape", full.shape))
+                        target_dtype = getattr(
+                            p, "_streaming_dtype", full.dtype)
+                        # Allocate the target storage at per-rank shape.
+                        p.data = torch.empty(
+                            target_shape, dtype=target_dtype,
+                            device=target_device,
+                        )
+                        used_vllm = False
+                        if (tp_world > 1 and linear_param_classes
+                                and isinstance(p, linear_param_classes)):
+                            try:
+                                from vllm.model_executor.parameter import (
+                                    _ColumnvLLMParameter as _Col,
+                                )
+                                cpu_t = full.to(
+                                    dtype=target_dtype,
+                                    device=target_device,
+                                )
+                                if isinstance(p, _Col):
+                                    p.load_column_parallel_weight(cpu_t)
+                                else:
+                                    p.load_row_parallel_weight(cpu_t)
+                                used_vllm = True
+                            except Exception:
+                                pass
+                        if not used_vllm:
+                            # Shape-based narrow.
+                            if tuple(full.shape) != target_shape:
+                                full = self._tp_slice_if_needed(
+                                    full, target_shape)
+                            if tuple(full.shape) == target_shape:
+                                p.data.copy_(full.to(
+                                    dtype=target_dtype,
+                                    device=target_device))
+                            else:
+                                # disable_tp layer with full target —
+                                # just copy.
+                                if full.numel() == p.data.numel():
+                                    p.data.copy_(full.view_as(p.data).to(
+                                        dtype=target_dtype,
+                                        device=target_device))
+                        loaded_n += 1
+            except (OSError, RuntimeError) as e:
+                logger.warning(
+                    "MultiQuant cache fallback: failed to read %s (%s)",
+                    shard_path, e)
+
+        logger.info(
+            "MultiQuant cache fallback: recovered %d stubbed params from "
+            "source HF safetensors (%s)%s",
+            loaded_n, model_dir,
+            f" — {len(unresolved)} unresolved (e.g. {unresolved[:3]})"
+            if unresolved else "",
+        )
 
     # ─── Summary ──────────────────────────────────────────────────────
 
