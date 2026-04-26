@@ -917,26 +917,23 @@ class MultiQuantWeightCache:
                             dtype=target.data.dtype, device=target.device,
                         ))
                     except RuntimeError as _copy_err:
-                        # Last-resort: shapes diverged after step 1
-                        # materialized via _streaming_shape but the
-                        # cached tensor doesn't match (e.g. was packed
-                        # at a different TP world or got sliced wrong).
-                        # Re-materialize from the loaded tensor directly.
+                        # Cached tensor shape doesn't match the layer's
+                        # constructed shape (cache packed before the
+                        # disable_tp / save_residuals fixes landed).
+                        # Don't paper over with the wrong-shape tensor
+                        # — leave the storage at its original allocation
+                        # and queue this param for the source-safetensors
+                        # fallback below.
                         logger.warning(
                             "residuals copy mismatch for %s "
                             "(target=%s tensor=%s): %s — "
-                            "re-materializing from tensor shape",
+                            "deferring to source safetensors",
                             key, tuple(target.data.shape),
                             tuple(tensor.shape), _copy_err,
                         )
-                        if isinstance(target, torch.nn.Parameter):
-                            target.data = tensor.to(
-                                dtype=target.data.dtype,
-                                device=_guess_device(model),
-                            ).contiguous()
-                        else:
-                            target.data = tensor.to(
-                                device=target.device).contiguous()
+                        if not hasattr(self, "_fallback_force"):
+                            self._fallback_force: set[str] = set()
+                        self._fallback_force.add(key)
                 loaded += 1
 
         logger.info(
@@ -956,8 +953,10 @@ class MultiQuantWeightCache:
         # end up with params still at the (0,) streaming-stub. Recover
         # them from the model's HF safetensors directly so we don't need
         # to re-pack just to fill in unquantized BF16 weights.
+        force_keys = getattr(self, "_fallback_force", set())
         self._fallback_load_from_source(model, name_to_param, tp_world,
-                                        tp_rank, _LINEAR_PARAM_CLASSES)
+                                        tp_rank, _LINEAR_PARAM_CLASSES,
+                                        force_keys=force_keys)
         return True
 
     def _fallback_load_from_source(
@@ -967,21 +966,30 @@ class MultiQuantWeightCache:
         tp_world: int,
         tp_rank: int,
         linear_param_classes: tuple,
+        force_keys: set | None = None,
     ) -> None:
         """Materialize stubbed/mis-shaped Linear weights from source HF.
 
-        Two trigger conditions:
+        Triggers (per param):
           1. Param is at (0,) stub with a known _streaming_shape — the
              cache was packed before save_residuals captured this layer.
           2. Param's name starts with ``visual.`` — vision tower weights
              have historically been mis-shaped in the v2 cache (saved at
              TP-shard size instead of full size), so we always reload
              them from source to bypass the cache for that subtree.
+          3. Param's key is in ``force_keys`` — the load_residuals copy
+             phase raised because the cached tensor's shape didn't match
+             the constructed target (e.g. linear_attn.conv1d.weight),
+             so the original storage is intact and we must re-fill it
+             from source.
         """
         if not self.model_path:
             return
+        if force_keys is None:
+            force_keys = set()
         # Collect targets: Linear params still at (0,) with a known
-        # original shape, OR any visual-tower param/buffer.
+        # original shape, any visual-tower param/buffer, or any param
+        # whose key the load phase explicitly forced into the fallback.
         targets: list[tuple[str, torch.nn.Parameter]] = []
         seen: set[str] = set()
         for name, p in model.named_parameters():
@@ -990,7 +998,8 @@ class MultiQuantWeightCache:
             stubbed = (p.data.numel() == 0
                        and getattr(p, "_streaming_shape", None))
             is_visual = name.startswith("visual.")
-            if stubbed or is_visual:
+            forced = name in force_keys
+            if stubbed or is_visual or forced:
                 if name in seen:
                     continue
                 seen.add(name)
