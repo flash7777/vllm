@@ -734,6 +734,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             return
         self._prefill_kernels_warmed_up = True
 
+        # SM120 RTX bug: Triton GDN chunk_gated_delta_rule scatter-gather
+        # in chunk_fwd_kernel_o triggers an idx-out-of-bounds device-side
+        # assert under cache-only XFP load + TP=2. The warmup itself is
+        # only there to pre-populate the autotuner cache before KV is
+        # allocated; skipping it costs a slower first request but lets
+        # the server start. Opt-in via env so the default (Spark/GB10
+        # where this works) keeps the warmup.
+        import os as _os
+        if _os.environ.get("VLLM_SKIP_GDN_WARMUP", "").lower() in (
+            "1", "true", "yes", "on",
+        ):
+            logger.info(
+                "GDN prefill kernel warmup skipped via "
+                "VLLM_SKIP_GDN_WARMUP — first inference may OOM during "
+                "autotune.")
+            return
+
         device = mixed_qkv.device
         dtype = mixed_qkv.dtype
         num_k_heads = self.num_k_heads // self.tp_size
