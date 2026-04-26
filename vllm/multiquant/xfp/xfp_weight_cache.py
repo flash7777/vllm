@@ -309,14 +309,38 @@ def load_moe(
             has_riy_filter = False
 
         # Step 1: RIY expert filter on dim 0 (E).
+        # local_num_experts is authoritative — it's what the FusedMoE
+        # forward kernel expects. _expert_map is used to decide *which*
+        # cached expert slots we keep. If the _expert_map's "kept" count
+        # disagrees with local_num_experts (observed in some Qwen3.5
+        # configs where a wrapper module sets local_num_experts via a
+        # different code path), we trust local_num_experts and take the
+        # first local_num_experts kept-by-_expert_map slots in order.
         if has_riy_filter:
             emap_cpu = _expert_map.detach().to("cpu")
             kept_mask = emap_cpu >= 0
-            n_kept = int(kept_mask.sum().item())
-            if n_kept != _local_E:
+            kept_indices = kept_mask.nonzero(as_tuple=True)[0]
+            n_emap_kept = int(kept_indices.numel())
+            if n_emap_kept >= _local_E:
+                # Trust local_num_experts; restrict to first _local_E
+                # kept slots (compact_idx ordering preserves consistency
+                # with the layer-level expert_id mapping).
+                if n_emap_kept != _local_E:
+                    logger.info(
+                        "XFP MoE %s: _expert_map kept=%d but layer "
+                        "local_num_experts=%d — trimming to first %d kept "
+                        "experts",
+                        layer_prefix, n_emap_kept, _local_E, _local_E)
+                kept_indices = kept_indices[: _local_E]
+                # Rebuild kept_mask reflecting just these indices.
+                kept_mask = torch.zeros_like(kept_mask)
+                kept_mask[kept_indices] = True
+                n_kept = _local_E
+            else:
                 raise ValueError(
-                    f"RIY filter: _expert_map keeps {n_kept} but "
-                    f"local_num_experts={_local_E}")
+                    f"RIY filter: _expert_map keeps only {n_emap_kept} "
+                    f"but local_num_experts={_local_E} — cache cannot "
+                    f"satisfy")
         else:
             kept_mask = None
             n_kept = cached_E
