@@ -273,9 +273,23 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
     linear_count = 0
     moe_count = 0
 
+    # UnquantizedLinearMethod is a no-op at process_weights_after_loading
+    # time (just CPU-dispatch tweak). Streaming-shrinking its params
+    # forces a needless materialize round-trip and — critically for
+    # multimodal models like Qwen3-VL — leaves vision-tower weights in a
+    # state where save_residuals can miss them, which then breaks the
+    # cache-only LOAD path. Skip those modules entirely.
+    try:
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    except ImportError:
+        UnquantizedLinearMethod = None  # type: ignore
+
     for module in model.modules():
         quant_method = getattr(module, "quant_method", None)
         if not isinstance(quant_method, QuantizeMethodBase):
+            continue
+        if (UnquantizedLinearMethod is not None
+                and isinstance(quant_method, UnquantizedLinearMethod)):
             continue
 
         module._sq_processed = False

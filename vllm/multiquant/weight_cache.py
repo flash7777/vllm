@@ -612,8 +612,12 @@ class MultiQuantWeightCache:
         tp_meta: dict[str, dict] = {}
         seen_ptrs: set[int] = set()
         skipped_mq = 0
+        skipped_empty: list[str] = []
         for name, p in model.named_parameters():
-            if p is None or p.data.numel() == 0:
+            if p is None:
+                continue
+            if p.data.numel() == 0:
+                skipped_empty.append(name)
                 continue
             if _is_mq_packed_param(name):
                 skipped_mq += 1
@@ -624,6 +628,13 @@ class MultiQuantWeightCache:
             seen_ptrs.add(ptr)
             tensors[name] = _tensor_cpu_contig(p.data)
             tp_meta[name] = infer_tp_role_from_param(name, p)
+        if skipped_empty:
+            logger.warning(
+                "MultiQuant cache: save_residuals skipped %d empty params "
+                "(first 5: %s) — these will be missing from the cache and "
+                "the cache-only load path will leave them stubbed.",
+                len(skipped_empty), skipped_empty[:5],
+            )
 
         # Also capture registered buffers (e.g. rotary inv_freq,
         # e_score_correction_bias if stored as buffer not param)
