@@ -273,6 +273,16 @@ fi
 # packed-XFP at the 95+ GB VRAM mark. Pass through whatever the caller
 # set, otherwise default to expandable_segments=True for our packs.
 CUDA_ALLOC_ENV=("-e" "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}")
+
+# Forward selected vllm-multiquant env vars into the container so
+# wrapper-callers can drive them without remembering -e flags.
+EXTRA_PASSTHROUGH_ENV=()
+for _v in VLLM_SKIP_GDN_WARMUP XFP_MIN_COS XFP_AUTO_BITS \
+          MULTIQUANT_QUANT_ONLY VLLM_LOG_MODEL_INSPECTION; do
+    if [[ -n "${!_v:-}" ]]; then
+        EXTRA_PASSTHROUGH_ENV+=("-e" "${_v}=${!_v}")
+    fi
+done
 echo ""
 
 # ── Prüfungen ────────────────────────────────────────────
@@ -336,6 +346,7 @@ podman run -d \
   "${CACHE_ENV[@]}" \
   "${QUANT_ENV[@]}" \
   "${CUDA_ALLOC_ENV[@]}" \
+  "${EXTRA_PASSTHROUGH_ENV[@]}" \
   "$IMAGE" \
   vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
