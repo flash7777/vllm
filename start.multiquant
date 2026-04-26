@@ -267,6 +267,12 @@ if [[ -n "$CACHE_DIR" ]]; then
         CACHE_ENV+=("-e" "MULTIQUANT_CACHE_READ_ONLY=1")
     fi
 fi
+
+# CUDA allocator: expandable_segments dramatically reduces fragmentation
+# during streaming-quant PACK runs where layers churn between BF16 and
+# packed-XFP at the 95+ GB VRAM mark. Pass through whatever the caller
+# set, otherwise default to expandable_segments=True for our packs.
+CUDA_ALLOC_ENV=("-e" "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}")
 echo ""
 
 # ── Prüfungen ────────────────────────────────────────────
@@ -329,6 +335,7 @@ podman run -d \
   $($QUANT_ONLY && echo "-e MULTIQUANT_QUANT_ONLY=1") \
   "${CACHE_ENV[@]}" \
   "${QUANT_ENV[@]}" \
+  "${CUDA_ALLOC_ENV[@]}" \
   "$IMAGE" \
   vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
