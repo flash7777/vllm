@@ -463,6 +463,24 @@ class XFPLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Defensive lazy device-migration: under TP > 1 the streaming-quant
+        # init path can leave xfp_* params on the wrong CUDA index (e.g.
+        # cuda:0 on rank 1) because torch.cuda.set_device(local_rank) hasn't
+        # taken effect at PWAL time. Migrate on first forward when the
+        # activation lands on the worker's actual device, then cache so
+        # subsequent forwards skip the check.
+        if not getattr(layer, "_xfp_devmoved", False):
+            x_dev = x.device
+            for _attr in ("xfp_packed", "xfp_codebook",
+                          "xfp_outlier_row", "xfp_outlier_col",
+                          "xfp_outlier_val"):
+                p = getattr(layer, _attr, None)
+                if p is None:
+                    continue
+                if p.device != x_dev:
+                    p.data = p.data.to(x_dev)
+            layer._xfp_devmoved = True
+
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
