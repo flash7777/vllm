@@ -774,17 +774,50 @@ class MultiQuantWeightCache:
         if the file is missing and returns False for soft failures.
         """
         path = self.cache_dir / "residuals.safetensors"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"MultiQuant cache-only load: residuals missing at {path}. "
-                f"Run once with bf16 source to populate the cache."
-            )
-
+        # If the cache lacks a residuals file (e.g. an aborted PACK that
+        # got the layer shards down but exited before save_residuals),
+        # skip directly to the source-safetensors fallback so we can
+        # still serve from the cache without a full re-pack. The fallback
+        # iterates ``model.named_parameters()`` and picks up every
+        # non-MQ-packed Linear from the model's HF source.
         try:
             from safetensors import safe_open
         except ImportError:
             logger.error("MultiQuant cache: safetensors unavailable")
             return False
+        if not path.exists():
+            logger.warning(
+                "MultiQuant cache: residuals missing at %s — falling "
+                "back to HF source for every non-quant Linear.", path)
+            try:
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+                _tp_world = get_tensor_model_parallel_world_size()
+                _tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                _tp_world, _tp_rank = 1, 0
+            try:
+                from vllm.model_executor.parameter import (
+                    _ColumnvLLMParameter, RowvLLMParameter,
+                )
+                _LP = (_ColumnvLLMParameter, RowvLLMParameter)
+            except ImportError:
+                _LP = ()
+            # Force every non-MQ-packed param into the source-fallback set
+            forced = {n for n, _ in model.named_parameters()
+                      if not (n.endswith(".w13_weight")
+                              or n.endswith(".w2_weight"))
+                      and any(s in n for s in (
+                          "visual.", "language_model.model.layers.",
+                          "language_model.model.embed_tokens",
+                          "language_model.lm_head",
+                      ))}
+            self._fallback_load_from_source(
+                model, {n: p for n, p in model.named_parameters()},
+                _tp_world, _tp_rank, _LP, force_keys=forced)
+            return True
 
         # Load the per-param tp_role sidecar for v2 caches.
         from vllm.multiquant._tp_slicer import slice_for_tp
