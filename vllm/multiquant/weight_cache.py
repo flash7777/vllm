@@ -874,9 +874,31 @@ class MultiQuantWeightCache:
                     else:
                         target.data = tensor.to(device=target.device).contiguous()
                 else:
-                    target.data.copy_(tensor.to(
-                        dtype=target.data.dtype, device=target.device,
-                    ))
+                    try:
+                        target.data.copy_(tensor.to(
+                            dtype=target.data.dtype, device=target.device,
+                        ))
+                    except RuntimeError as _copy_err:
+                        # Last-resort: shapes diverged after step 1
+                        # materialized via _streaming_shape but the
+                        # cached tensor doesn't match (e.g. was packed
+                        # at a different TP world or got sliced wrong).
+                        # Re-materialize from the loaded tensor directly.
+                        logger.warning(
+                            "residuals copy mismatch for %s "
+                            "(target=%s tensor=%s): %s — "
+                            "re-materializing from tensor shape",
+                            key, tuple(target.data.shape),
+                            tuple(tensor.shape), _copy_err,
+                        )
+                        if isinstance(target, torch.nn.Parameter):
+                            target.data = tensor.to(
+                                dtype=target.data.dtype,
+                                device=_guess_device(model),
+                            ).contiguous()
+                        else:
+                            target.data = tensor.to(
+                                device=target.device).contiguous()
                 loaded += 1
 
         logger.info(
