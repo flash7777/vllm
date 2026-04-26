@@ -152,7 +152,7 @@ for task in ${TASKS//,/ }; do
           "$IMAGE" \
           lm_eval \
             --model local-completions \
-            --model_args "base_url=${URL}/v1/completions,model=${MODEL},tokenizer=${TOKENIZER_PATH},num_concurrent=${CONCURRENCY},max_retries=3,tokenized_requests=False" \
+            --model_args "base_url=${URL}/v1/completions,model=${MODEL},tokenizer=${TOKENIZER_PATH},num_concurrent=${CONCURRENCY},max_retries=3,tokenized_requests=True" \
             --tasks "$task" \
             --num_fewshot "$nfs" \
             --batch_size 1 \
