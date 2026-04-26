@@ -265,6 +265,25 @@ def infer_tp_role_from_param(name: str, param: torch.nn.Parameter) -> dict:
 
     Falls back to ``replicated`` when no TP-relevant attributes found.
     """
+    # vllm carries TP metadata only on its BasevLLMParameter subclasses
+    # (ModelWeightParameter, _ColumnvLLMParameter, RowvLLMParameter,
+    # QKVParameter, …). Plain ``torch.nn.Parameter`` objects — biases,
+    # routers' mlp.gate.weight, GatedDeltaNet conv1d.weight, RMSNorms,
+    # … — get an ``output_dim`` attribute via ``set_weight_attrs`` for
+    # the parent layer's weight_loader to use, but they aren't actually
+    # TP-sharded by the layer (the per-rank shape is set on the param's
+    # ``.data`` directly by the layer constructor, not via slicing).
+    # Treat plain Parameters as replicated regardless of any
+    # ``output_dim`` attribute, otherwise the load-time _tp_slicer
+    # would halve them at TP>1.
+    try:
+        from vllm.model_executor.parameter import BasevLLMParameter
+        _is_vllm_param = isinstance(param, BasevLLMParameter)
+    except ImportError:
+        _is_vllm_param = False
+    if not _is_vllm_param:
+        return {"tp_role": "replicated"}
+
     output_dim = getattr(param, "output_dim", None)
     input_dim = getattr(param, "input_dim", None)
     packed_dim = getattr(param, "packed_dim", None)

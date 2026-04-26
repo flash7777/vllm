@@ -58,7 +58,16 @@ _LLOYD_ITERS_LINEAR = 20
 # warp-interleaved repack happens on-device at load time. Schema 1
 # baked repack into storage and had no per-tensor TP metadata — caches
 # from schema 1 are not load-compatible and must be regenerated.
-_MANIFEST_SCHEMA_VERSION = 2
+#
+# Schema 3: identical wire format to schema 2, but adds the PACK/LOAD
+# separation in base_loader: cache-only LOAD never invokes
+# save_residuals, so the on-disk full-shape tensors stay intact across
+# arbitrarily many TP>1 LOADs. Caches packed under schema 2 (where
+# save_residuals fired on every LOAD) accumulated per-rank shapes for
+# vision QKV bias, GatedDeltaNet conv1d.weight, and the MoE router
+# gate.weight — those are unrecoverable and rejected here so the
+# operator is forced into a clean PACK with the new code.
+_MANIFEST_SCHEMA_VERSION = 3
 
 
 def _env_truthy(name: str) -> bool:
@@ -582,6 +591,26 @@ class MultiQuantWeightCache:
         """
         if self.read_only:
             return False
+        # Hard guard: residuals are inherently a TP=1 (full-shape) artifact.
+        # If we're called at TP>1, the model.named_parameters() iteration
+        # would write per-rank shards over the full tensors and corrupt
+        # the cache for any future LOAD. Bail out — the LOAD path should
+        # never reach here (it sets read_only above), but defend against
+        # accidental writes from any other code path.
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_world_size as _get_tp_world,
+            )
+            tp_world_now = _get_tp_world()
+        except Exception:
+            tp_world_now = 1
+        if tp_world_now > 1:
+            logger.warning(
+                "MultiQuant cache: refusing save_residuals at TP=%d — "
+                "params are per-rank shaped, would corrupt the on-disk "
+                "TP=1 cache. Run a quant-only PACK at TP=1 first.",
+                tp_world_now)
+            return False
         try:
             from safetensors.torch import save_file
         except ImportError:
@@ -799,13 +828,6 @@ class MultiQuantWeightCache:
         skipped: list[str] = []
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in f.keys():
-                # The v2 cache packed before the disable_tp/save_residuals
-                # fixes captured vision-tower params at TP-shard sizes
-                # rather than full sizes. Skip the cache for visual.*
-                # entries — the source-safetensors fallback below will
-                # re-load them at the correct per-rank shape.
-                if key.startswith("visual."):
-                    continue
                 tensor = f.get_tensor(key)
                 if key.startswith("__buffer__/"):
                     target_name = key[len("__buffer__/"):]
@@ -988,8 +1010,12 @@ class MultiQuantWeightCache:
         if force_keys is None:
             force_keys = set()
         # Collect targets: Linear params still at (0,) with a known
-        # original shape, any visual-tower param/buffer, or any param
-        # whose key the load phase explicitly forced into the fallback.
+        # original shape, or any param whose key the load phase
+        # explicitly forced into the fallback (residuals.safetensors copy
+        # raised a shape mismatch). With schema v3 the cache should hold
+        # full-shape vision/conv1d/gate tensors and this fallback should
+        # almost never fire — it stays as a safety net for future cases
+        # where save_residuals misses a layer class entirely.
         targets: list[tuple[str, torch.nn.Parameter]] = []
         seen: set[str] = set()
         for name, p in model.named_parameters():
@@ -997,9 +1023,8 @@ class MultiQuantWeightCache:
                 continue  # MoE expert tensors handled by XFP cache hit
             stubbed = (p.data.numel() == 0
                        and getattr(p, "_streaming_shape", None))
-            is_visual = name.startswith("visual.")
             forced = name in force_keys
-            if stubbed or is_visual or forced:
+            if stubbed or forced:
                 if name in seen:
                     continue
                 seen.add(name)

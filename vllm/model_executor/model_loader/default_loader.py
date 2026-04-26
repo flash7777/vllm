@@ -43,6 +43,11 @@ logger = init_logger(__name__)
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
+    # PACK loader — populates the MultiQuant cache from HF safetensors
+    # at TP=1 with full-shape tensors. _finalize_multiquant_cache is
+    # therefore allowed to dump residuals.
+    is_pack_loader = True
+
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 

@@ -24,6 +24,12 @@ logger = init_logger(__name__)
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
+    # Subclasses that materialize the cache from a fresh source (PACK)
+    # must set this to True. Cache-only LOAD paths leave it False so
+    # _finalize_multiquant_cache won't overwrite cached residuals with
+    # the per-rank shapes we just constructed during model init.
+    is_pack_loader: bool = False
+
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
@@ -110,8 +116,13 @@ class BaseModelLoader(ABC):
 
             # Finalize cache (write manifest + log summary + dump
             # residuals) after all per-layer process_weights_after_loading
-            # calls have fired.
-            _finalize_multiquant_cache(model)
+            # calls have fired. write_residuals only fires on a PACK
+            # loader — cache-only LOAD paths must leave the on-disk
+            # residuals untouched (they were written at TP=1 with
+            # full-size tensors; an LOAD at TP>1 would overwrite them
+            # with per-rank shards and corrupt the cache).
+            _finalize_multiquant_cache(
+                model, write_residuals=self.is_pack_loader)
 
             # MULTIQUANT_QUANT_ONLY: we've written the full cache shard
             # + residuals to disk. Exit cleanly before vLLM proceeds to
@@ -198,15 +209,22 @@ def _initialize_multiquant_cache(
     MultiQuantWeightCache.set_active(cache)
 
 
-def _finalize_multiquant_cache(model: nn.Module | None = None) -> None:
+def _finalize_multiquant_cache(
+    model: nn.Module | None = None,
+    write_residuals: bool = True,
+) -> None:
     """Write manifest + summary log at the end of model load.
 
-    When ``model`` is provided and the cache is writable, also dump
-    ``residuals.safetensors`` — all Parameters/buffers that still hold
-    non-zero data after the MultiQuant-packed layers zeroed theirs.
-    That file is the missing half for a future cache-only reload
-    (tp-xfp workflow): cache shards carry the quantized weights,
-    residuals carry embed_tokens / RMSNorms / biases / non-fp8 lm_head.
+    When ``model`` is provided, ``write_residuals=True`` and the cache
+    is writable, also dump ``residuals.safetensors`` — all
+    Parameters/buffers that still hold non-zero data after the
+    MultiQuant-packed layers zeroed theirs. That file is the missing
+    half for a future cache-only reload (tp-xfp workflow): cache shards
+    carry the quantized weights, residuals carry embed_tokens / RMSNorms
+    / biases / non-fp8 lm_head.
+
+    Cache-only LOAD paths pass ``write_residuals=False`` so the on-disk
+    file isn't overwritten with per-rank shapes from a TP>1 worker.
     """
     try:
         from vllm.multiquant.policy import MultiQuantPolicyRegistry
@@ -221,8 +239,14 @@ def _finalize_multiquant_cache(model: nn.Module | None = None) -> None:
         registry = MultiQuantPolicyRegistry.get_active()
         inventory = [p.stem for p in cache.cache_dir.glob("*.safetensors")]
         cache.write_manifest(registry, inventory)
-        if model is not None:
+        if model is not None and write_residuals and not cache.read_only:
             cache.save_residuals(model)
+        elif model is not None:
+            logger.info(
+                "MultiQuant cache: skipping save_residuals "
+                "(write_residuals=%s, read_only=%s) — "
+                "cache-only LOAD path leaves residuals on disk untouched.",
+                write_residuals, cache.read_only)
         cache.log_summary()
 
         # Persist structured xfp_summary.json for offline analysis

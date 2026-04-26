@@ -1,0 +1,74 @@
+{
+  "metrics": {
+    "exact_match,flexible-extract": {
+      "ci95": [
+        0.057570972533495524,
+        1.0632781555938737
+      ],
+      "mean": 0.5604245640636846,
+      "per_seed": [
+        0.6,
+        0.5208491281273692
+      ],
+      "std": 0.05596811823796482
+    },
+    "exact_match,strict-match": {
+      "ci95": [
+        0.2550068254427599,
+        0.894652007006065
+      ],
+      "mean": 0.5748294162244124,
+      "per_seed": [
+        0.6,
+        0.5496588324488249
+      ],
+      "std": 0.035596580948284114
+    },
+    "exact_match_stderr,flexible-extract": {
+      "ci95": [
+        -0.8615054573735826,
+        1.0385652796531577
+      ],
+      "mean": 0.08852991113978755,
+      "per_seed": [
+        0.16329931618554522,
+        0.013760506094029864
+      ],
+      "std": 0.10573990666627783
+    },
+    "exact_match_stderr,strict-match": {
+      "ci95": [
+        -0.8618900232936275,
+        1.0388937299777554
+      ],
+      "mean": 0.08850185334206401,
+      "per_seed": [
+        0.16329931618554522,
+        0.01370439049858281
+      ],
+      "std": 0.10577958638434876
+    }
+  },
+  "n_seeds": 2,
+  "per_seed": [
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.6,
+        "exact_match,strict-match": 0.6,
+        "exact_match_stderr,flexible-extract": 0.16329931618554522,
+        "exact_match_stderr,strict-match": 0.16329931618554522
+      },
+      "seed_dir": "seed0"
+    },
+    {
+      "metrics": {
+        "exact_match,flexible-extract": 0.5208491281273692,
+        "exact_match,strict-match": 0.5496588324488249,
+        "exact_match_stderr,flexible-extract": 0.013760506094029864,
+        "exact_match_stderr,strict-match": 0.01370439049858281
+      },
+      "seed_dir": "seed1"
+    }
+  ],
+  "task": "gsm8k"
+}

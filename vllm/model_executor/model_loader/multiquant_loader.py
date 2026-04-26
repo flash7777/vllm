@@ -53,7 +53,15 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
          ``process_weights_after_loading`` fires and hits the cache.
       3. ``process_weights_after_loading`` runs — for each quant layer,
          the cache-hit path loads packed/codebook tensors directly.
+
+    LOAD path — never writes the cache. ``is_pack_loader = False`` keeps
+    ``_finalize_multiquant_cache`` from overwriting on-disk residuals
+    with per-rank tensors, and we additionally force the cache itself
+    into read_only mode as a belt-and-suspenders guard against any
+    save_residuals invocation through other code paths.
     """
+
+    is_pack_loader = False
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -64,6 +72,13 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         from vllm.multiquant.weight_cache import MultiQuantWeightCache
+        # Force read_only on the active cache so even an accidental
+        # save_residuals call here or downstream is a no-op.
+        _active_cache = MultiQuantWeightCache.get_active()
+        if _active_cache is not None and not _active_cache.read_only:
+            _active_cache.read_only = True
+            logger.info(
+                "MultiQuant cache: cache-only loader forces read_only=True")
 
         cache = MultiQuantWeightCache.get_active()
         if cache is None:
