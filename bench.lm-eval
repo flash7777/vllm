@@ -29,7 +29,11 @@ EXTRA_GEN_KWARGS=""   # e.g. top_p=1 etc (already set by defaults below)
 
 # lm-eval task name conventions — gsm8k + wikitext + mmlu are what we care about
 declare -A TASK_FEWSHOT=( [gsm8k]=5 [wikitext]=0 [mmlu]=5 )
-declare -A TASK_MAX_GEN=(  [gsm8k]=256 [wikitext]=0 [mmlu]=8 )
+# gsm8k: 1024 statt 256 für reasoning models (Qwen3.5/GLM-4.7) — die
+# verbrauchen 200-800 Tokens im <think>...</think> Block bevor die
+# eigentliche Antwort + "#### NUMBER" kommt. 256 schneidet mid-reasoning
+# ab und strict-match kollabiert auf 0 %.
+declare -A TASK_MAX_GEN=(  [gsm8k]=1024 [wikitext]=0 [mmlu]=8 )
 
 # ── Argparse ─────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
