@@ -270,6 +270,14 @@ def infer_tp_role_from_param(name: str, param: torch.nn.Parameter) -> dict:
     packed_dim = getattr(param, "packed_dim", None)
     head_size = getattr(param, "head_size", None)
 
+    # disable_tp layers (e.g. Qwen3-VL vision tower under
+    # mm-encoder-tp-mode=data) attach output_dim/input_dim attributes
+    # for the loader's q/k/v narrow logic, but the param's tp_size is
+    # forced to 1 by Linear.__init__. Treat those as replicated so the
+    # generic column/row slicer doesn't halve them at TP > 1.
+    if getattr(param, "tp_size", None) == 1:
+        return {"tp_role": "replicated"}
+
     # Heuristics — vllm's set_weight_attrs usually sets exactly one of these
     if output_dim is not None:
         # Could be column, qkv, merged_column, vocab_parallel — but without

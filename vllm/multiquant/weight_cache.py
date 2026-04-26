@@ -812,13 +812,18 @@ class MultiQuantWeightCache:
                 # Step 1: prefer vllm's specialized load methods on
                 # _ColumnvLLMParameter / RowvLLMParameter — they handle
                 # qkv-aware, merged-shard-offset, and per-rank narrow
-                # correctly. Skip for buffers and non-linear params.
+                # correctly. Skip for buffers, non-linear params, and
+                # disable_tp params (vision tower under mm-encoder-tp-mode=
+                # data: param.tp_size==1 means "this param is replicated
+                # across TP ranks", so the loader's tp_rank * shard_size
+                # narrow goes out of bounds on rank>0).
                 used_vllm_loader = False
                 if (
                     tp_world > 1
                     and _LINEAR_PARAM_CLASSES
                     and isinstance(target, _LINEAR_PARAM_CLASSES)
                     and not key.startswith("__buffer__/")
+                    and getattr(target, "tp_size", None) != 1
                 ):
                     try:
                         # Materialize meta-device target if needed.
@@ -865,6 +870,14 @@ class MultiQuantWeightCache:
                 # GatedDeltaNet weights, and any param the vllm loader
                 # rejected).
                 entry = tp_meta.get(key)
+                # disable_tp layers (vision tower under
+                # mm-encoder-tp-mode=data) have param.tp_size==1 even at
+                # TP > 1. The manifest may still say "column" because it
+                # was packed by an older infer_tp_role_from_param without
+                # the tp_size check — treat those as replicated.
+                if (entry is not None and entry.get("tp_role") == "column"
+                        and getattr(target, "tp_size", None) == 1):
+                    entry = {"tp_role": "replicated"}
                 if entry is not None and tp_world > 1:
                     try:
                         tensor = slice_for_tp(tensor, entry, tp_rank, tp_world)
