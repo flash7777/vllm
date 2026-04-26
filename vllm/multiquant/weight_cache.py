@@ -799,6 +799,13 @@ class MultiQuantWeightCache:
         skipped: list[str] = []
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in f.keys():
+                # The v2 cache packed before the disable_tp/save_residuals
+                # fixes captured vision-tower params at TP-shard sizes
+                # rather than full sizes. Skip the cache for visual.*
+                # entries — the source-safetensors fallback below will
+                # re-load them at the correct per-rank shape.
+                if key.startswith("visual."):
+                    continue
                 tensor = f.get_tensor(key)
                 if key.startswith("__buffer__/"):
                     target_name = key[len("__buffer__/"):]
@@ -961,22 +968,33 @@ class MultiQuantWeightCache:
         tp_rank: int,
         linear_param_classes: tuple,
     ) -> None:
-        """Materialize stubbed Linear weights from source HF safetensors."""
+        """Materialize stubbed/mis-shaped Linear weights from source HF.
+
+        Two trigger conditions:
+          1. Param is at (0,) stub with a known _streaming_shape — the
+             cache was packed before save_residuals captured this layer.
+          2. Param's name starts with ``visual.`` — vision tower weights
+             have historically been mis-shaped in the v2 cache (saved at
+             TP-shard size instead of full size), so we always reload
+             them from source to bypass the cache for that subtree.
+        """
         if not self.model_path:
             return
         # Collect targets: Linear params still at (0,) with a known
-        # original shape (set by initialize_streaming_quantload).
+        # original shape, OR any visual-tower param/buffer.
         targets: list[tuple[str, torch.nn.Parameter]] = []
+        seen: set[str] = set()
         for name, p in model.named_parameters():
-            if not name.endswith(".weight"):
-                continue
-            if p.data.numel() != 0:
-                continue
-            if not getattr(p, "_streaming_shape", None):
-                continue
             if name.endswith(".w13_weight") or name.endswith(".w2_weight"):
                 continue  # MoE expert tensors handled by XFP cache hit
-            targets.append((name, p))
+            stubbed = (p.data.numel() == 0
+                       and getattr(p, "_streaming_shape", None))
+            is_visual = name.startswith("visual.")
+            if stubbed or is_visual:
+                if name in seen:
+                    continue
+                seen.add(name)
+                targets.append((name, p))
         if not targets:
             return
 
@@ -1076,17 +1094,24 @@ class MultiQuantWeightCache:
                         # Apply TP slice via the same mechanism as the
                         # main residual path: use the vllm Parameter's
                         # specialized loader if it's column/row/qkv, else
-                        # fall back to a plain narrow against the stored
-                        # _streaming_shape.
-                        target_shape = tuple(getattr(
-                            p, "_streaming_shape", full.shape))
+                        # fall back to a plain narrow against the target
+                        # per-rank shape (preferred from the param itself,
+                        # then _streaming_shape, then full.shape).
+                        if p.data.numel() > 0:
+                            target_shape = tuple(p.data.shape)
+                        else:
+                            target_shape = tuple(getattr(
+                                p, "_streaming_shape", full.shape))
                         target_dtype = getattr(
-                            p, "_streaming_dtype", full.dtype)
-                        # Allocate the target storage at per-rank shape.
-                        p.data = torch.empty(
-                            target_shape, dtype=target_dtype,
-                            device=target_device,
-                        )
+                            p, "_streaming_dtype", p.data.dtype)
+                        # Allocate the target storage at per-rank shape
+                        # only if the existing storage is empty/wrong.
+                        if (p.data.numel() == 0
+                                or tuple(p.data.shape) != target_shape):
+                            p.data = torch.empty(
+                                target_shape, dtype=target_dtype,
+                                device=target_device,
+                            )
                         used_vllm = False
                         if (tp_world > 1 and linear_param_classes
                                 and isinstance(p, linear_param_classes)):
