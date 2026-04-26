@@ -331,6 +331,15 @@ def load_moe(
                         "local_num_experts=%d — trimming to first %d kept "
                         "experts",
                         layer_prefix, n_emap_kept, _local_E, _local_E)
+                    # CRITICAL: also clear the dropped expert slots in
+                    # the live ``_expert_map`` tensor so the FusedMoE
+                    # forward router doesn't dispatch tokens to compact
+                    # ids the kernel doesn't have storage for. Leaving
+                    # the original mapping in place produces a
+                    # scatter-gather index-out-of-bounds device-side
+                    # assert when topk picks one of the dropped experts.
+                    dropped = kept_indices[_local_E:]
+                    _expert_map[dropped] = -1
                 kept_indices = kept_indices[: _local_E]
                 # Rebuild kept_mask reflecting just these indices.
                 kept_mask = torch.zeros_like(kept_mask)
