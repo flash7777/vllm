@@ -26,42 +26,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.multiquant.policy import DTYPE_BITS
 
-def _infer_linear_tp_role(layer: nn.Module) -> str:
-    """Map a vllm Linear-base subclass to its TP-role keyword.
-
-    Used by save_linear to record the slicing axis the generic loader
-    will need at load time. Returns one of:
-        ``column`` | ``row`` | ``qkv`` | ``merged_column`` | ``replicated``
-
-    A MergedColumnParallelLinear with a *single* element in
-    ``output_sizes`` is effectively a plain ColumnParallelLinear
-    (Qwen3-Next / GatedDeltaNet uses this pattern for in_proj_qkvz and
-    in_proj_ba) — downgrade to ``column`` so the slicer doesn't expect
-    multi-shard ``shard_offsets`` we'd then have to populate.
-    """
-    try:
-        from vllm.model_executor.layers.linear import (
-            ColumnParallelLinear,
-            RowParallelLinear,
-            QKVParallelLinear,
-            MergedColumnParallelLinear,
-        )
-    except ImportError:
-        return "replicated"
-    if isinstance(layer, QKVParallelLinear):
-        return "qkv"
-    if isinstance(layer, MergedColumnParallelLinear):
-        out_sizes = getattr(layer, "output_sizes", None)
-        if out_sizes is not None and len(out_sizes) == 1:
-            return "column"
-        return "merged_column"
-    if isinstance(layer, RowParallelLinear):
-        return "row"
-    if isinstance(layer, ColumnParallelLinear):
-        return "column"
-    return "replicated"
-
-
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -281,17 +245,7 @@ class XFPLinearMethod(QuantizeMethodBase):
         from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
 
         W = layer.weight.data  # [N_out, K]
-        # Use the worker's current CUDA device, not W.device. Under
-        # streaming-quant init layer.weight.data was reset to a size-0
-        # stub on the constructor's default device (often cuda:0
-        # regardless of the worker's tp_rank), so W.device would route
-        # the per-rank tensors of an XFP cache-hit (packed, codebook,
-        # outliers) onto cuda:0 even on rank 1 — mismatch at forward
-        # time.
-        if torch.cuda.is_available():
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        else:
-            device = W.device
+        device = W.device
 
         # ─── Cache check (skip Lloyd + pack if we've done this before) ──
         cache = MultiQuantWeightCache.get_active()
@@ -344,11 +298,10 @@ class XFPLinearMethod(QuantizeMethodBase):
             outlier_max_fraction=self.outlier_max_fraction,
         )
 
-        # Schema v2: store pre-repack 2D ``[K_packed, N]`` so the cache is
-        # TP-slicable. The on-device warp-interleaved repack happens
-        # below for non-quant-only runs (so the forward kernel sees the
-        # familiar flat layout) and inside ``load_linear`` for cache
-        # warmstarts.
+        # Repack for coalesced warp reads (v4opt kernel expects 1D repacked)
+        from vllm.multiquant.xfp.xfp_pack import xfp_repack
+        repacked = xfp_repack(packed)
+
         K = int(W.shape[1])
         N_out = int(W.shape[0])
 
@@ -366,7 +319,7 @@ class XFPLinearMethod(QuantizeMethodBase):
         # mode we strip them AFTER save, leaving nn.Parameters with
         # size-0 stubs so nothing lingers in VRAM.
         layer.xfp_packed = nn.Parameter(
-            packed.to(device), requires_grad=False
+            repacked.to(device), requires_grad=False
         )
         layer.xfp_codebook = nn.Parameter(
             codebook.to(device), requires_grad=False
@@ -406,41 +359,54 @@ class XFPLinearMethod(QuantizeMethodBase):
             reg.record_stats(layer_type, stats)
 
         auto_tag = f"(auto)" if self.bits == 0 else ""
+        # Log a richer name (prefix or layer_name fallback) and, when the
+        # pack stats are pathological (nan/inf), dump source-W stats so we
+        # can tell input-pathology from pack-bug.
+        _name = (getattr(layer, "layer_name", None)
+                 or getattr(layer, "prefix", None)
+                 or f"<{type(layer).__name__}>")
+        import math as _math
+        _bad = (
+            _math.isnan(stats.mse) or _math.isnan(stats.cos_sim)
+            or _math.isinf(stats.mse)
+        )
         logger.info(
             "XFP %s [%dx%d] -> xfp%d%s | mse=%.3g cos=%.3f | "
             "3sigma=%.1f%% | outliers=%.3f%% (k=%.1f)",
-            getattr(layer, "layer_name", "?"),
-            stats.shape[0], stats.shape[1],
+            _name, stats.shape[0], stats.shape[1],
             bits, auto_tag, stats.mse, stats.cos_sim,
             100.0 * stats.outlier_ratio_k3,
             100.0 * stats.outlier_fraction,
             stats.outlier_sigma,
         )
+        if _bad:
+            _Wf = W.float()
+            _norm = _Wf.norm().item()
+            _has_nan = bool(torch.isnan(_Wf).any().item())
+            _has_inf = bool(torch.isinf(_Wf).any().item())
+            _all_zero = bool((_Wf == 0).all().item())
+            _row_norms = _Wf.norm(dim=1)
+            _zero_rows = int((_row_norms == 0).sum().item())
+            _row_min = _row_norms.min().item()
+            _row_max = _row_norms.max().item()
+            logger.warning(
+                "[xfp-nan] %s shape=%s | W.norm=%.3g all_zero=%s nan=%s inf=%s "
+                "| row_norms: zero_rows=%d/%d min=%.3g max=%.3g | "
+                "W mean=%.3g std=%.3g abs_max=%.3g",
+                _name, tuple(W.shape), _norm, _all_zero, _has_nan, _has_inf,
+                _zero_rows, _Wf.shape[0], _row_min, _row_max,
+                _Wf.mean().item(), _Wf.std().item(), _Wf.abs().max().item(),
+            )
 
         # Persist to disk cache (if enabled) so future loads skip Lloyd.
-        # Determine the TP role from the linear-layer's class so the
-        # generic load-time slicer can recover this rank's slice.
         if cache is not None and layer_prefix:
-            tp_role = _infer_linear_tp_role(layer)
-            xfp_cache.save_linear(
-                cache, layer_prefix, layer,
-                tp_role=tp_role,
-                input_dim_packed=0,  # packed is [K_packed, N]
-                output_dim=1,
-            )
+            xfp_cache.save_linear(cache, layer_prefix, layer)
 
         # Free the BF16 weight
         try:
             del layer.weight
         except AttributeError:
             pass
-
-        # On-device warp-interleave repack so the forward kernel sees
-        # the familiar flat layout. Skip in quant-only (no forward).
-        if not _quant_only:
-            from vllm.multiquant.xfp._repack import repack_2d_to_warp_flat
-            layer.xfp_packed.data = repack_2d_to_warp_flat(
-                layer.xfp_packed.data)
 
         # MULTIQUANT_QUANT_ONLY: after cache.save has persisted the
         # packed artefacts, strip the attached Parameters' storage so
@@ -463,82 +429,6 @@ class XFPLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Defensive lazy device-migration: under TP > 1 the streaming-quant
-        # init path can leave xfp_* params on the wrong CUDA index (e.g.
-        # cuda:0 on rank 1) because torch.cuda.set_device(local_rank) hasn't
-        # taken effect at PWAL time. Migrate on first forward when the
-        # activation lands on the worker's actual device, then cache so
-        # subsequent forwards skip the check.
-        if not getattr(layer, "_xfp_devmoved", False):
-            x_dev = x.device
-            for _attr in ("xfp_packed", "xfp_codebook",
-                          "xfp_outlier_row", "xfp_outlier_col",
-                          "xfp_outlier_val"):
-                p = getattr(layer, _attr, None)
-                if p is None:
-                    continue
-                if p.device != x_dev:
-                    p.data = p.data.to(x_dev)
-            layer._xfp_devmoved = True
-
-        # Defensive lazy outlier TP-remap: cache writer marks
-        # xfp_outlier_{row,col,val} as "replicated" (xfp_weight_cache.py:125),
-        # so under TP > 1 every rank loads the *full-N* indices. For
-        # column-parallel layers, output-channel indices in
-        # [rank * N_per_rank, (rank+1) * N_per_rank) belong to this rank;
-        # outside that range they OOB scatter_add. Detect via
-        # outlier_row.max() vs N_per_rank, then filter+shift in place.
-        # Symmetric for row-parallel via outlier_col vs K_per_rank.
-        if (
-            not getattr(layer, "_xfp_outliers_tpfixed", False)
-            and getattr(layer, "_xfp_has_outliers", False)
-        ):
-            try:
-                from vllm.distributed import (
-                    get_tensor_model_parallel_rank,
-                    get_tensor_model_parallel_world_size,
-                )
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_world = get_tensor_model_parallel_world_size()
-            except Exception:
-                tp_rank, tp_world = 0, 1
-
-            row = layer.xfp_outlier_row.data
-            col = layer.xfp_outlier_col.data
-            val = layer.xfp_outlier_val.data
-            N_per = int(layer._xfp_N)
-            K_per = int(layer._xfp_K)
-
-            if tp_world > 1 and row.numel() > 0:
-                # Column-parallel detection: row indices reach into the
-                # full-N range above N_per_rank.
-                if int(row.max().item()) >= N_per:
-                    lo = tp_rank * N_per
-                    hi = (tp_rank + 1) * N_per
-                    mask = (row >= lo) & (row < hi)
-                    layer.xfp_outlier_row.data = (row[mask] - lo).contiguous()
-                    layer.xfp_outlier_col.data = col[mask].contiguous()
-                    layer.xfp_outlier_val.data = val[mask].contiguous()
-                # Row-parallel detection: col indices reach into the
-                # full-K range above K_per_rank.
-                else:
-                    col_after = layer.xfp_outlier_col.data
-                    if col_after.numel() > 0 and \
-                            int(col_after.max().item()) >= K_per:
-                        lo = tp_rank * K_per
-                        hi = (tp_rank + 1) * K_per
-                        mask = (col_after >= lo) & (col_after < hi)
-                        layer.xfp_outlier_row.data = \
-                            layer.xfp_outlier_row.data[mask].contiguous()
-                        layer.xfp_outlier_col.data = \
-                            (col_after[mask] - lo).contiguous()
-                        layer.xfp_outlier_val.data = \
-                            layer.xfp_outlier_val.data[mask].contiguous()
-
-            if layer.xfp_outlier_row.data.numel() == 0:
-                layer._xfp_has_outliers = False
-            layer._xfp_outliers_tpfixed = True
-
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
