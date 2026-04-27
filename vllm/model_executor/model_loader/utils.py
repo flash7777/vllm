@@ -488,11 +488,36 @@ def _make_streaming_loader(layer, param_name, original_loader,
             kwargs["param"] = param
         ret = original_loader(*args, **kwargs)
 
-        # Track how many elements have been loaded for this layer
+        # Track how many elements have been loaded for this layer.
+        #
+        # Naïve `loaded_weight.numel()` over-counts in two FusedMoE cases:
+        #   1. The HF source feeds full pre-TP-narrow tensors; the actual
+        #      write to `param.data[expert_id]` is `numel // tp_world_size`.
+        #   2. Under EP, weight_loader is called for *every* global expert
+        #      id; only the local subset is actually written (others
+        #      return False with `return_success=True`).
+        # Both effects let `_sq_load_numel` cross `_sq_load_total` long
+        # before w2_weight is loaded, firing PWAL on a half-populated
+        # FusedMoE layer (`w2_weight.shape=(0,)` → IndexError at K2).
         loaded_weight = args[1] if len(args) > 1 else kwargs.get(
             "loaded_weight", None)
         if loaded_weight is not None and hasattr(loaded_weight, "numel"):
-            layer._sq_load_numel += loaded_weight.numel()
+            numel = loaded_weight.numel()
+            # FusedMoE expert calls always pass return_success=True.
+            if kwargs.get("return_success") is True:
+                if ret is False:
+                    numel = 0  # non-local expert, nothing was written
+                else:
+                    try:
+                        from vllm.distributed import (
+                            get_tensor_model_parallel_world_size,
+                        )
+                        _tp = get_tensor_model_parallel_world_size()
+                        if _tp > 1:
+                            numel = numel // _tp
+                    except Exception:
+                        pass
+            layer._sq_load_numel += numel
 
         # When all weights for this layer are loaded, quantize immediately
         if (layer._sq_load_numel >= layer._sq_load_total
