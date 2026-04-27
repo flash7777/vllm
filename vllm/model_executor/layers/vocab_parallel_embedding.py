@@ -66,6 +66,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Same TP-rank-affinity guard as in `embedding()` below — the
+        # ParallelLMHead's weight Parameter can land on global cuda:0
+        # even on rank-N workers, causing wrapper_CUDA_mm to refuse the
+        # lm_head GEMM at logits-compute time.
+        if layer.weight.device != x.device:
+            layer.weight.data = layer.weight.data.to(x.device)
+            if bias is not None and bias.device != x.device:
+                bias.data = bias.data.to(x.device)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
