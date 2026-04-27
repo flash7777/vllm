@@ -287,6 +287,17 @@ def load_moe(
     needs_stage = has_riy_filter or tp_world > 1
     stage = torch.device("cpu") if needs_stage else device
     res = cache.load(layer_prefix, _XFP_MOE_METHOD, stage)
+    # PR1 diagnostic — log cache-hit/miss per layer + rank to surface
+    # whether some MoE layers are silently missing on one rank but not
+    # the other (which would explain the w2.shape=(0,) bug).
+    import os as _dbg_os
+    if _dbg_os.environ.get("XFP_LOAD_DEBUG", "0") == "1":
+        logger.info(
+            "[XFP_LOAD_DEBUG load_moe rank=%d] %s: cache_hit=%s "
+            "needs_stage=%s riy=%s",
+            tp_rank, layer_prefix, res is not None, needs_stage,
+            has_riy_filter,
+        )
     if res is None:
         return False
     tensors, meta, tensor_meta = res

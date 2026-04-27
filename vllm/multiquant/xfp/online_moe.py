@@ -266,13 +266,32 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 _rank = _dist.get_rank() if _dist.is_initialized() else -1
             except Exception:
                 _rank = -1
+            # PR1: include numel, dtype + cache-presence to disambiguate
+            # "stub never overwritten" vs "vllm wrote partial" vs
+            # "cache-hit branch should have fired but didn't".
+            try:
+                from vllm.multiquant.weight_cache import (
+                    MultiQuantWeightCache,
+                )
+                _cache = MultiQuantWeightCache.get_active()
+                _layer_prefix = getattr(layer, "layer_name", "") or \
+                    getattr(layer, "prefix", "") or ""
+                _cache_dir = (_cache.cache_dir / _layer_prefix
+                              if _cache and _layer_prefix else None)
+                _cache_present = _cache_dir.exists() if _cache_dir else False
+            except Exception:
+                _cache_present = "?"
             logger.warning(
                 "XFP MoE: unexpected weight rank at %s "
-                "(dist_rank=%d): w13.shape=%s device=%s | w2.shape=%s device=%s",
+                "(dist_rank=%d): w13.shape=%s numel=%d dtype=%s device=%s | "
+                "w2.shape=%s numel=%d dtype=%s device=%s | "
+                "cache_dir_for_layer_present=%s",
                 getattr(layer, "layer_name", "?") or
                 getattr(layer, "prefix", "?"),
-                _rank, tuple(w13.shape), w13.device,
-                tuple(w2.shape), w2.device,
+                _rank, tuple(w13.shape), int(w13.numel()), w13.dtype,
+                w13.device,
+                tuple(w2.shape), int(w2.numel()), w2.dtype, w2.device,
+                _cache_present,
             )
         E = int(w13.shape[0])
 

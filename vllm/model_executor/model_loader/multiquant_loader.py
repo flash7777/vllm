@@ -114,6 +114,12 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
         # ``layer.w13_weight`` instead of a meta tensor.
         n_stubbed = self._stub_moe_expert_tensors(model)
 
+        # PR1 diagnostic — per-rank shape of w13/w2 right after stubbing.
+        # Gated on XFP_LOAD_DEBUG=1 to avoid log spam on normal runs.
+        import os as _dbg_os
+        if _dbg_os.environ.get("XFP_LOAD_DEBUG", "0") == "1":
+            self._dbg_dump_moe_shapes(model, "AFTER_STUB")
+
         # Pick the iterator source.
         residuals_path = cache.cache_dir / "residuals.safetensors"
         if residuals_path.exists():
@@ -157,6 +163,12 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
             "model.load_weights, %d MoE expert params stubbed — quant "
             "layers will fill from cache in process_weights_after_loading",
             n_loaded, n_stubbed)
+
+        # PR1 diagnostic — per-rank shape of w13/w2 after vllm load_weights.
+        # Compare with AFTER_STUB to see what vllm did (or didn't) populate.
+        if _dbg_os.environ.get("XFP_LOAD_DEBUG", "0") == "1":
+            self._dbg_dump_moe_shapes(model, "AFTER_LOAD_WEIGHTS")
+            self._dbg_dump_filter_state(cache.cache_dir)
 
     # ─────────────────────────────────────────────────────────────────
     # Helpers
@@ -221,6 +233,46 @@ class MultiQuantCacheOnlyLoader(BaseModelLoader):
                         0, dtype=p.data.dtype, device=real_dev)
                     n += 1
         return n
+
+    def _dbg_dump_moe_shapes(self, model: nn.Module, tag: str) -> None:
+        """PR1 diagnostic — log w13/w2 shape per FusedMoE layer + rank."""
+        try:
+            from vllm.model_executor.layers.fused_moe import FusedMoE
+        except ImportError:
+            return
+        try:
+            import torch.distributed as _td
+            r = _td.get_rank() if _td.is_initialized() else -1
+        except Exception:
+            r = -1
+        first_logged = 0
+        for name, module in model.named_modules():
+            if not isinstance(module, FusedMoE):
+                continue
+            w13 = getattr(module, "w13_weight", None)
+            w2 = getattr(module, "w2_weight", None)
+            w13_shape = tuple(w13.data.shape) if w13 is not None else None
+            w2_shape = tuple(w2.data.shape) if w2 is not None else None
+            w13_dev = str(w13.data.device) if w13 is not None else "?"
+            w2_dev = str(w2.data.device) if w2 is not None else "?"
+            # Log only first 3 + last 1 layers per rank to bound noise
+            if first_logged < 3 or "59" in name or "47" in name:
+                logger.info(
+                    "[XFP_LOAD_DEBUG %s rank=%d] %s: "
+                    "w13.shape=%s dev=%s | w2.shape=%s dev=%s",
+                    tag, r, name, w13_shape, w13_dev, w2_shape, w2_dev,
+                )
+                first_logged += 1
+
+    def _dbg_dump_filter_state(self, cache_dir: Path) -> None:
+        """PR1 diagnostic — log whether _filter_mq_packed would be active."""
+        experts_dirs = list(cache_dir.glob("*.experts"))
+        logger.info(
+            "[XFP_LOAD_DEBUG] cache_dir=%s | *.experts dirs=%d | "
+            "filter_active=%s | _MQ_PACKED_LEAF_NAMES=%s",
+            cache_dir, len(experts_dirs), bool(experts_dirs),
+            _MQ_PACKED_LEAF_NAMES,
+        )
 
     def _residuals_iterator(
         self, residuals_path: Path, model: nn.Module,
