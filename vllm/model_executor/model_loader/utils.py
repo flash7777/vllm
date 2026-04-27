@@ -490,23 +490,29 @@ def _make_streaming_loader(layer, param_name, original_loader,
 
         # Track how many elements have been loaded for this layer.
         #
-        # Naïve `loaded_weight.numel()` over-counts in two FusedMoE cases:
-        #   1. The HF source feeds full pre-TP-narrow tensors; the actual
-        #      write to `param.data[expert_id]` is `numel // tp_world_size`.
-        #   2. Under EP, weight_loader is called for *every* global expert
-        #      id; only the local subset is actually written (others
-        #      return False with `return_success=True`).
-        # Both effects let `_sq_load_numel` cross `_sq_load_total` long
-        # before w2_weight is loaded, firing PWAL on a half-populated
-        # FusedMoE layer (`w2_weight.shape=(0,)` → IndexError at K2).
+        # Naïve `loaded_weight.numel()` over-counts in TWO patterns:
+        #   1. FusedMoE per-expert calls (return_success=True): under EP
+        #      non-local experts return False with no write; under TP the
+        #      loaded_weight is full pre-narrow.
+        #   2. Stacked Linear params (qkv_proj, gate_up_proj, in_proj_ba,
+        #      in_proj_qkvz, ...): each weight_loader call is given the
+        #      FULL HF tensor pre-narrow. The original_loader internally
+        #      narrows to (1/tp_world)-th of dim and copies. So actual
+        #      write per call is loaded_weight.numel()//tp_world.
+        # In both cases, naïve counting fires PWAL after the first call —
+        # which means later shards get skipped entirely. Symptom: layer's
+        # weight ends up partially uninit (torch.empty memory possibly NaN),
+        # producing avg cos=nan in xfp_pack reconstruction.
         loaded_weight = args[1] if len(args) > 1 else kwargs.get(
             "loaded_weight", None)
         if loaded_weight is not None and hasattr(loaded_weight, "numel"):
             numel = loaded_weight.numel()
-            # FusedMoE expert calls always pass return_success=True.
-            if kwargs.get("return_success") is True:
+            is_moe_call = kwargs.get("return_success") is True
+            # has_shard_id: either positional (3rd arg) or kwarg.
+            has_shard_id = (len(args) >= 3) or ("shard_id" in kwargs)
+            if is_moe_call:
                 if ret is False:
-                    numel = 0  # non-local expert, nothing was written
+                    numel = 0
                 else:
                     try:
                         from vllm.distributed import (
@@ -517,6 +523,17 @@ def _make_streaming_loader(layer, param_name, original_loader,
                             numel = numel // _tp
                     except Exception:
                         pass
+            elif has_shard_id:
+                # Stacked Linear param: loaded_weight is full pre-narrow.
+                try:
+                    from vllm.distributed import (
+                        get_tensor_model_parallel_world_size,
+                    )
+                    _tp = get_tensor_model_parallel_world_size()
+                    if _tp > 1:
+                        numel = numel // _tp
+                except Exception:
+                    pass
             layer._sq_load_numel += numel
 
         # When all weights for this layer are loaded, quantize immediately
