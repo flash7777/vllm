@@ -86,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --tool-call-parser)    TOOL_PARSER="$2"; shift 2 ;;
         --max-model-len)       MAX_MODEL_LEN="$2"; shift 2 ;;
         --max-num-seqs)        EXTRA_ARGS+=("--max-num-seqs" "$2"); shift 2 ;;
+        --max-num-batched-tokens) EXTRA_ARGS+=("--max-num-batched-tokens" "$2"); shift 2 ;;
         --mm-encoder-tp-mode)  EXTRA_ARGS+=("--mm-encoder-tp-mode" "$2"); shift 2 ;;
         --limit-mm-per-prompt) EXTRA_ARGS+=("--limit-mm-per-prompt" "$2"); shift 2 ;;
         --gpu-memory-utilization) GPU_MEM_UTIL="$2"; shift 2 ;;

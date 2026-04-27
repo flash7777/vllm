@@ -90,11 +90,21 @@ class FP8EmbeddingMethod(QuantizeMethodBase):
         Caches transposed weight on first call. Keeps weight in FP8 —
         real memory saving (no bf16 copy).
         """
-        if not hasattr(layer, '_fp8_weight_t'):
-            # Cache transposed FP8 weight + scale tensors
-            layer._fp8_weight_t = layer.weight.t().contiguous()
+        # Cache transposed FP8 weight + scale tensors on the *forward
+        # device* (= x.device), not on layer.weight.device. With TP>1,
+        # the lm_head Parameter can end up on the global cuda:0 even on
+        # rank-N workers, while forward inputs come in on cuda:N. Caching
+        # against x.device — and rebuilding the cache if the input
+        # device changes — prevents a torch._scaled_mm device mismatch.
+        target_dev = x.device
+        if (not hasattr(layer, '_fp8_weight_t')
+                or layer._fp8_weight_t.device != target_dev):
+            layer._fp8_weight_t = layer.weight.t().contiguous().to(target_dev)
             layer._fp8_x_scale = torch.tensor(
-                1.0, dtype=torch.float32, device=layer.weight.device)
+                1.0, dtype=torch.float32, device=target_dev)
+            # Also migrate weight_scale if it landed on a different device.
+            if layer.weight_scale.device != target_dev:
+                layer.weight_scale.data = layer.weight_scale.data.to(target_dev)
 
         x_fp8 = x.to(torch.float8_e4m3fn)
         out = torch._scaled_mm(
@@ -114,6 +124,11 @@ class FP8EmbeddingMethod(QuantizeMethodBase):
         input_: torch.Tensor,
     ) -> torch.Tensor:
         """Embedding lookup: dequant selected rows."""
-        # Lookup in FP8, then dequant
+        # Defensive TP-rank-affinity migration: under TP>1 the embedding
+        # layer.weight may have been placed on cuda:0 globally while the
+        # input arrives on the rank-local device.
+        if layer.weight.device != input_.device:
+            layer.weight.data = layer.weight.data.to(input_.device)
+            layer.weight_scale.data = layer.weight_scale.data.to(input_.device)
         out_fp8 = F.embedding(input_, layer.weight)
         return out_fp8.to(torch.bfloat16) * layer.weight_scale
