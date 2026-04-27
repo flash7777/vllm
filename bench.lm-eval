@@ -34,6 +34,9 @@ declare -A TASK_FEWSHOT=( [gsm8k]=5 [wikitext]=0 [mmlu]=5 )
 # eigentliche Antwort + "#### NUMBER" kommt. 256 schneidet mid-reasoning
 # ab und strict-match kollabiert auf 0 %.
 declare -A TASK_MAX_GEN=(  [gsm8k]=1024 [wikitext]=0 [mmlu]=8 )
+# batch_size: 1 für generate_until (num_concurrent macht den Job),
+# "auto" für loglikelihood-Tasks (MMLU, WikiText) — sonst sequentiell.
+declare -A TASK_BATCH=(    [gsm8k]=1    [wikitext]=auto [mmlu]=auto )
 
 # ── Argparse ─────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -136,6 +139,7 @@ ANY_FAILED=0
 for task in ${TASKS//,/ }; do
     nfs=${TASK_FEWSHOT[$task]:-0}
     mgen=${TASK_MAX_GEN[$task]:-128}
+    bs=${TASK_BATCH[$task]:-1}
     for seed in $(seq 0 $((SEEDS-1))); do
         SEED_DIR_HOST="$RUN_DIR/seed${seed}/${task}"
         mkdir -p "$SEED_DIR_HOST"
@@ -159,7 +163,7 @@ for task in ${TASKS//,/ }; do
             --model_args "base_url=${URL}/v1/completions,model=${MODEL},tokenizer=${TOKENIZER_PATH},num_concurrent=${CONCURRENCY},max_retries=3,tokenized_requests=True" \
             --tasks "$task" \
             --num_fewshot "$nfs" \
-            --batch_size 1 \
+            --batch_size "$bs" \
             --seed "$seed" \
             --gen_kwargs "temperature=0,top_p=1,max_gen_toks=${mgen},seed=${seed}${EXTRA_GEN_KWARGS}" \
             --output_path "/measurements/seed${seed}/${task}" \
