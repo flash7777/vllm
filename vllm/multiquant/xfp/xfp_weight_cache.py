@@ -67,7 +67,8 @@ def load_linear(
     res = cache.load(layer_prefix, _XFP_LINEAR_METHOD, device)
     if res is None:
         return False
-    tensors, meta = res
+    # cache.load returns (tensors, meta, tensor_meta) since refactor.
+    tensors, meta, _ = res
     try:
         layer.xfp_packed = nn.Parameter(
             tensors["xfp_packed"], requires_grad=False)
@@ -195,7 +196,9 @@ def load_moe(
     res = cache.load(layer_prefix, _XFP_MOE_METHOD, stage_device)
     if res is None:
         return False
-    tensors, meta = res
+    # cache.load returns (tensors, meta, tensor_meta); load_moe computes
+    # its TP-slice plan inline so tensor_meta is not needed here.
+    tensors, meta, _ = res
     try:
         cached_E = int(meta["E"])
         fpe13 = int(meta["fpe13"])
