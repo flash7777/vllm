@@ -69,6 +69,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        # TP-rank-affinity guard: under TP>1 a replicated embedding's
+        # weight Parameter can land on the global cuda:0 even on rank-N
+        # workers, while input_ arrives on cuda:N. F.embedding then
+        # refuses with index/weight device-mismatch.
+        if layer.weight.device != input_.device:
+            layer.weight.data = layer.weight.data.to(input_.device)
         return F.embedding(input_, layer.weight)
 
 
