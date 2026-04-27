@@ -481,6 +481,64 @@ class XFPLinearMethod(QuantizeMethodBase):
                     p.data = p.data.to(x_dev)
             layer._xfp_devmoved = True
 
+        # Defensive lazy outlier TP-remap: cache writer marks
+        # xfp_outlier_{row,col,val} as "replicated" (xfp_weight_cache.py:125),
+        # so under TP > 1 every rank loads the *full-N* indices. For
+        # column-parallel layers, output-channel indices in
+        # [rank * N_per_rank, (rank+1) * N_per_rank) belong to this rank;
+        # outside that range they OOB scatter_add. Detect via
+        # outlier_row.max() vs N_per_rank, then filter+shift in place.
+        # Symmetric for row-parallel via outlier_col vs K_per_rank.
+        if (
+            not getattr(layer, "_xfp_outliers_tpfixed", False)
+            and getattr(layer, "_xfp_has_outliers", False)
+        ):
+            try:
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_world = get_tensor_model_parallel_world_size()
+            except Exception:
+                tp_rank, tp_world = 0, 1
+
+            row = layer.xfp_outlier_row.data
+            col = layer.xfp_outlier_col.data
+            val = layer.xfp_outlier_val.data
+            N_per = int(layer._xfp_N)
+            K_per = int(layer._xfp_K)
+
+            if tp_world > 1 and row.numel() > 0:
+                # Column-parallel detection: row indices reach into the
+                # full-N range above N_per_rank.
+                if int(row.max().item()) >= N_per:
+                    lo = tp_rank * N_per
+                    hi = (tp_rank + 1) * N_per
+                    mask = (row >= lo) & (row < hi)
+                    layer.xfp_outlier_row.data = (row[mask] - lo).contiguous()
+                    layer.xfp_outlier_col.data = col[mask].contiguous()
+                    layer.xfp_outlier_val.data = val[mask].contiguous()
+                # Row-parallel detection: col indices reach into the
+                # full-K range above K_per_rank.
+                else:
+                    col_after = layer.xfp_outlier_col.data
+                    if col_after.numel() > 0 and \
+                            int(col_after.max().item()) >= K_per:
+                        lo = tp_rank * K_per
+                        hi = (tp_rank + 1) * K_per
+                        mask = (col_after >= lo) & (col_after < hi)
+                        layer.xfp_outlier_row.data = \
+                            layer.xfp_outlier_row.data[mask].contiguous()
+                        layer.xfp_outlier_col.data = \
+                            (col_after[mask] - lo).contiguous()
+                        layer.xfp_outlier_val.data = \
+                            layer.xfp_outlier_val.data[mask].contiguous()
+
+            if layer.xfp_outlier_row.data.numel() == 0:
+                layer._xfp_has_outliers = False
+            layer._xfp_outliers_tpfixed = True
+
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
