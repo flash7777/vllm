@@ -280,7 +280,7 @@ EXTRA_PASSTHROUGH_ENV=()
 for _v in VLLM_SKIP_GDN_WARMUP XFP_MIN_COS XFP_AUTO_BITS \
           MULTIQUANT_QUANT_ONLY VLLM_LOG_MODEL_INSPECTION \
           CUDA_LAUNCH_BLOCKING TORCH_USE_CUDA_DSA \
-          VLLM_CUSTOM_OPS; do
+          VLLM_CUSTOM_OPS XFP_MOE_DEBUG; do
     if [[ -n "${!_v:-}" ]]; then
         EXTRA_PASSTHROUGH_ENV+=("-e" "${_v}=${!_v}")
     fi

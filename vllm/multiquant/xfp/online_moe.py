@@ -70,6 +70,20 @@ def _xfp_moe_forward_impl(
     sorted_expert_ids = flat_topk[sort_indices].to(torch.int32)
     num_valid = sorted_token_ids.shape[0]
 
+    # H1 diagnostic: surface global-vs-local expert mismatch before kernel launch
+    import os as _dbg_os
+    if _dbg_os.environ.get("XFP_MOE_DEBUG", "0") == "1":
+        import torch.distributed as _dist
+        _r = _dist.get_rank() if _dist.is_initialized() else 0
+        _emax = int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1
+        print(
+            f"[xfp_moe rank={_r}] B={B} topk={topk} BT={BT} "
+            f"K13={K13} N13={N13} K2={K2} N2={N2} "
+            f"E_global_max={_emax} E_local_w13={w13_packed.shape[0]} "
+            f"E_local_w2={w2_packed.shape[0]} num_valid={num_valid}",
+            flush=True,
+        )
+
     # Gate+Up
     gate_up = torch.zeros(BT, N13, dtype=torch.bfloat16, device=x.device)
     moe_kernel.xfp_moe_gemm(
