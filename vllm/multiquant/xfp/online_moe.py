@@ -197,6 +197,12 @@ class XFPMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "_xfp_moe_packed", False):
             return
 
+        # ─── XFP-V2 MoE branch — env-gated, shared library across experts ──
+        # Mirrors online_linear's _process_v2 path.
+        import os as _v2_os
+        if _v2_os.environ.get("XFP_V2", "0") == "1":
+            return self._process_moe_v2(layer)
+
         from vllm.multiquant.xfp.xfp_pack import xfp_pack, xfp_repack
         from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
         from vllm.multiquant.xfp.xfp_moe_kernel import _load_xfp_moe_gemm
@@ -421,6 +427,159 @@ class XFPMoEMethod(FusedMoEMethodBase):
             fpe13, fpe2, moe_lloyd_iters,
         )
 
+    def _process_moe_v2(self, layer: nn.Module) -> None:
+        """V2 MoE pack with shared library across experts per stack.
+
+        Reuses xfp_moe_pack_v2 (which itself reuses _lloyd_per_channel +
+        _pack_indices). Saves via xfp_cache.save_moe_v2.
+
+        Apply path uses a Python reference: dequant per stack to BF16
+        once, then call vllm's fused_experts. This is correct but
+        slow — Phase 3 replaces with the v17_lib MoE kernel.
+        """
+        import os as _os
+        from vllm.multiquant.xfp.xfp_pack import xfp_moe_pack_v2
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+        from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
+
+        cache = MultiQuantWeightCache.get_active()
+        layer_prefix = (getattr(layer, "layer_name", None)
+                        or getattr(layer, "prefix", None) or "")
+        device = layer.w13_weight.device
+
+        # Cache check first
+        if cache is not None and layer_prefix and xfp_cache.load_moe_v2(
+                cache, layer_prefix, layer, device):
+            logger.info(
+                "XFP-V2 MoE %s ← cache (skip Lloyd) bits=%d E=%d "
+                "K13=%d N13=%d K2=%d N2=%d g=%d L=%d",
+                layer_prefix, layer._xfp_moe_bits, layer._xfp_moe_E,
+                layer._xfp_moe_K13, layer._xfp_moe_N13,
+                layer._xfp_moe_K2, layer._xfp_moe_N2,
+                layer._xfp_moe_group_size, layer._xfp_moe_library_size,
+            )
+            for attr in ("w13_weight", "w2_weight"):
+                p = layer._parameters.get(attr)
+                if p is not None:
+                    p.data = torch.empty(0, device=p.data.device, dtype=p.data.dtype)
+            try:
+                del layer.w13_weight, layer.w2_weight
+            except AttributeError:
+                pass
+            return
+
+        bits = self.bits if self.bits != 0 else 4
+        group_size = int(_os.environ.get("XFP_GROUP_SIZE", "128"))
+        library_size = int(_os.environ.get("XFP_LIBRARY_SIZE", "32"))
+
+        w13 = layer.w13_weight.data  # [E, N_gate_up, K]
+        w2 = layer.w2_weight.data    # [E, N_down, K_down]
+
+        K13 = int(w13.shape[2])
+        N13 = int(w13.shape[1])
+        K2 = int(w2.shape[2])
+        N2 = int(w2.shape[1])
+        E = int(w13.shape[0])
+
+        # Pack w13
+        p13, lib13, lid13, sc13, mid13, st13 = xfp_moe_pack_v2(
+            w13.float(), bits=bits, group_size=group_size,
+            library_size=library_size,
+        )
+        layer.w13_weight.data = torch.empty(0)  # free BF16 immediately
+
+        # Pack w2
+        p2, lib2, lid2, sc2, mid2, st2 = xfp_moe_pack_v2(
+            w2.float(), bits=bits, group_size=group_size,
+            library_size=library_size,
+        )
+        layer.w2_weight.data = torch.empty(0)
+
+        layer.w13_xfp_packed = nn.Parameter(p13.contiguous(), requires_grad=False)
+        layer.w13_xfp_library = nn.Parameter(lib13.contiguous(), requires_grad=False)
+        layer.w13_xfp_group_lib_id = nn.Parameter(lid13.contiguous(), requires_grad=False)
+        layer.w13_xfp_group_scale = nn.Parameter(sc13.contiguous(), requires_grad=False)
+        layer.w13_xfp_group_mid = nn.Parameter(mid13.contiguous(), requires_grad=False)
+        layer.w2_xfp_packed = nn.Parameter(p2.contiguous(), requires_grad=False)
+        layer.w2_xfp_library = nn.Parameter(lib2.contiguous(), requires_grad=False)
+        layer.w2_xfp_group_lib_id = nn.Parameter(lid2.contiguous(), requires_grad=False)
+        layer.w2_xfp_group_scale = nn.Parameter(sc2.contiguous(), requires_grad=False)
+        layer.w2_xfp_group_mid = nn.Parameter(mid2.contiguous(), requires_grad=False)
+
+        layer._xfp_moe_bits = bits
+        layer._xfp_moe_K13 = K13
+        layer._xfp_moe_N13 = N13
+        layer._xfp_moe_K2 = K2
+        layer._xfp_moe_N2 = N2
+        layer._xfp_moe_E = E
+        # fpe stored for kernel compatibility (unused by V2 reference path)
+        layer._xfp_moe_fpe13 = int(p13[0].numel())
+        layer._xfp_moe_fpe2 = int(p2[0].numel())
+        layer._xfp_moe_group_size = group_size
+        layer._xfp_moe_library_size = library_size
+        layer._xfp_moe_packed = True
+        layer._xfp_v2 = True
+
+        logger.info(
+            "XFP-V2 MoE %s: %d experts %s + %s -> xfp%d (g=%d L=%d) | "
+            "w13 cos=%.4f, w2 cos=%.4f, lib_p5(w13)=%.4f lib_p5(w2)=%.4f",
+            layer_prefix, E, list(w13.shape[1:]), list(w2.shape[1:]),
+            bits, group_size, library_size,
+            st13.cos_sim, st2.cos_sim,
+            st13.library_p5_cos, st2.library_p5_cos,
+        )
+
+        if cache is not None and layer_prefix:
+            xfp_cache.save_moe_v2(cache, layer_prefix, layer)
+
+        try:
+            del layer.w13_weight, layer.w2_weight
+        except AttributeError:
+            pass
+
+    def _moe_v2_dequant_to_bf16(self, layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        """V2 reference: per-stack dequant ALL experts to BF16 [E,N,K].
+
+        Slow but correct. Phase 3 replaces with v17_lib kernel that
+        operates on packed indices directly.
+        """
+        from vllm.multiquant.xfp.xfp_pack import dequant_xfp_v2_packed
+
+        bits = int(layer._xfp_moe_bits)
+        group_size = int(layer._xfp_moe_group_size)
+        E = int(layer._xfp_moe_E)
+        K13 = int(layer._xfp_moe_K13)
+        K2 = int(layer._xfp_moe_K2)
+        N13 = int(layer._xfp_moe_N13)
+        N2 = int(layer._xfp_moe_N2)
+
+        w13_dense = torch.empty(
+            E, N13, K13, dtype=torch.bfloat16,
+            device=layer.w13_xfp_packed.device,
+        )
+        w2_dense = torch.empty(
+            E, N2, K2, dtype=torch.bfloat16,
+            device=layer.w2_xfp_packed.device,
+        )
+        for e in range(E):
+            w13_dense[e] = dequant_xfp_v2_packed(
+                layer.w13_xfp_packed.data[e],
+                layer.w13_xfp_library.data,
+                layer.w13_xfp_group_lib_id.data[e],
+                layer.w13_xfp_group_scale.data[e],
+                layer.w13_xfp_group_mid.data[e],
+                K=K13, bits=bits, group_size=group_size,
+            ).to(torch.bfloat16)
+            w2_dense[e] = dequant_xfp_v2_packed(
+                layer.w2_xfp_packed.data[e],
+                layer.w2_xfp_library.data,
+                layer.w2_xfp_group_lib_id.data[e],
+                layer.w2_xfp_group_scale.data[e],
+                layer.w2_xfp_group_mid.data[e],
+                K=K2, bits=bits, group_size=group_size,
+            ).to(torch.bfloat16)
+        return w13_dense, w2_dense
+
     def apply(
         self,
         layer: FusedMoE,
@@ -433,6 +592,19 @@ class XFPMoEMethod(FusedMoEMethodBase):
             from vllm.model_executor.layers.fused_moe import fused_experts
             return fused_experts(
                 x, layer.w13_weight, layer.w2_weight,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+            )
+
+        # XFP-V2 reference apply: dequant once (cached), then fused_experts.
+        # Slow first call, fast subsequent. Phase 3 ships the kernel.
+        if getattr(layer, "_xfp_v2", False):
+            from vllm.model_executor.layers.fused_moe import fused_experts
+            if not hasattr(layer, "_xfp_v2_w13_dense"):
+                w13_d, w2_d = self._moe_v2_dequant_to_bf16(layer)
+                layer._xfp_v2_w13_dense = w13_d
+                layer._xfp_v2_w2_dense = w2_d
+            return fused_experts(
+                x, layer._xfp_v2_w13_dense, layer._xfp_v2_w2_dense,
                 topk_weights=topk_weights, topk_ids=topk_ids,
             )
 

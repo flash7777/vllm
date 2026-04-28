@@ -957,6 +957,134 @@ def dequant_xfp_v2_packed(
                           idx, group_size)
 
 
+def xfp_moe_pack_v2(
+    W_stack: torch.Tensor,         # [E, N, K] bf16/fp32 — one stack (w13 or w2)
+    bits: int = 4,
+    group_size: int = 128,
+    library_size: int = 32,
+    lloyd_iters: int = 5,          # MoE default (per-expert is fast)
+    library_iters: int = 30,
+) -> tuple[
+    torch.Tensor,  # packed [E, K_packed, N] int32
+    torch.Tensor,  # library [L, n_centroids] fp16    (shared across experts)
+    torch.Tensor,  # group_lib_id [E, N, G] int32
+    torch.Tensor,  # group_scale  [E, N, G] fp16
+    torch.Tensor,  # group_mid    [E, N, G] fp16
+    XFPPackV2Stats,
+]:
+    """V2 MoE pack with shared library across experts in one stack.
+
+    Per-expert per-group Lloyd codebooks are first fitted independently,
+    then ALL such codebooks (across all E experts) are clustered into a
+    single shared library. Each (expert, row, group) triple references
+    that shared library via a small lib_id.
+
+    Memory rationale: with E=128 experts, N=1024, K=2048, group_size=128,
+    we have 128·1024·16 = 2M per-group codebooks before sharing. The
+    library compresses these to L≈32 prototypes (same insight as the
+    Linear case — gaussian distributions cluster heavily).
+    """
+    if W_stack.dim() != 3:
+        raise ValueError(f"xfp_moe_pack_v2: W must be 3D [E,N,K], got {W_stack.shape}")
+    Wf = W_stack.float()
+    E, N, K = Wf.shape
+    if K % group_size != 0:
+        raise ValueError(
+            f"xfp_moe_pack_v2: K={K} not divisible by group_size={group_size}"
+        )
+    G = K // group_size
+    n_centroids = 1 << bits
+
+    # Step 1 — fit per-expert per-group codebooks (REUSE _lloyd_per_channel)
+    all_cb_norm: list[torch.Tensor] = []
+    all_scale: list[torch.Tensor] = []
+    all_mid: list[torch.Tensor] = []
+    for e in range(E):
+        W_e = Wf[e].reshape(N, G, group_size).reshape(N * G, group_size)
+        cb_e = _lloyd_per_channel(W_e, n_centroids, lloyd_iters)
+        cb_min = cb_e.amin(dim=1, keepdim=True)
+        cb_max = cb_e.amax(dim=1, keepdim=True)
+        mid_e = (cb_min + cb_max) / 2
+        scale_e = ((cb_max - cb_min) / 2).clamp(min=1e-12)
+        all_cb_norm.append((cb_e - mid_e) / scale_e)        # [N*G, n_cents]
+        all_scale.append(scale_e.squeeze(-1))                # [N*G]
+        all_mid.append(mid_e.squeeze(-1))                    # [N*G]
+
+    # Step 2 — build SHARED library across all experts in this stack
+    cb_norm_all = torch.cat(all_cb_norm, dim=0)  # [E*N*G, n_cents]
+    library = _build_codebook_library(cb_norm_all, library_size, iters=library_iters)
+    # [library_size, n_centroids] fp32 in [-1, +1]
+
+    # Step 3 — per-expert: assign + re-quantize + pack (REUSE _pack_indices)
+    packed_list: list[torch.Tensor] = []
+    lib_id_list: list[torch.Tensor] = []
+    scale_list: list[torch.Tensor] = []
+    mid_list: list[torch.Tensor] = []
+    library_p5_min = 1.0
+    library_min_min = 1.0
+    total_mse = 0.0
+    total_cos_num = 0.0
+    total_cos_den_a = 0.0
+    total_cos_den_b = 0.0
+    for e in range(E):
+        cb_norm_e = all_cb_norm[e]  # [N*G, n_cents]
+        scale_e = all_scale[e]      # [N*G]
+        mid_e = all_mid[e]          # [N*G]
+        # Library assignment
+        d2 = ((cb_norm_e.unsqueeze(1) - library.unsqueeze(0)) ** 2).sum(-1)
+        lib_id_e = d2.argmin(dim=1)  # [N*G]
+        # Diagnostics
+        nearest = library[lib_id_e]
+        cb_cos = F.cosine_similarity(cb_norm_e, nearest, dim=1)
+        cb_cos_sorted = cb_cos.sort().values
+        p5 = float(cb_cos_sorted[max(0, int(0.05 * cb_cos.numel()) - 1)].item())
+        library_p5_min = min(library_p5_min, p5)
+        library_min_min = min(library_min_min, float(cb_cos_sorted[0].item()))
+        # Re-quantize weights with chosen library codebook
+        W_groups_e = Wf[e].reshape(N, G, group_size).reshape(N * G, group_size)
+        W_norm_e = (W_groups_e - mid_e.unsqueeze(-1)) / scale_e.unsqueeze(-1)
+        chosen_lib = library[lib_id_e]  # [N*G, n_cents]
+        d_w = (W_norm_e.unsqueeze(-1) - chosen_lib.unsqueeze(1)).abs()
+        idx_e = d_w.argmin(dim=-1).to(torch.int32)  # [N*G, group_size]
+        idx_full_e = idx_e.reshape(N, G, group_size).reshape(N, K)
+        # Pack indices
+        packed_e = _pack_indices(idx_full_e, bits)
+        packed_list.append(packed_e)
+        lib_id_list.append(lib_id_e.reshape(N, G).to(torch.int32))
+        scale_list.append(scale_e.reshape(N, G).to(torch.float16))
+        mid_list.append(mid_e.reshape(N, G).to(torch.float16))
+        # MSE/cos for stats (running aggregates)
+        rec_norm = torch.gather(chosen_lib, 1, idx_e.long())
+        W_rec_e = (rec_norm * scale_e.unsqueeze(-1) + mid_e.unsqueeze(-1)).reshape(N, K)
+        diff = Wf[e] - W_rec_e
+        total_mse += float((diff * diff).sum().item())
+        total_cos_num += float((Wf[e] * W_rec_e).sum().item())
+        total_cos_den_a += float((Wf[e] * Wf[e]).sum().item())
+        total_cos_den_b += float((W_rec_e * W_rec_e).sum().item())
+
+    n_total = float(E * N * K)
+    mse = total_mse / n_total
+    cos_sim = total_cos_num / max(
+        (total_cos_den_a ** 0.5) * (total_cos_den_b ** 0.5), 1e-12
+    )
+    lib_id_bits = 4 if library_size <= 16 else 8 if library_size <= 256 else 32
+    overhead_bits = (2 * 16 + lib_id_bits) / group_size
+
+    packed = torch.stack(packed_list, dim=0)         # [E, K_packed, N]
+    group_lib_id = torch.stack(lib_id_list, dim=0)   # [E, N, G]
+    group_scale = torch.stack(scale_list, dim=0)     # [E, N, G]
+    group_mid = torch.stack(mid_list, dim=0)         # [E, N, G]
+
+    stats = XFPPackV2Stats(
+        bits=bits, group_size=group_size, library_size=library_size,
+        shape=(E * N, K), mse=mse, cos_sim=cos_sim,
+        library_p5_cos=library_p5_min,
+        library_min_cos=library_min_min,
+        overhead_bits_per_param=overhead_bits,
+    )
+    return packed, library.to(torch.float16), group_lib_id, group_scale, group_mid, stats
+
+
 def dequant_xfp_v2(
     library: torch.Tensor,         # [library_size, n_centroids] fp16/fp32
     group_lib_id: torch.Tensor,    # [N, G] int (uint8 / int32)
