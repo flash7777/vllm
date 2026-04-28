@@ -716,3 +716,231 @@ def xfp_pack(
         outlier_values,
         stats,
     )
+
+
+# ─── XFP-V2: per-group quant + shared codebook library ─────────────────
+#
+# V1 design: each output row gets its own learned 16-centroid codebook
+# fitted on the row's K weights.
+#
+# V2 design (this section): each output row is split into G groups of
+# `group_size` weights. Each group references one of `library_size`
+# shared prototype codebooks (16 centroids, normalized to [-1, +1]).
+# Per group we also store one fp16 scale + midpoint so the same
+# normalized library entry can serve groups with different magnitudes.
+#
+# Reuses (unchanged):
+#   - _lloyd_per_channel (operates on [N*G, group_size] reshape)
+#   - _pack_indices (existing 4-bit packing)
+#   - xfp_repack (warp-interleaved layout for kernel)
+#   - outlier extraction (orthogonal — wired in v2 same path as v1)
+#
+# New (this section):
+#   - _build_codebook_library (k-means over normalized group codebooks)
+#   - xfp_pack_v2 (top-level orchestration)
+#   - dequant_xfp_v2 (Python reference for the kernel)
+
+
+@dataclass
+class XFPPackV2Stats:
+    """Statistics for XFP-V2 pack: per-group + shared library."""
+
+    bits: int
+    group_size: int
+    library_size: int  # number of prototype codebooks in library
+    shape: tuple[int, int]
+    mse: float
+    cos_sim: float
+    # Library-coverage diagnostics: how good is the per-group nearest-lib match?
+    library_p5_cos: float = 0.0
+    library_min_cos: float = 0.0
+    # Group params overhead: bits/param added by per-group scale+mid
+    overhead_bits_per_param: float = 0.0
+
+
+def _build_codebook_library(
+    cb_norm: torch.Tensor,
+    library_size: int,
+    iters: int = 30,
+    seed: int = 0,
+) -> torch.Tensor:
+    """K-means over normalized group codebooks → [library_size, n_centroids].
+
+    Each codebook is treated as a 16-D point. We use k-means++-style init
+    (sample first centroid uniformly, subsequent ones biased toward the
+    farthest unassigned points) followed by Lloyd refinement.
+    """
+    M, D = cb_norm.shape
+    if library_size >= M:
+        # Library can hold every codebook — return them as-is (deduped not necessary).
+        return cb_norm.clone()
+
+    g = torch.Generator(device=cb_norm.device).manual_seed(seed)
+
+    # k-means++ init
+    idx0 = int(torch.randint(0, M, (1,), generator=g).item())
+    cents = cb_norm[idx0:idx0 + 1].clone()
+    while cents.shape[0] < library_size:
+        d2 = ((cb_norm.unsqueeze(1) - cents.unsqueeze(0)) ** 2).sum(-1).amin(dim=1)
+        prob = d2 / d2.sum().clamp(min=1e-12)
+        nxt = int(torch.multinomial(prob, 1, generator=g).item())
+        cents = torch.cat([cents, cb_norm[nxt:nxt + 1]], dim=0)
+
+    # Lloyd refinement
+    for _ in range(iters):
+        d2 = ((cb_norm.unsqueeze(1) - cents.unsqueeze(0)) ** 2).sum(-1)  # [M, k]
+        assign = d2.argmin(dim=1)
+        new_cents = cents.clone()
+        for c in range(library_size):
+            mask = assign == c
+            if mask.any():
+                new_cents[c] = cb_norm[mask].mean(dim=0)
+        cents = new_cents
+    return cents
+
+
+def xfp_pack_v2(
+    W: torch.Tensor,
+    bits: int = 4,
+    group_size: int = 128,
+    library_size: int = 32,
+    lloyd_iters: int = 20,
+    library_iters: int = 30,
+) -> tuple[
+    torch.Tensor,  # packed indices [K_packed, N] int32 (existing _pack_indices format)
+    torch.Tensor,  # library [library_size, n_centroids] fp16
+    torch.Tensor,  # group_lib_id [N, G] int32 (uint8 viable when library_size ≤ 256)
+    torch.Tensor,  # group_scale  [N, G] fp16
+    torch.Tensor,  # group_mid    [N, G] fp16
+    XFPPackV2Stats,
+]:
+    """V2 pack: per-group Lloyd + shared codebook library.
+
+    Reuses _lloyd_per_channel / _pack_indices unchanged. Adds library
+    construction and per-group reference assignment.
+
+    Currently outlier extraction is left out — it can be wired in later
+    on the residual after library reconstruction (orthogonal to library
+    learning). Keeping V1 + outliers as the existing baseline.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"xfp_pack_v2: W must be 2D, got {W.dim()}D")
+    if bits not in (2, 3, 4):
+        raise ValueError(f"xfp_pack_v2: bits must be in (2,3,4), got {bits}")
+    Wf = W.float()
+    N, K = Wf.shape
+    if K % group_size != 0:
+        raise ValueError(
+            f"xfp_pack_v2: K={K} not divisible by group_size={group_size}"
+        )
+    G = K // group_size
+    n_centroids = 1 << bits
+
+    # Step 1 — reshape rows into groups: each group is one "virtual row"
+    # for Lloyd. [N, K] → [N*G, group_size]
+    W_groups = Wf.reshape(N, G, group_size).reshape(N * G, group_size)
+
+    # Step 2 — fit per-group codebooks (REUSE existing _lloyd_per_channel)
+    cb_per_group = _lloyd_per_channel(W_groups, n_centroids, lloyd_iters)
+    # cb_per_group: [N*G, n_centroids] fp32
+
+    # Step 3 — normalize each group codebook to [-1, +1]; record scale+mid
+    cb_min = cb_per_group.amin(dim=1, keepdim=True)
+    cb_max = cb_per_group.amax(dim=1, keepdim=True)
+    midpoint = (cb_min + cb_max) / 2  # [N*G, 1]
+    scale = ((cb_max - cb_min) / 2).clamp(min=1e-12)  # [N*G, 1]
+    cb_norm = (cb_per_group - midpoint) / scale  # [N*G, n_centroids] in [-1, +1]
+
+    # Step 4 — build shared library via k-means over the normalized codebooks
+    library = _build_codebook_library(cb_norm, library_size, iters=library_iters)
+    # [library_size, n_centroids] fp32, in [-1, +1]
+
+    # Step 5 — assign each group's normalized codebook to the nearest library entry
+    d2 = ((cb_norm.unsqueeze(1) - library.unsqueeze(0)) ** 2).sum(-1)  # [N*G, library_size]
+    group_lib_id = d2.argmin(dim=1)  # [N*G]
+
+    # Library-coverage diagnostics
+    nearest = library[group_lib_id]
+    cb_cos = F.cosine_similarity(cb_norm, nearest, dim=1)
+    cb_cos_sorted = cb_cos.sort().values
+    p5 = float(cb_cos_sorted[max(0, int(0.05 * cb_cos.numel()) - 1)].item())
+    cb_min_cos = float(cb_cos_sorted[0].item())
+
+    # Step 6 — re-assign weight indices given the chosen library codebook
+    # For each weight w in group g: idx = argmin_k |w_norm - library[lib_id, k]|
+    W_norm_groups = (W_groups - midpoint) / scale  # [N*G, group_size]
+    chosen_lib = library[group_lib_id]  # [N*G, n_centroids]
+    d_w = (W_norm_groups.unsqueeze(-1) - chosen_lib.unsqueeze(1)).abs()
+    idx_per_group = d_w.argmin(dim=-1).to(torch.int32)  # [N*G, group_size]
+    # Reassemble back to [N, K]
+    idx_full = idx_per_group.reshape(N, G, group_size).reshape(N, K)
+
+    # Step 7 — pack indices via existing _pack_indices (UNCHANGED layout)
+    packed = _pack_indices(idx_full, bits)
+
+    # Reconstruction for stats
+    rec_norm = torch.gather(chosen_lib, 1, idx_per_group.long())  # [N*G, group_size]
+    W_rec_groups = rec_norm * scale + midpoint  # [N*G, group_size]
+    W_rec = W_rec_groups.reshape(N, K)
+    diff = Wf - W_rec
+    mse = float((diff * diff).mean().item())
+    cos_sim = float(F.cosine_similarity(
+        Wf.reshape(-1).unsqueeze(0),
+        W_rec.reshape(-1).unsqueeze(0),
+        dim=1,
+    ).item())
+
+    # Reshape group params to [N, G]
+    group_lib_id_2d = group_lib_id.reshape(N, G).to(torch.int32)
+    group_scale_2d = scale.reshape(N, G).to(torch.float16)
+    group_mid_2d = midpoint.reshape(N, G).to(torch.float16)
+
+    # Bits/param overhead from group params (scale+mid in fp16, lib_id 4-8 bit).
+    # Per group: 2*16 = 32 bits for scale+mid + 8 bits lib_id (uint8 fits ≤256)
+    lib_id_bits = 4 if library_size <= 16 else 8 if library_size <= 256 else 32
+    overhead_bits = (2 * 16 + lib_id_bits) / group_size
+
+    stats = XFPPackV2Stats(
+        bits=bits,
+        group_size=group_size,
+        library_size=library_size,
+        shape=(N, K),
+        mse=mse,
+        cos_sim=cos_sim,
+        library_p5_cos=p5,
+        library_min_cos=cb_min_cos,
+        overhead_bits_per_param=overhead_bits,
+    )
+
+    return packed, library.to(torch.float16), group_lib_id_2d, group_scale_2d, group_mid_2d, stats
+
+
+def dequant_xfp_v2(
+    library: torch.Tensor,         # [library_size, n_centroids] fp16/fp32
+    group_lib_id: torch.Tensor,    # [N, G] int (uint8 / int32)
+    group_scale: torch.Tensor,     # [N, G] fp16/fp32
+    group_mid: torch.Tensor,       # [N, G] fp16/fp32
+    idx: torch.Tensor,             # [N, K] int — UNPACKED indices in [0, n_centroids)
+    group_size: int,
+) -> torch.Tensor:
+    """Python reference reconstruction. Returns W_rec [N, K] fp32.
+
+    Mirrors what the v17_lib kernel must compute:
+      W[n, k] = group_scale[n, g] * library[group_lib_id[n, g], idx[n, k]]
+               + group_mid[n, g]
+    where g = k // group_size.
+
+    Note: this takes UNPACKED idx for clarity. The kernel will work
+    directly on packed uint32 indices via the same unpack pattern as v12.
+    """
+    N, K = idx.shape
+    if K % group_size != 0:
+        raise ValueError(f"K={K} not divisible by group_size={group_size}")
+    G = K // group_size
+    idx_g = idx.reshape(N, G, group_size).long()
+    # library [L, n_cents], group_lib_id [N, G] → gather → [N, G, n_cents]
+    lib_per_group = library.float()[group_lib_id.long()]
+    # gather centroids per weight: [N, G, group_size]
+    cb_norm = torch.gather(lib_per_group, 2, idx_g)
+    W_rec = cb_norm * group_scale.float().unsqueeze(-1) + group_mid.float().unsqueeze(-1)
+    return W_rec.reshape(N, K)
