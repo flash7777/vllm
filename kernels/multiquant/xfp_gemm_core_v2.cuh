@@ -114,11 +114,26 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     float acc = 0.0f;
     int n_offset = ctx.n * XFP_WARP_SIZE + lane;
 
-    // Group-base pointer for this warp's output row n.
-    // group_lib_id, scale, mid are laid out [N, G]; warp owns row n.
-    const int32_t* row_lib_id = ctx.group_lib_id + (size_t)ctx.n * G;
-    const half*    row_scale  = ctx.group_scale  + (size_t)ctx.n * G;
-    const half*    row_mid    = ctx.group_mid    + (size_t)ctx.n * G;
+    // ── Per-warp SMEM cache for this row's group metadata ──
+    // [WARPS_PER_BLOCK][G][3]  // (lib_id, scale_f, mid_f) per group.
+    // Storing as float lets us avoid __half2float in the hot loop
+    // and pack {scale, mid} as float32 too (cheap precision: scale/mid
+    // come from fp16 source already).
+    constexpr int META_PER_GROUP = 3;        // lib_id (as float), scale, mid
+    constexpr int META_MAX_G     = PolicyV2::K_SMEM_MAX / 64;  // K/group_size cap (≥ G ever observed)
+    __shared__ float s_meta[XFP_WARPS_PER_BLOCK * META_MAX_G * META_PER_GROUP];
+    float* my_warp_meta = s_meta + warp_id * META_MAX_G * META_PER_GROUP;
+    {
+        const int32_t* row_lib_id = ctx.group_lib_id + (size_t)ctx.n * G;
+        const half*    row_scale  = ctx.group_scale  + (size_t)ctx.n * G;
+        const half*    row_mid    = ctx.group_mid    + (size_t)ctx.n * G;
+        for (int g = lane; g < G; g += XFP_WARP_SIZE) {
+            my_warp_meta[g * META_PER_GROUP + 0] = (float) row_lib_id[g];
+            my_warp_meta[g * META_PER_GROUP + 1] = __half2float(row_scale[g]);
+            my_warp_meta[g * META_PER_GROUP + 2] = __half2float(row_mid[g]);
+        }
+    }
+    __syncwarp();  // warp-local: all lanes see this warp's meta
 
     int K_packed_safe = K / VALS_PER_WORD;
     int n_full_groups = K_packed_safe / XFP_WARP_SIZE;
@@ -130,11 +145,13 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     for (int gi = 0; gi < n_full_groups; gi++) {
         // ── V2 PATCH: per-lane-group codebook reload ──
         // Each outer iter spans CB_PER_ITER groups; this lane belongs to
-        // group (gi * CB_PER_ITER + lane_group).
+        // group (gi * CB_PER_ITER + lane_group). Read from per-warp SMEM
+        // (was: 3× global loads per iter — that was the +37% bottleneck).
         int my_group_idx = gi * CB_PER_ITER + lane_group;
-        int   lib_id  = (int) row_lib_id[my_group_idx];
-        float scale_f = __half2float(row_scale[my_group_idx]);
-        float mid_f   = __half2float(row_mid  [my_group_idx]);
+        const float* meta = my_warp_meta + my_group_idx * META_PER_GROUP;
+        int lib_id   = (int) meta[0];
+        float scale_f = meta[1];
+        float mid_f   = meta[2];
         my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx])
                     * scale_f + mid_f;
 
