@@ -21,35 +21,49 @@
 
 **Strategie:** v17_lib ist **kein Rewrite** — es ist `v12 + 30-50 LOC Patch im inner dequant loop`, und ein **neuer Policy-Slot** für die V2-Per-Group-Metadata. Das Kernel-File (xfp_gemm_v17_lib.cu) ruft den selben `xfp_gemm_core<BITS, LinearPolicyV2>` Template; die Policy macht den Unterschied.
 
-## Warp-Layout vs Group-Boundary — der Knackpunkt
+## Warp-Layout vs Group-Boundary — Re-design ohne Quality-Verlust
 
-In v12 verteilt eine Warp ihre 32 Lanes über `XFP_WARP_SIZE` packed words pro outer iter. Pro packed word werden `VALS_PER_WORD` weights dekodiert. Also:
+**Initial Annahme (verworfen):** group_size muss Vielfaches der Warp-K-stride (256 für bits=4) sein.
 
-| BITS | VALS/WORD | Warp covered K per outer iter |
-|---|---|---|
-| 2 | 16 | 32 × 16 = **512** |
-| 3 | 10 | 32 × 10 = **320** |
-| **4** | **8** | **32 × 8 = 256** |
+**Korrekte Constraint:** `lanes_per_group ≥ LUT_SIZE`. Jede Lane hält EINE Codebook-Entry; mehrere Codebooks pro outer iter sind möglich, solange jeder eine vollständige Lane-Subgroup zugewiesen wird.
 
-In v12 ist die Codebook konstant über alle K der Row → kein Conflict. In V2 wechselt die effektive Codebook **jeder `group_size` Weights**. Damit ein outer iter SAUBER innerhalb einer einzigen Group bleibt, muss:
+In v12 hält Lane `l` den Wert `cb[l]` (für `l < LUT_SIZE`), und `__shfl_sync(my_cb_val, idx)` broadcastet Lane `idx`'s Wert an alle Lanes. Für V2 wenn 2 Codebooks pro Warp-Iter aktiv sind:
 
+- Lanes 0-15 sind in Group A, halten `library[lib_id_A][lane]` × scale_A + mid_A
+- Lanes 16-31 sind in Group B, halten `library[lib_id_B][lane-16]` × scale_B + mid_B
+- Lane in Group A dekodiert via `__shfl_sync(my_cb_val, 0 + idx)` → liest Lanes 0-15 → Codebook A ✓
+- Lane in Group B dekodiert via `__shfl_sync(my_cb_val, 16 + idx)` → liest Lanes 16-31 → Codebook B ✓
+
+**Same SHFL instruction, nur per-lane verschiedene src-lane**. Funktioniert.
+
+Generalisierte Constraint:
+
+| BITS | LUT_SIZE | max Codebooks/iter | **min group_size** | Aligned mit Phase-1 sweet spot? |
+|---|---|---|---|---|
+| 2 | 4  | 32 / 4  = 8 | 512 / 8 = **64** | (nicht im Sweep) |
+| 3 | 8  | 32 / 8  = 4 | 320 / 4 = **80** | (awkward) |
+| **4** | **16** | **32 / 16 = 2** | **256 / 2 = 128** | **✓ Sweet spot 0.99464 cos!** |
+
+**v17_lib v1 wählt group_size=128 als default** (für bits=4). Damit verliert XFP-V2 **kein Quality** gegenüber Phase-1's optimaler Konfiguration. v17_lib v2 (Phase 3.2 später) könnte g=64 ergänzen via per-Lane-Library-Lookup mit 16 Registern/Lane (höhere Komplexität).
+
+Der hot-loop hat dann pro Iter **2 Codebook-Reloads** (eine pro Lane-Subgroup):
+- Lane-Subgroup-Index: `lane_group = lane / LUT_SIZE` (0 oder 1)
+- `cb_lane_offset = lane_group * LUT_SIZE` (0 oder 16)
+- Per Lane: `lib_id`, `scale`, `mid` für IHRE Group direkt aus Global Memory (lane-coalesced)
+
+Konkret pro outer iter (bits=4, g=128):
 ```
-group_size  ≡  0  (mod warp_K_stride)
+int my_cb_idx = lane % LUT_SIZE;        // 0..15
+int lane_group = lane / LUT_SIZE;        // 0 oder 1
+int cb_lane_offset = lane_group * LUT_SIZE;  // 0 oder 16
+int my_group_idx = gi * 2 + lane_group;
+int lib_id = (int) ctx.group_lib_id[ctx.n * G + my_group_idx];
+float scale_f = __half2float(ctx.group_scale[ctx.n * G + my_group_idx]);
+float mid_f   = __half2float(ctx.group_mid  [ctx.n * G + my_group_idx]);
+my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx]) * scale_f + mid_f;
 ```
 
-Für bits=4 also: **group_size ∈ {256, 512, 1024, 2048, ...}**.
-
-Aus den Phase-1 Daten:
-| g | cos | bits/param |
-|---|---|---|
-| 64  | 0.99606 | 4.62 |
-| 128 | 0.99464 | 4.31 |
-| **256** | **0.99332** | **4.16** ← v17_lib v1 target |
-| 512 | (nicht gemessen, vermutlich schlechter)| 4.07 |
-
-**v17_lib v1 wählt group_size=256 als default**: aligned mit warp K-stride für bits=4, beste Kombi aus quality + bit-budget bei Phase-3-Komplexität-Minimum. Verliert ~0.13pp gegen g=128, gewinnt aber Kernel-Einfachheit.
-
-**v17_lib v2 (Phase 3.2 später):** g=128 oder g=64 via per-Lane-Library-Lookup (16 Register/Lane statt SHFL). Höhere Quality, höhere Komplexität. Zurückgestellt.
+Metadata reads sind über die 32 Lanes naturally coalesced (32 × 1 B lib_id + 32 × 2 B scale + 32 × 2 B mid = 160 B per outer iter), keine SHFL-Broadcasts nötig.
 
 ## Hot-Path-Diff (kommentiert)
 
@@ -80,56 +94,56 @@ __syncthreads();
 float my_cb_val = 0.0f;
 ```
 
-Dann im outer loop:
+Dann im outer loop (bits=4, g=128 → 2 Codebooks pro outer iter, je 16 Lanes):
 
 ```cuda
-for (int gi = 0; gi < n_full_groups; gi++) {
-    // ─── V2 PATCH: per-group codebook reload ──
-    // For g=256, every outer iter is exactly one group.
-    int group_idx = gi;  // (gi * XFP_WARP_SIZE * VALS_PER_WORD) / GROUP_SIZE
-    // Lane 0 reads metadata; broadcast scalars via SHFL.
-    int lib_id;
-    half scale_h, mid_h;
-    if (lane == 0) {
-        lib_id  = (int)ctx.group_lib_id[ctx.n * G + group_idx];
-        scale_h = ctx.group_scale[ctx.n * G + group_idx];
-        mid_h   = ctx.group_mid[ctx.n * G + group_idx];
-    }
-    lib_id = __shfl_sync(0xffffffff, lib_id, 0);
-    float scale_f = __half2float(__shfl_sync(0xffffffff, scale_h, 0));
-    float mid_f   = __half2float(__shfl_sync(0xffffffff, mid_h, 0));
-    // Each lane reloads ITS centroid from library + applies (scale, mid).
-    my_cb_val = (lane < LUT_SIZE)
-        ? __half2float(s_library[lib_id * LUT_SIZE + lane]) * scale_f + mid_f
-        : 0.0f;
+// Outside the loop (constants):
+constexpr int CB_PER_ITER = 2;                       // for g=128, bits=4
+const int my_cb_idx       = lane % LUT_SIZE;          // 0..15
+const int lane_group      = lane / LUT_SIZE;          // 0 or 1
+const int cb_lane_offset  = lane_group * LUT_SIZE;    // 0 or 16
 
-    // ─── EXISTING HOT LOOP UNCHANGED ──
+for (int gi = 0; gi < n_full_groups; gi++) {
+    // ─── V2 PATCH: per-lane-group codebook reload ──
+    // Each outer iter covers CB_PER_ITER groups; this lane belongs to
+    // group (gi*CB_PER_ITER + lane_group).
+    int my_group_idx = gi * CB_PER_ITER + lane_group;
+    // Each lane reads ITS group's metadata directly (coalesced 32-byte
+    // chunks across the warp — natural cache-line alignment).
+    int   lib_id  = (int)   ctx.group_lib_id[ctx.n * G + my_group_idx];
+    float scale_f = __half2float(ctx.group_scale[ctx.n * G + my_group_idx]);
+    float mid_f   = __half2float(ctx.group_mid  [ctx.n * G + my_group_idx]);
+    my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx])
+                * scale_f + mid_f;
+
+    // ─── EXISTING HOT LOOP, only SHFL src lane gets cb_lane_offset ──
     int kw = lane + gi * XFP_WARP_SIZE;
     uint32_t packed = ctx.B_packed[gi * N * XFP_WARP_SIZE + n_offset];
     int k_base = kw * VALS_PER_WORD;
     #pragma unroll
     for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
-        __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(A_src + k_base + slot);
+        __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(
+            A_src + k_base + slot);
         float a0 = __bfloat162float(__low2bfloat16(a2));
         float a1 = __bfloat162float(__high2bfloat16(a2));
         int idx0 = (int)((packed >> (slot * BITS)) & MASK);
         int idx1 = (int)((packed >> ((slot + 1) * BITS)) & MASK);
-        float w0 = __shfl_sync(0xffffffff, my_cb_val, idx0);
-        float w1 = __shfl_sync(0xffffffff, my_cb_val, idx1);
+        // V2: SHFL src lane is cb_lane_offset + idx (16 or 0 + idx)
+        float w0 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx0);
+        float w1 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx1);
         acc = fmaf(w0, a0, acc);
         acc = fmaf(w1, a1, acc);
     }
 }
 ```
 
-**Hot-Loop-Cost-Delta:** vor jedem outer iter zusätzlich:
-- 3× SHFL broadcast (lib_id, scale, mid) — ~6 Cycles
-- 1× SMEM load für library entry — ~10 Cycles uncontended
-- 1× FMA (scale × cb + mid) — 1 Cycle
+**Hot-Loop-Cost-Delta** pro outer iter:
+- 3× per-lane Global-Loads (lib_id 1B, scale 2B, mid 2B) — coalesced, in L2-Cache, ~5-8 Cycles uncontended
+- 1× SMEM load library entry — ~5 Cycles
+- 1× FMA (`scale × cb + mid`) — 1 Cycle
+- SHFL pattern unverändert (gleicher Throughput, nur src-lane = base + idx)
 
-Pro outer iter: ~17 Zusatz-Cycles vs ursprünglich 0. Aber outer iter macht `VALS_PER_WORD * 2 = 16` Slots × 2 FMA = 32 FMA + 16 SHFL = ~48 Cycles. **Overhead: ~35% pro outer iter, aber SMEM-A-cache + B coalesced bleiben — der absolute Latenz-Anteil wird kleiner durch K_SMEM_MAX-Reuse.**
-
-Erwartung: **5-15% Throughput-Verlust gegen v12 V1.** Annehmbar als Tradeoff für Quality-Win.
+Pro outer iter: **~12 Zusatz-Cycles** vs ursprünglich 0. Outer iter macht `VALS_PER_WORD * 2 / 2 = 8` Slots × 2 FMA = 16 FMA + 16 SHFL = ~48 Cycles ohne V2. **Overhead: ~25% pro outer iter.** Da SMEM A-cache K_SMEM_MAX-Reuse den absoluten Wall-Clock dominiert, expect **5-12% Throughput-Verlust** gegen v12 V1 — knapper als die ursprüngliche 5-15% Schätzung weil keine Broadcasts nötig sind.
 
 ## SMEM-Budget v17_lib
 
@@ -144,7 +158,7 @@ Plus die globalen Loads für lib_id/scale/mid sind 3 × G × 1-4 B per row. Werd
 
 MoE (K_SMEM_MAX=4096) analog, library jetzt per Stack (eine pro w13 / w2 — wir haben ZWEI Libraries pro layer).
 
-## Files-Liste (Phase 3.1: g=256-aligned)
+## Files-Liste (Phase 3.1: g=128, bits=4, kein Quality-Verlust)
 
 Neue Files:
 - `kernels/multiquant/xfp_gemm_v17_lib.cu` (Copy von v12 + LinearPolicyV2)
