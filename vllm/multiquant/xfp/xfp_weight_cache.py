@@ -25,6 +25,10 @@ logger = init_logger(__name__)
 
 _XFP_LINEAR_METHOD = "xfp_linear"
 _XFP_MOE_METHOD = "xfp_moe"
+# V2: per-group + shared codebook library. Distinct method strings so the
+# generic cache (and pack_report.py) can tell V1/V2 shards apart.
+_XFP_LINEAR_METHOD_V2 = "xfp_linear_v2"
+_XFP_MOE_METHOD_V2 = "xfp_moe_v2"
 
 
 def save_linear(
@@ -92,6 +96,100 @@ def load_linear(
     except KeyError as e:
         logger.warning(
             "XFP cache: %s is incomplete (%s) — treating as miss",
+            layer_prefix, e,
+        )
+        return False
+
+
+# ─── XFP-V2 Linear: per-group + shared codebook library ───────────────
+
+def save_linear_v2(
+    cache: MultiQuantWeightCache, layer_prefix: str, layer: nn.Module,
+) -> bool:
+    """Save XFP-V2 packed linear: packed indices + library + group params.
+
+    Tensors written:
+      - xfp_packed       [K_packed, N] int32   (same layout as V1)
+      - xfp_library      [L, n_centroids] fp16 (shared prototype codebooks)
+      - xfp_group_lib_id [N, G] uint8/int32    (per-group library index)
+      - xfp_group_scale  [N, G] fp16            (per-group magnitude)
+      - xfp_group_mid    [N, G] fp16            (per-group midpoint)
+
+    Outliers re-use the V1 fields (`xfp_outlier_*`) when present.
+    """
+    tensors: dict[str, torch.Tensor] = {
+        "xfp_packed":       layer.xfp_packed.data,
+        "xfp_library":      layer.xfp_library.data,
+        "xfp_group_lib_id": layer.xfp_group_lib_id.data,
+        "xfp_group_scale":  layer.xfp_group_scale.data,
+        "xfp_group_mid":    layer.xfp_group_mid.data,
+    }
+    has_outliers = bool(getattr(layer, "_xfp_has_outliers", False))
+    if has_outliers:
+        tensors["xfp_outlier_row"] = layer.xfp_outlier_row.data
+        tensors["xfp_outlier_col"] = layer.xfp_outlier_col.data
+        tensors["xfp_outlier_val"] = layer.xfp_outlier_val.data
+    metadata: dict = {
+        "bits":         int(layer._xfp_bits),
+        "K":            int(layer._xfp_K),
+        "N":            int(layer._xfp_N),
+        "group_size":   int(layer._xfp_group_size),
+        "library_size": int(layer._xfp_library_size),
+        "has_outliers": 1 if has_outliers else 0,
+    }
+    stats = getattr(layer, "_xfp_stats", None)
+    if stats is not None and hasattr(stats, "to_dict"):
+        try:
+            metadata["stats"] = stats.to_dict()
+        except Exception as e:
+            logger.warning(
+                "XFP-V2 cache: stats.to_dict failed for %s (%s) — saving without",
+                layer_prefix, e,
+            )
+    return cache.save(layer_prefix, _XFP_LINEAR_METHOD_V2, tensors, metadata)
+
+
+def load_linear_v2(
+    cache: MultiQuantWeightCache, layer_prefix: str,
+    layer: nn.Module, device: torch.device,
+) -> bool:
+    """Load XFP-V2 packed linear shard. Mirrors save_linear_v2."""
+    res = cache.load(layer_prefix, _XFP_LINEAR_METHOD_V2, device)
+    if res is None:
+        return False
+    tensors, meta, _ = res
+    try:
+        layer.xfp_packed = nn.Parameter(
+            tensors["xfp_packed"], requires_grad=False)
+        layer.xfp_library = nn.Parameter(
+            tensors["xfp_library"], requires_grad=False)
+        layer.xfp_group_lib_id = nn.Parameter(
+            tensors["xfp_group_lib_id"], requires_grad=False)
+        layer.xfp_group_scale = nn.Parameter(
+            tensors["xfp_group_scale"], requires_grad=False)
+        layer.xfp_group_mid = nn.Parameter(
+            tensors["xfp_group_mid"], requires_grad=False)
+        has_outliers = meta.get("has_outliers", "0") == "1"
+        if has_outliers:
+            layer.xfp_outlier_row = nn.Parameter(
+                tensors["xfp_outlier_row"], requires_grad=False)
+            layer.xfp_outlier_col = nn.Parameter(
+                tensors["xfp_outlier_col"], requires_grad=False)
+            layer.xfp_outlier_val = nn.Parameter(
+                tensors["xfp_outlier_val"], requires_grad=False)
+        layer._xfp_has_outliers = has_outliers
+        layer._xfp_bits = int(meta["bits"])
+        layer._xfp_K = int(meta["K"])
+        layer._xfp_N = int(meta["N"])
+        layer._xfp_group_size = int(meta["group_size"])
+        layer._xfp_library_size = int(meta["library_size"])
+        layer._xfp_stats = None
+        layer._xfp_packed_done = True
+        layer._xfp_v2 = True
+        return True
+    except KeyError as e:
+        logger.warning(
+            "XFP-V2 cache: %s is incomplete (%s) — treating as miss",
             layer_prefix, e,
         )
         return False
@@ -357,6 +455,90 @@ def load_moe(
     except (KeyError, ValueError) as e:
         logger.warning(
             "XFP MoE cache: %s is incomplete (%s) — treating as miss",
+            layer_prefix, e,
+        )
+        return False
+
+
+# ─── XFP-V2 MoE: per-group + shared codebook library ──────────────────
+
+def save_moe_v2(
+    cache: MultiQuantWeightCache, layer_prefix: str, layer: nn.Module,
+) -> bool:
+    """Save XFP-V2 MoE: w13/w2 packed indices + library + group params per stack.
+
+    Each stack (w13 = gate+up merged, w2 = down) has its own library.
+    """
+    tensors: dict[str, torch.Tensor] = {
+        "w13_xfp_packed":       layer.w13_xfp_packed.data,
+        "w13_xfp_library":      layer.w13_xfp_library.data,
+        "w13_xfp_group_lib_id": layer.w13_xfp_group_lib_id.data,
+        "w13_xfp_group_scale":  layer.w13_xfp_group_scale.data,
+        "w13_xfp_group_mid":    layer.w13_xfp_group_mid.data,
+        "w2_xfp_packed":        layer.w2_xfp_packed.data,
+        "w2_xfp_library":       layer.w2_xfp_library.data,
+        "w2_xfp_group_lib_id":  layer.w2_xfp_group_lib_id.data,
+        "w2_xfp_group_scale":   layer.w2_xfp_group_scale.data,
+        "w2_xfp_group_mid":     layer.w2_xfp_group_mid.data,
+    }
+    metadata: dict = {
+        "bits":         int(layer._xfp_moe_bits),
+        "K13":          int(layer._xfp_moe_K13),
+        "N13":          int(layer._xfp_moe_N13),
+        "K2":           int(layer._xfp_moe_K2),
+        "N2":           int(layer._xfp_moe_N2),
+        "E":            int(layer._xfp_moe_E),
+        "fpe13":        int(layer._xfp_moe_fpe13),
+        "fpe2":         int(layer._xfp_moe_fpe2),
+        "group_size":   int(layer._xfp_moe_group_size),
+        "library_size": int(layer._xfp_moe_library_size),
+    }
+    return cache.save(layer_prefix, _XFP_MOE_METHOD_V2, tensors, metadata)
+
+
+def load_moe_v2(
+    cache: MultiQuantWeightCache, layer_prefix: str,
+    layer: nn.Module, device: torch.device,
+) -> bool:
+    """Load XFP-V2 MoE shard.
+
+    NOTE: TP-slicing of the new tensors (group_lib_id, group_scale,
+    group_mid) is required for tp_world > 1. The cache stores TP=1
+    full-width tensors; per-rank slicing happens here based on the
+    same tp_role pattern as `load_moe` v1 (w13: column-parallel along
+    N13, w2: row-parallel along K2).
+
+    For Phase 2 we accept TP=1 only; TP>1 slicing is wired in Phase 4
+    alongside the kernel integration.
+    """
+    res = cache.load(layer_prefix, _XFP_MOE_METHOD_V2, device)
+    if res is None:
+        return False
+    tensors, meta, _ = res
+    try:
+        for attr in (
+            "w13_xfp_packed", "w13_xfp_library", "w13_xfp_group_lib_id",
+            "w13_xfp_group_scale", "w13_xfp_group_mid",
+            "w2_xfp_packed", "w2_xfp_library", "w2_xfp_group_lib_id",
+            "w2_xfp_group_scale", "w2_xfp_group_mid",
+        ):
+            setattr(layer, attr, nn.Parameter(tensors[attr], requires_grad=False))
+        layer._xfp_moe_bits         = int(meta["bits"])
+        layer._xfp_moe_K13          = int(meta["K13"])
+        layer._xfp_moe_N13          = int(meta["N13"])
+        layer._xfp_moe_K2           = int(meta["K2"])
+        layer._xfp_moe_N2           = int(meta["N2"])
+        layer._xfp_moe_E            = int(meta["E"])
+        layer._xfp_moe_fpe13        = int(meta["fpe13"])
+        layer._xfp_moe_fpe2         = int(meta["fpe2"])
+        layer._xfp_moe_group_size   = int(meta["group_size"])
+        layer._xfp_moe_library_size = int(meta["library_size"])
+        layer._xfp_moe_packed       = True
+        layer._xfp_v2               = True
+        return True
+    except (KeyError, ValueError) as e:
+        logger.warning(
+            "XFP-V2 MoE cache: %s is incomplete (%s) — treating as miss",
             layer_prefix, e,
         )
         return False

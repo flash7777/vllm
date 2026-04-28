@@ -270,6 +270,11 @@ class MultiQuantWeightCache:
         moe_lloyd = int(os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
         auto_min_cos = float(os.environ.get("XFP_MIN_COS", "0.98"))
         moe_sample = int(os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
+        # XFP-V2 knobs: when XFP_V2 is enabled, group_size + library_size
+        # change the packed bytes substantially → must be in cache_key.
+        xfp_v2 = _env_truthy("XFP_V2")
+        xfp_group_size = int(os.environ.get("XFP_GROUP_SIZE", "128"))
+        xfp_library_size = int(os.environ.get("XFP_LIBRARY_SIZE", "32"))
         # TP/EP are intentionally NOT in the cache key by default: the
         # packed bytes (codebook + indices) are per-layer complete
         # [E, N, K] tensors; slicing by rank happens at cache-load time.
@@ -281,6 +286,10 @@ class MultiQuantWeightCache:
             if _env_truthy("MULTIQUANT_CACHE_TP_SPECIFIC")
             else ""
         )
+        v2_in_hash = (
+            f"|xfp_v2=1|group={xfp_group_size}|lib={xfp_library_size}"
+            if xfp_v2 else ""
+        )
         h.update(
             f"|sigma={_DEFAULT_OUTLIER_SIGMA}"
             f"|maxf={_DEFAULT_OUTLIER_MAX_FRACTION}"
@@ -288,6 +297,7 @@ class MultiQuantWeightCache:
             f"|moe_lloyd={moe_lloyd}"
             f"|min_cos={auto_min_cos}"
             f"|moe_sample={moe_sample}"
+            f"{v2_in_hash}"
             f"{tp_in_hash}"
             f"|schema={_MANIFEST_SCHEMA_VERSION}".encode()
         )
