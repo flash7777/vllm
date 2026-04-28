@@ -915,6 +915,48 @@ def xfp_pack_v2(
     return packed, library.to(torch.float16), group_lib_id_2d, group_scale_2d, group_mid_2d, stats
 
 
+def _unpack_indices(packed: torch.Tensor, K: int, bits: int) -> torch.Tensor:
+    """Reverse of `_pack_indices`. Returns [N_out, K] int64 indices.
+
+    Extracted from `dequant_xfp` so V2 reference paths can reuse it.
+    """
+    vals_per_word = {2: 16, 3: 10, 4: 8}[bits]
+    mask = (1 << bits) - 1
+    K_packed = packed.shape[0]
+    N_out = packed.shape[1]
+    assert K_packed * vals_per_word >= K
+    packed_nk = packed.t().to(torch.int64)
+    unpacked = torch.zeros(
+        N_out, K_packed * vals_per_word,
+        dtype=torch.int64, device=packed.device,
+    )
+    for slot in range(vals_per_word):
+        unpacked[:, slot::vals_per_word] = (packed_nk >> (slot * bits)) & mask
+    return unpacked[:, :K]
+
+
+def dequant_xfp_v2_packed(
+    packed: torch.Tensor,          # [K_packed, N] int32 (existing _pack_indices format)
+    library: torch.Tensor,         # [library_size, n_centroids] fp16/fp32
+    group_lib_id: torch.Tensor,    # [N, G] int (uint8 / int32)
+    group_scale: torch.Tensor,     # [N, G] fp16/fp32
+    group_mid: torch.Tensor,       # [N, G] fp16/fp32
+    K: int,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    """V2 reference dequant from packed indices.
+
+    Wrapper that unpacks via `_unpack_indices` and applies the V2 lookup
+    formula. Mirrors what the v17_lib kernel will compute, but in pure
+    PyTorch (slow). Used by `online_linear.apply()` V2 branch until the
+    kernel ships.
+    """
+    idx = _unpack_indices(packed, K, bits)
+    return dequant_xfp_v2(library, group_lib_id, group_scale, group_mid,
+                          idx, group_size)
+
+
 def dequant_xfp_v2(
     library: torch.Tensor,         # [library_size, n_centroids] fp16/fp32
     group_lib_id: torch.Tensor,    # [N, G] int (uint8 / int32)

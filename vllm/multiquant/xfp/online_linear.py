@@ -247,6 +247,15 @@ class XFPLinearMethod(QuantizeMethodBase):
         W = layer.weight.data  # [N_out, K]
         device = W.device
 
+        # ─── XFP-V2 branch — per-group + shared codebook library ──
+        # Gated on env XFP_V2=1. Pack/cache uses the existing reuse map
+        # (see doc/xfp/v2_codebook_library.md). Apply path falls back to
+        # a Python reference until the v17_lib kernel ships (Phase 3).
+        import os as _v2_os
+        _xfp_v2 = _v2_os.environ.get("XFP_V2", "0") == "1"
+        if _xfp_v2:
+            return self._process_v2(layer, W, device)
+
         # ─── Cache check (skip Lloyd + pack if we've done this before) ──
         cache = MultiQuantWeightCache.get_active()
         layer_prefix = getattr(layer, "layer_name", "") or \
@@ -423,12 +432,145 @@ class XFPLinearMethod(QuantizeMethodBase):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    def _process_v2(
+        self,
+        layer: nn.Module,
+        W: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Phase 1+2 V2 path: pack via library + per-group, save_linear_v2.
+
+        Apply will use a Python reference (slow); v17_lib kernel ships
+        in Phase 3.
+        """
+        import os as _os
+        from vllm.multiquant.xfp.xfp_pack import xfp_pack_v2
+        from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
+        from vllm.multiquant.weight_cache import MultiQuantWeightCache
+        from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
+
+        cache = MultiQuantWeightCache.get_active()
+        layer_prefix = (getattr(layer, "layer_name", None)
+                        or getattr(layer, "prefix", None) or "")
+
+        # Cache check first — V2 shards live under a different cache_key
+        # (XFP_V2 + group_size + library_size in the hash) so V1/V2 don't
+        # collide on disk.
+        if cache is not None and layer_prefix and xfp_cache.load_linear_v2(
+                cache, layer_prefix, layer, device):
+            logger.info(
+                "XFP-V2 %s ← cache (skip Lloyd) bits=%d K=%d N=%d "
+                "group=%d L=%d",
+                layer_prefix, layer._xfp_bits, layer._xfp_K, layer._xfp_N,
+                layer._xfp_group_size, layer._xfp_library_size,
+            )
+            p = layer._parameters.get("weight")
+            if p is not None:
+                p.data = torch.empty(0, device=p.data.device, dtype=p.data.dtype)
+            try:
+                del layer.weight
+            except AttributeError:
+                pass
+            return
+
+        # Fresh pack
+        bits = self.bits if self.bits != 0 else 4  # V2 fixed bits=4 in phase 1
+        group_size = int(_os.environ.get("XFP_GROUP_SIZE", "128"))
+        library_size = int(_os.environ.get("XFP_LIBRARY_SIZE", "32"))
+
+        # K must be divisible by group_size; otherwise the pack raises.
+        Wf = W.float()
+        K = Wf.shape[1]
+        if K % group_size != 0:
+            # Fall back to V1 for layers whose K is not divisible by
+            # group_size (e.g. attention proj with odd intermediate size).
+            logger.warning(
+                "XFP-V2 %s: K=%d not divisible by group_size=%d → V1 fallback",
+                layer_prefix, K, group_size,
+            )
+            return self._process_v1_fallback(layer, W, device)
+
+        packed, library, lib_id, scale, mid, stats = xfp_pack_v2(
+            Wf, bits=bits, group_size=group_size, library_size=library_size,
+        )
+
+        layer.xfp_packed = nn.Parameter(packed.contiguous(), requires_grad=False)
+        layer.xfp_library = nn.Parameter(library.contiguous(), requires_grad=False)
+        layer.xfp_group_lib_id = nn.Parameter(lib_id.contiguous(), requires_grad=False)
+        layer.xfp_group_scale = nn.Parameter(scale.contiguous(), requires_grad=False)
+        layer.xfp_group_mid = nn.Parameter(mid.contiguous(), requires_grad=False)
+        layer._xfp_bits = bits
+        layer._xfp_K = K
+        layer._xfp_N = int(Wf.shape[0])
+        layer._xfp_group_size = group_size
+        layer._xfp_library_size = library_size
+        layer._xfp_has_outliers = False  # outliers wired in later
+        layer._xfp_v2 = True
+        layer._xfp_packed_done = True
+        layer._xfp_stats = stats
+
+        # JIT-load the V1 kernel still, so cache-hit fallback paths work.
+        # The actual V2 forward uses Python reference until v17_lib ships.
+        try:
+            _load_xfp_gemm(bits)
+        except Exception:
+            pass
+
+        logger.info(
+            "XFP-V2 %s [%dx%d] -> xfp%d (g=%d L=%d) | mse=%.3g cos=%.4f "
+            "lib_p5=%.4f overhead=%.2f bits/param",
+            layer_prefix, stats.shape[0], stats.shape[1], bits,
+            group_size, library_size, stats.mse, stats.cos_sim,
+            stats.library_p5_cos, stats.overhead_bits_per_param,
+        )
+
+        if cache is not None and layer_prefix:
+            xfp_cache.save_linear_v2(cache, layer_prefix, layer)
+
+        # Free BF16
+        p = layer._parameters.get("weight")
+        if p is not None:
+            p.data = torch.empty(0, device=p.data.device, dtype=p.data.dtype)
+        try:
+            del layer.weight
+        except AttributeError:
+            pass
+
+    def _process_v1_fallback(self, layer, W, device):
+        """V1 path used when V2 prerequisites (K % group_size == 0) fail."""
+        # Re-enter normal processing without the v2 flag. We just call
+        # the rest of the V1 pipeline by toggling the env flag locally.
+        import os as _os
+        prev = _os.environ.get("XFP_V2", "0")
+        _os.environ["XFP_V2"] = "0"
+        try:
+            return self.process_weights_after_loading(layer)
+        finally:
+            _os.environ["XFP_V2"] = prev
+
     def apply(
         self,
         layer: nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # XFP-V2 reference apply (Python). Replace with v17_lib kernel
+        # call once Phase 3 ships. Slow, but mathematically equivalent
+        # to what the kernel must compute.
+        if getattr(layer, "_xfp_v2", False):
+            from vllm.multiquant.xfp.xfp_pack import dequant_xfp_v2_packed
+            W_rec = dequant_xfp_v2_packed(
+                layer.xfp_packed.data,
+                layer.xfp_library.data,
+                layer.xfp_group_lib_id.data,
+                layer.xfp_group_scale.data,
+                layer.xfp_group_mid.data,
+                K=int(layer._xfp_K),
+                bits=int(layer._xfp_bits),
+                group_size=int(layer._xfp_group_size),
+            ).to(x.dtype)
+            return torch.nn.functional.linear(x, W_rec, bias)
+
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
