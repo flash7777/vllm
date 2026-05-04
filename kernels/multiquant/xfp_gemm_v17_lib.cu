@@ -35,6 +35,23 @@ static void launch_linear_v2(
     size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16)
                       + static_cast<size_t>(library_size) * LUT * sizeof(__half);
 
+    // sm_120/121 default SMEM-per-block carveout is 48 KB — opt in to the
+    // 99 KB sharedMemPerBlockOptin via cudaFuncSetAttribute. Required for
+    // K > 24320 (e.g. K=32768 hypothetical 397B Linear). One-time set is
+    // sticky per kernel function. For low-K calls (K=2048, smem=5 KB)
+    // occupancy is computed from the actual smem_bytes argument, so this
+    // setting does not regress small-K throughput.
+    static bool s_attr_set = false;
+    if (!s_attr_set) {
+        cudaFuncSetAttribute(
+            xfp_gemm_v2_templated_kernel<BITS, LinearPolicyV2>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        s_attr_set = true;
+    }
+    TORCH_CHECK(smem_bytes <= 98304,
+                "xfp_gemm_v17_lib: smem_bytes=", smem_bytes,
+                " exceeds 96 KB carveout (K=", K, ")");
+
     xfp_gemm_v2_templated_kernel<BITS, LinearPolicyV2>
         <<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
