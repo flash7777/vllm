@@ -322,6 +322,64 @@ def _select_v2_m_chunk(K: int) -> int:
     return 2  # K up to 8192
 
 
+# SMEM-Limit für split-M: M_CHUNK * K * bf16 + library + meta muss in
+# ~96 KB carveout passen. Bei K=8192 mit M_CHUNK=2 → s_A = 32 KB OK.
+# Bei K > 8192 reicht selbst M_CHUNK=2 (oder lookup-Default) nicht
+# zuverlässig — in dem Fall fällt der Dispatcher auf split-N (v17_lib)
+# zurück, der nur 1×K für A im SMEM hält.
+XFP_V2_SPLITM_K_MAX = 8192
+
+
+_xfp_v2_dispatch_seen: set = set()  # First-occurrence cache (M_bucket, K, path)
+
+
+def _xfp_v2_log_dispatch(M: int, K: int, path: str, m_chunk: int = 0) -> None:
+    """Log V2 dispatch decision once per (M-bucket, K, path) combination.
+
+    Default: first-seen logging — emits one INFO per shape so we can
+    confirm in benchmark logs which kernel served which layer-class.
+    Set ``XFP_V2_LOG=verbose`` to log every call (very chatty).
+    """
+    if os.environ.get("XFP_V2_LOG", "").lower() in ("verbose", "v"):
+        if path == "splitm":
+            logger.info(
+                "XFP-V2 dispatch: M=%d K=%d → splitm M_CHUNK=%d",
+                M, K, m_chunk)
+        else:
+            logger.info("XFP-V2 dispatch: M=%d K=%d → split-N (v17_lib)", M, K)
+        return
+    # Bucketed first-occurrence
+    if M == 1:
+        m_b = "M=1"
+    elif M <= 4:
+        m_b = "M=2-4"
+    elif M < XFP_V2_SPLITM_THRESHOLD_M:
+        m_b = f"M=5-{XFP_V2_SPLITM_THRESHOLD_M-1}"
+    elif M < 64:
+        m_b = f"M={XFP_V2_SPLITM_THRESHOLD_M}-63"
+    elif M < 256:
+        m_b = "M=64-255"
+    else:
+        m_b = "M>=256"
+    key = (m_b, K, path)
+    if key in _xfp_v2_dispatch_seen:
+        return
+    _xfp_v2_dispatch_seen.add(key)
+    if path == "splitm":
+        logger.info(
+            "XFP-V2 dispatch [first-seen]: %s K=%d -> splitm M_CHUNK=%d",
+            m_b, K, m_chunk)
+    elif path == "split-N-fallback":
+        logger.warning(
+            "XFP-V2 dispatch [first-seen]: %s K=%d -> split-N FALLBACK "
+            "(K > %d, splitm SMEM too tight)",
+            m_b, K, XFP_V2_SPLITM_K_MAX)
+    else:
+        logger.info(
+            "XFP-V2 dispatch [first-seen]: %s K=%d -> split-N (v17_lib)",
+            m_b, K)
+
+
 def dispatch_v2_linear_gemm(
     x_bf16, packed_repacked, library, lib_id, scale, mid, C,
     bits: int, K: int, group_size: int,
@@ -331,22 +389,43 @@ def dispatch_v2_linear_gemm(
     Caller is responsible for repacking ``packed`` (warp-interleaved
     layout via xfp_repack) and ensuring all tensors are contiguous + on
     the same device. C is pre-allocated [M, N] bf16.
+
+    Decision matrix:
+      - M < THRESHOLD (16):              split-N (v17_lib) -- top perf
+      - M >= THRESHOLD, K <= 8192:       splitm (split-M)  -- batched
+      - M >= THRESHOLD, K  > 8192:       split-N fallback  -- splitm SMEM
+                                                              would be
+                                                              too tight
+    Logging: first-seen (M-bucket, K, path) emits one INFO line. Set
+    ``XFP_V2_LOG=verbose`` to log every call.
     """
     v17_lib, v17_splitm = _load_xfp_v2_kernels()
     if v17_lib is None and v17_splitm is None:
         raise RuntimeError("XFP-V2 kernels not loaded")
 
     M = int(x_bf16.shape[0])
-    if M < XFP_V2_SPLITM_THRESHOLD_M or v17_splitm is None:
+    use_splitm = (
+        M >= XFP_V2_SPLITM_THRESHOLD_M
+        and K <= XFP_V2_SPLITM_K_MAX
+        and v17_splitm is not None
+    )
+    if not use_splitm:
         if v17_lib is None:
             raise RuntimeError(
                 "XFP-V2: v17_lib (split-N) not loaded for M=%d" % M)
+        path = (
+            "split-N-fallback"
+            if M >= XFP_V2_SPLITM_THRESHOLD_M and K > XFP_V2_SPLITM_K_MAX
+            else "split-N"
+        )
+        _xfp_v2_log_dispatch(M, K, path)
         v17_lib.xfp_gemm_v17_lib(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size),
         )
     else:
         m_chunk = _select_v2_m_chunk(K)
+        _xfp_v2_log_dispatch(M, K, "splitm", m_chunk)
         v17_splitm.xfp_gemm_v17_lib_splitm(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size), int(m_chunk),
