@@ -109,9 +109,10 @@ Welche Modelle betrifft welcher K-Pfad?
 | Q3.6-27B | n/a (K=17408 > v12-Limit) | n/a (K=17408 > v17_lib pre-V2a) | ❌ pending (RTX) | ❌ pending (in devel) |
 | GLM-4.7-Flash | bench.py 52% Math (22.04.) | ❌ pending | ❌ pending (RTX) | ❌ pending (in devel) |
 
-**V2a-Bench auf DGX verworfen** — DGX und RTX sind in Throughput "Welten
-voneinander entfernt". Alle Performance-Vergleiche müssen auf RTX
-laufen, sonst nicht referenz-konsistent.
+**Performance-Referenz = RTX**, nicht DGX. DGX-Messungen werden
+weiter geführt (eigenes Profil, Quality-OK), aber für Throughput-
+Vergleiche **nicht aussagekräftig** — DGX und RTX sind weit
+auseinander. Die 138 tok/s 122B V2 kamen von RTX.
 
 ### GSM8K (Quality)
 

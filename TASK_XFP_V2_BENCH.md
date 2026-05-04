@@ -70,20 +70,41 @@ Nur bei OK-quality-Probe.
 ./bench.lm-eval --label "<modell>-xfp-<v1|v2|v2a>" --tasks gsm8k --seeds 3
 ```
 
-## Reihenfolge / Plan
+## Reihenfolge / Plan (RTX = Referenz-Hardware)
 
-| # | Modell | Quant | Aktion | ETA |
-|---|---|---|---|---|
-| 1 | Q3.6-27B | V2a | Server up (Cache-Hit) + Smoke + bench.py + GSM8K --limit 50 | ~15 min |
-| 2 | Q3.6-27B | V2a | Full GSM8K 3 seeds (nur falls Probe OK) | ~1.5h |
-| 3 | 35B-A3B | V2 | Server start (V2-cache TBD, vermutlich miss → re-pack) + bench.py | ~25 min |
-| 4 | 35B-A3B | V2 | GSM8K --limit 50 + full 3 seeds | ~1.5h |
-| 5 | 35B-A3B | V2a | Identisch zu V2 (K klein), evtl. ein Sample zur Konsistenz | ~30 min |
-| 6 | 122B-A10B | V2 | Server start + V2 fresh-pack + bench.py + GSM8K --limit 50 | ~45 min |
-| 7 | 122B-A10B | V2 | Full GSM8K 3 seeds | ~3h |
-| 8 | 122B-A10B | V2a | Sample (K klein, sollte == V2) | ~30 min |
+**Wichtig:** Performance-Vergleichs-Bench **auf RTX PRO 6000**
+(Spiegel 2, `-p 2020 root@10.249.0.99`) — die 138 tok/s 122B-Referenz
+kam von dort. DGX-Messungen werden weiter geführt (eigenes Profil,
+Hardware-Vergleich, Quality-Tests OK), aber **nicht als Performance-
+Referenz** verwendet — DGX und RTX sind in Throughput weit auseinander.
 
-**Total Wallclock:** ~8-10h sequentiell auf DGX.
+DGX bleibt aktuell off (Hitze im Büro). Quality-Bench (GSM8K) auf
+DGX wäre OK sobald wieder warm-up möglich, aber Throughput-Bench
+muss auf RTX.
+
+V2a vs V2 auf 35B/122B: K ≤ 4096 bzw. K ≤ 3072 — also algorithmisch
+identisch. Nachmessung trotzdem nötig wegen `cudaFuncSetAttribute`
+Carveout-Lift (96 KB) und `static bool s_attr_set` Pfad in
+`xfp_gemm_v17_lib.cu` — könnte Mikro-Regression vs Pre-V2a-Stand
+(138 tok/s 122B) bedeuten.
+
+| # | Modell | Quant | Hardware | Aktion | ETA |
+|---|---|---|---|---|---|
+| 1 | 35B-A3B | V2 | RTX | bench.py + GSM8K --limit 50 (V2-cache prüfen, evtl. re-pack) | ~30 min |
+| 2 | 35B-A3B | V2 | RTX | Full GSM8K 3 seeds | ~1.5h |
+| 3 | 35B-A3B | V2a | RTX | bench.py (Throughput-Δ vs V2 messen, sollte ≈ 0) + GSM8K --limit 50 | ~30 min |
+| 4 | 122B-A10B | V2 | RTX | bench.py (Soll: 138 tok/s, falls niedriger → Regression-Suche) + GSM8K --limit 50 | ~45 min |
+| 5 | 122B-A10B | V2 | RTX | Full GSM8K 3 seeds | ~3h |
+| 6 | 122B-A10B | V2a | RTX | bench.py + GSM8K --limit 50 (Konsistenz-Probe) | ~45 min |
+| 7 | Q3.6-27B | V2a | RTX | Smoke + bench.py + GSM8K --limit 50 (K=17408 → V2a-Pfad aktiv) | ~30 min |
+| 8 | Q3.6-27B | V2a | RTX | Full GSM8K 3 seeds (nur falls Probe OK) | ~1.5h |
+| 9 | GLM-4.7-Flash | V2a | RTX | bench.py + GSM8K --limit 50 (K=10240 → V2a-Pfad aktiv) | ~45 min |
+
+**Total Wallclock:** ~10-12h sequentiell auf RTX.
+
+**Reihenfolge-Begründung:** 35B zuerst (kleinstes), dann 122B (138 tok/s
+Referenz validieren), dann die K>8192-Modelle (Q3.6-27B + GLM) wo V2a-
+Patch tatsächlich wirkt.
 
 ## Erwartung / Hypothesen
 
