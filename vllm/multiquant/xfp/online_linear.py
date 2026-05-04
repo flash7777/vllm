@@ -445,13 +445,24 @@ class XFPLinearMethod(QuantizeMethodBase):
         """
         import os as _os
         from vllm.multiquant.xfp.xfp_pack import xfp_pack_v2
-        from vllm.multiquant.xfp.xfp_kernel import _load_xfp_gemm
+        from vllm.multiquant.xfp.xfp_kernel import (
+            _load_xfp_gemm, _load_xfp_v2_kernels,
+        )
         from vllm.multiquant.weight_cache import MultiQuantWeightCache
         from vllm.multiquant.xfp import xfp_weight_cache as xfp_cache
 
         cache = MultiQuantWeightCache.get_active()
         layer_prefix = (getattr(layer, "layer_name", None)
                         or getattr(layer, "prefix", None) or "")
+
+        # Eagerly JIT the V2 kernels so the forward path is torch.compile
+        # / aot_compile safe. Without this, dispatch_v2_linear_gemm calls
+        # _load_xfp_v2_kernels() inside the graphed region — os.path.exists
+        # is not traceable by torch.dynamo and breaks aot_compile.
+        try:
+            _load_xfp_v2_kernels()
+        except Exception:
+            pass
 
         # Cache check first — V2 shards live under a different cache_key
         # (XFP_V2 + group_size + library_size in the hash) so V1/V2 don't
