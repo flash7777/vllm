@@ -31,6 +31,75 @@ _XFP_LINEAR_METHOD_V2 = "xfp_linear_v2"
 _XFP_MOE_METHOD_V2 = "xfp_moe_v2"
 
 
+def _slice_stacked(
+    t: torch.Tensor, dim: int, sub_sizes: list[int],
+    tp_world: int, tp_rank: int,
+) -> torch.Tensor:
+    """Sub-stack-aware TP narrow.
+
+    For tensors stacked along ``dim`` as ``[A, B, ...]`` (e.g. QKV or
+    gate+up), slice EACH sub-block independently by tp_world and concat.
+    This matches what vLLM's ``QKVParallelLinear``/``MergedColumnParallelLinear``
+    weight_loader does — naive ``narrow(dim, rank·N/TP, N/TP)`` would
+    cut across sub-block boundaries (e.g. taking all gate, no up).
+    """
+    if tp_world == 1:
+        return t
+    parts = []
+    offset = 0
+    for sub in sub_sizes:
+        if sub % tp_world != 0:
+            raise ValueError(
+                f"sub_size={sub} not divisible by tp_world={tp_world} "
+                f"in stacked sizes {sub_sizes}")
+        sub_local = sub // tp_world
+        parts.append(t.narrow(dim, offset + tp_rank * sub_local, sub_local))
+        offset += sub
+    return torch.cat(parts, dim=dim)
+
+
+def _detect_linear_sub_sizes(layer) -> tuple[str, list[int] | None]:
+    """Identify TP-mode and sub-stack sizes from layer class.
+
+    Returns:
+        (mode, sub_sizes) where mode ∈ {"col", "row", "replicated"}
+        and sub_sizes is None for non-stacked, else a list of sub-output
+        sizes along the column dim.
+    """
+    try:
+        from vllm.model_executor.layers.linear import (
+            ColumnParallelLinear, RowParallelLinear,
+            MergedColumnParallelLinear, QKVParallelLinear,
+            ReplicatedLinear,
+        )
+    except Exception:
+        # Defensive: degrade to simple narrow.
+        return "col", None
+
+    if isinstance(layer, RowParallelLinear):
+        return "row", None
+    if isinstance(layer, QKVParallelLinear):
+        # Q/K/V with potentially asymmetric kv heads.
+        try:
+            q = int(layer.q_size)
+            kv = int(layer.kv_size)
+            return "col", [q, kv, kv]
+        except Exception:
+            return "col", None
+    if isinstance(layer, MergedColumnParallelLinear):
+        # gate_up_proj, in_proj_qkvz (4-stack), in_proj_ba (2-stack), …
+        try:
+            return "col", list(layer.output_sizes)
+        except Exception:
+            return "col", None
+    if isinstance(layer, ColumnParallelLinear):
+        return "col", None  # single output, naive narrow OK
+    if isinstance(layer, ReplicatedLinear):
+        return "replicated", None
+    # Fallback for unknown — assume column (safer than skipping)
+    return "col", None
+
+
 def save_linear(
     cache: MultiQuantWeightCache, layer_prefix: str, layer: nn.Module,
 ) -> bool:
@@ -153,43 +222,150 @@ def load_linear_v2(
     cache: MultiQuantWeightCache, layer_prefix: str,
     layer: nn.Module, device: torch.device,
 ) -> bool:
-    """Load XFP-V2 packed linear shard. Mirrors save_linear_v2."""
-    res = cache.load(layer_prefix, _XFP_LINEAR_METHOD_V2, device)
+    """Load XFP-V2 packed linear shard with TP-aware narrow + device move.
+
+    The cache stores TP=1 full-width tensors. For TP>1 each rank reads its
+    own slice based on layer's ColumnParallel/RowParallel role:
+      * ColumnParallel (qkv, gate_up, ...): narrow N on dim 1 of xfp_packed
+        and on dim 0 of (group_lib_id, group_scale, group_mid).
+      * RowParallel (o_proj, down, ...): narrow K_packed on dim 0 of
+        xfp_packed and G on dim 1 of metadata. Library is shared, never
+        narrowed.
+    """
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        tp_world = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+    except Exception:
+        tp_world, tp_rank = 1, 0
+
+    # vLLM TP-rank-affinity quirk: layer.weight.device may be cuda:0 on
+    # rank 1's worker. Force device to the worker's rank-mapped GPU.
+    if tp_world > 1 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{tp_rank}")
+    elif device is not None and device.type == "cuda" and torch.cuda.is_available():
+        cur = torch.cuda.current_device()
+        if device.index is not None and device.index != cur:
+            device = torch.device(f"cuda:{cur}")
+
+    # Stage on CPU when narrowing — avoids loading full-width tensors on
+    # the wrong GPU before slicing.
+    needs_stage = tp_world > 1
+    stage_device = torch.device("cpu") if needs_stage else device
+    res = cache.load(layer_prefix, _XFP_LINEAR_METHOD_V2, stage_device)
     if res is None:
         return False
     tensors, meta, _ = res
+
+    # Determine TP mode + sub-stack sizes from layer class.
+    tp_dim = None
+    sub_sizes_n: list[int] | None = None
+    if tp_world > 1:
+        mode, sub_sizes_n = _detect_linear_sub_sizes(layer)
+        tp_dim = mode  # "row" | "col" | "replicated"
+        logger.debug(
+            "[xfp_v2_tp] load_linear %s tp_rank=%d cls=%s tp_dim=%s "
+            "sub_sizes_n=%s", layer_prefix, tp_rank, type(layer).__name__,
+            tp_dim, sub_sizes_n,
+        )
+
     try:
+        K_full = int(meta["K"])
+        N_full = int(meta["N"])
+        bits = int(meta["bits"])
+        group_size = int(meta["group_size"])
+        K_packed_full = (K_full + (8 if bits == 4 else 16) - 1) // (8 if bits == 4 else 16)
+        G_full = K_full // group_size
+
+        xfp_packed = tensors["xfp_packed"]
+        lib_id = tensors["xfp_group_lib_id"]
+        scale = tensors["xfp_group_scale"]
+        mid = tensors["xfp_group_mid"]
+
+        if tp_dim == "col":
+            assert N_full % tp_world == 0, (
+                f"N={N_full} not divisible by tp_world={tp_world}")
+            N_tp = N_full // tp_world
+            if sub_sizes_n and len(sub_sizes_n) > 1:
+                # Stacked column-parallel (QKV / MergedColumn): slice each
+                # sub-block independently, otherwise sub-block boundaries
+                # are crossed and the per-rank tensor mixes Q/K/V wrongly.
+                xfp_packed = _slice_stacked(
+                    xfp_packed, 1, sub_sizes_n, tp_world, tp_rank)
+                lib_id = _slice_stacked(
+                    lib_id, 0, sub_sizes_n, tp_world, tp_rank)
+                scale = _slice_stacked(
+                    scale, 0, sub_sizes_n, tp_world, tp_rank)
+                mid = _slice_stacked(
+                    mid, 0, sub_sizes_n, tp_world, tp_rank)
+            else:
+                xfp_packed = xfp_packed.narrow(1, tp_rank * N_tp, N_tp)
+                lib_id = lib_id.narrow(0, tp_rank * N_tp, N_tp)
+                scale = scale.narrow(0, tp_rank * N_tp, N_tp)
+                mid = mid.narrow(0, tp_rank * N_tp, N_tp)
+            N_local = N_tp
+            K_local = K_full
+        elif tp_dim == "row":
+            assert K_packed_full % tp_world == 0, (
+                f"K_packed={K_packed_full} not divisible by tp_world={tp_world}")
+            assert G_full % tp_world == 0, (
+                f"G={G_full} not divisible by tp_world={tp_world}")
+            K_packed_tp = K_packed_full // tp_world
+            G_tp = G_full // tp_world
+            xfp_packed = xfp_packed.narrow(0, tp_rank * K_packed_tp, K_packed_tp)
+            lib_id = lib_id.narrow(1, tp_rank * G_tp, G_tp)
+            scale = scale.narrow(1, tp_rank * G_tp, G_tp)
+            mid = mid.narrow(1, tp_rank * G_tp, G_tp)
+            N_local = N_full
+            K_local = K_full // tp_world
+        else:
+            N_local = N_full
+            K_local = K_full
+
         layer.xfp_packed = nn.Parameter(
-            tensors["xfp_packed"], requires_grad=False)
+            xfp_packed.contiguous().to(device), requires_grad=False)
         layer.xfp_library = nn.Parameter(
-            tensors["xfp_library"], requires_grad=False)
+            tensors["xfp_library"].to(device), requires_grad=False)
         layer.xfp_group_lib_id = nn.Parameter(
-            tensors["xfp_group_lib_id"], requires_grad=False)
+            lib_id.contiguous().to(device), requires_grad=False)
         layer.xfp_group_scale = nn.Parameter(
-            tensors["xfp_group_scale"], requires_grad=False)
+            scale.contiguous().to(device), requires_grad=False)
         layer.xfp_group_mid = nn.Parameter(
-            tensors["xfp_group_mid"], requires_grad=False)
+            mid.contiguous().to(device), requires_grad=False)
         has_outliers = meta.get("has_outliers", "0") == "1"
         if has_outliers:
-            layer.xfp_outlier_row = nn.Parameter(
-                tensors["xfp_outlier_row"], requires_grad=False)
-            layer.xfp_outlier_col = nn.Parameter(
-                tensors["xfp_outlier_col"], requires_grad=False)
-            layer.xfp_outlier_val = nn.Parameter(
-                tensors["xfp_outlier_val"], requires_grad=False)
+            # Outliers store per-coord (row, col, val); column-parallel
+            # narrows row, row-parallel narrows col. Skip for now if TP>1
+            # — correctness matters; will surface as missing outliers.
+            if tp_world > 1:
+                logger.warning(
+                    "XFP-V2 %s: outlier-tensor TP-narrow not implemented; "
+                    "skipping outliers for this layer at TP>1", layer_prefix,
+                )
+                has_outliers = False
+            else:
+                layer.xfp_outlier_row = nn.Parameter(
+                    tensors["xfp_outlier_row"].to(device), requires_grad=False)
+                layer.xfp_outlier_col = nn.Parameter(
+                    tensors["xfp_outlier_col"].to(device), requires_grad=False)
+                layer.xfp_outlier_val = nn.Parameter(
+                    tensors["xfp_outlier_val"].to(device), requires_grad=False)
         layer._xfp_has_outliers = has_outliers
-        layer._xfp_bits = int(meta["bits"])
-        layer._xfp_K = int(meta["K"])
-        layer._xfp_N = int(meta["N"])
-        layer._xfp_group_size = int(meta["group_size"])
+        layer._xfp_bits = bits
+        layer._xfp_K = K_local
+        layer._xfp_N = N_local
+        layer._xfp_group_size = group_size
         layer._xfp_library_size = int(meta["library_size"])
         layer._xfp_stats = None
         layer._xfp_packed_done = True
         layer._xfp_v2 = True
         return True
-    except KeyError as e:
+    except (KeyError, AssertionError) as e:
         logger.warning(
-            "XFP-V2 cache: %s is incomplete (%s) — treating as miss",
+            "XFP-V2 cache: %s is incomplete or TP-incompatible (%s) — miss",
             layer_prefix, e,
         )
         return False
@@ -500,45 +676,139 @@ def load_moe_v2(
     cache: MultiQuantWeightCache, layer_prefix: str,
     layer: nn.Module, device: torch.device,
 ) -> bool:
-    """Load XFP-V2 MoE shard.
+    """Load XFP-V2 MoE shard with TP-aware narrow + device move.
 
-    NOTE: TP-slicing of the new tensors (group_lib_id, group_scale,
-    group_mid) is required for tp_world > 1. The cache stores TP=1
-    full-width tensors; per-rank slicing happens here based on the
-    same tp_role pattern as `load_moe` v1 (w13: column-parallel along
-    N13, w2: row-parallel along K2).
-
-    For Phase 2 we accept TP=1 only; TP>1 slicing is wired in Phase 4
-    alongside the kernel integration.
+    Cache stores TP=1 full-width tensors. Per-rank slicing here, mirroring
+    V1 ``load_moe``:
+      * w13 (gate+up, ColumnParallel): narrow N13 on dim 2 of packed
+        [E, K13_packed, N13] and on dim 1 of metadata [E, N13, G13].
+      * w2 (down, RowParallel): narrow K2_packed on dim 1 of packed
+        [E, K2_packed, N2] and G2 on dim 2 of metadata [E, N2, G2].
+      * Library [L, lut] is shared across experts and ranks — never narrowed.
     """
-    res = cache.load(layer_prefix, _XFP_MOE_METHOD_V2, device)
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        tp_world = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+    except Exception:
+        tp_world, tp_rank = 1, 0
+
+    # vLLM TP-rank-affinity quirk: layer.weight.device may be cuda:0 on
+    # rank 1's worker. Force to the worker's rank-mapped GPU.
+    if tp_world > 1 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{tp_rank}")
+    elif device is not None and device.type == "cuda" and torch.cuda.is_available():
+        cur = torch.cuda.current_device()
+        if device.index is not None and device.index != cur:
+            device = torch.device(f"cuda:{cur}")
+
+    needs_stage = tp_world > 1
+    stage_device = torch.device("cpu") if needs_stage else device
+    res = cache.load(layer_prefix, _XFP_MOE_METHOD_V2, stage_device)
     if res is None:
         return False
     tensors, meta, _ = res
+
     try:
-        for attr in (
-            "w13_xfp_packed", "w13_xfp_library", "w13_xfp_group_lib_id",
-            "w13_xfp_group_scale", "w13_xfp_group_mid",
-            "w2_xfp_packed", "w2_xfp_library", "w2_xfp_group_lib_id",
-            "w2_xfp_group_scale", "w2_xfp_group_mid",
-        ):
-            setattr(layer, attr, nn.Parameter(tensors[attr], requires_grad=False))
-        layer._xfp_moe_bits         = int(meta["bits"])
-        layer._xfp_moe_K13          = int(meta["K13"])
-        layer._xfp_moe_N13          = int(meta["N13"])
-        layer._xfp_moe_K2           = int(meta["K2"])
-        layer._xfp_moe_N2           = int(meta["N2"])
+        bits = int(meta["bits"])
+        K13 = int(meta["K13"])
+        N13 = int(meta["N13"])
+        K2 = int(meta["K2"])
+        N2 = int(meta["N2"])
+        group_size = int(meta["group_size"])
+        vals_per_word = 8 if bits == 4 else (16 if bits == 2 else 10)
+        K13_packed = (K13 + vals_per_word - 1) // vals_per_word
+        K2_packed = (K2 + vals_per_word - 1) // vals_per_word
+        G13 = K13 // group_size
+        G2 = K2 // group_size
+
+        w13p = tensors["w13_xfp_packed"]
+        w13_lib_id = tensors["w13_xfp_group_lib_id"]
+        w13_scale = tensors["w13_xfp_group_scale"]
+        w13_mid = tensors["w13_xfp_group_mid"]
+        w2p = tensors["w2_xfp_packed"]
+        w2_lib_id = tensors["w2_xfp_group_lib_id"]
+        w2_scale = tensors["w2_xfp_group_scale"]
+        w2_mid = tensors["w2_xfp_group_mid"]
+
+        N13_local, K13_local = N13, K13
+        N2_local, K2_local = N2, K2
+        if tp_world > 1:
+            # w13 = FusedMoE gate_up stack: [gate, up] each = N13/2.
+            # vLLM splits each sub-block separately — narrow on dim=2 must
+            # be sub-stack-aware so rank gets [gate_local, up_local] not
+            # ALL gate or ALL up.
+            assert N13 % 2 == 0, (
+                f"N13={N13} must be 2-stacked (gate+up) for FusedMoE")
+            half = N13 // 2
+            assert half % tp_world == 0, (
+                f"N13/2={half} not divisible by tp_world={tp_world}")
+            sub_n13 = [half, half]  # [gate, up]
+            w13p = _slice_stacked(w13p, 2, sub_n13, tp_world, tp_rank)
+            w13_lib_id = _slice_stacked(w13_lib_id, 1, sub_n13, tp_world, tp_rank)
+            w13_scale  = _slice_stacked(w13_scale,  1, sub_n13, tp_world, tp_rank)
+            w13_mid    = _slice_stacked(w13_mid,    1, sub_n13, tp_world, tp_rank)
+            N13_local = N13 // tp_world
+            logger.debug(
+                "[xfp_v2_tp] load_moe %s tp_rank=%d N13_full=%d N13_local=%d "
+                "(stacked gate+up sliced per rank)",
+                layer_prefix, tp_rank, N13, N13_local,
+            )
+
+            # w2 = RowParallel on K2: narrow K2_packed (dim 1) and G2 (dim 2).
+            assert K2_packed % tp_world == 0, (
+                f"K2_packed={K2_packed} not divisible by tp_world={tp_world}")
+            assert G2 % tp_world == 0, (
+                f"G2={G2} not divisible by tp_world={tp_world}")
+            K2_packed_tp = K2_packed // tp_world
+            G2_tp = G2 // tp_world
+            w2p = w2p.narrow(1, tp_rank * K2_packed_tp, K2_packed_tp)
+            w2_lib_id = w2_lib_id.narrow(2, tp_rank * G2_tp, G2_tp)
+            w2_scale  = w2_scale.narrow(2, tp_rank * G2_tp, G2_tp)
+            w2_mid    = w2_mid.narrow(2, tp_rank * G2_tp, G2_tp)
+            K2_local = K2 // tp_world
+
+        layer.w13_xfp_packed = nn.Parameter(
+            w13p.contiguous().to(device), requires_grad=False)
+        layer.w13_xfp_library = nn.Parameter(
+            tensors["w13_xfp_library"].to(device), requires_grad=False)
+        layer.w13_xfp_group_lib_id = nn.Parameter(
+            w13_lib_id.contiguous().to(device), requires_grad=False)
+        layer.w13_xfp_group_scale = nn.Parameter(
+            w13_scale.contiguous().to(device), requires_grad=False)
+        layer.w13_xfp_group_mid = nn.Parameter(
+            w13_mid.contiguous().to(device), requires_grad=False)
+        layer.w2_xfp_packed = nn.Parameter(
+            w2p.contiguous().to(device), requires_grad=False)
+        layer.w2_xfp_library = nn.Parameter(
+            tensors["w2_xfp_library"].to(device), requires_grad=False)
+        layer.w2_xfp_group_lib_id = nn.Parameter(
+            w2_lib_id.contiguous().to(device), requires_grad=False)
+        layer.w2_xfp_group_scale = nn.Parameter(
+            w2_scale.contiguous().to(device), requires_grad=False)
+        layer.w2_xfp_group_mid = nn.Parameter(
+            w2_mid.contiguous().to(device), requires_grad=False)
+
+        layer._xfp_moe_bits         = bits
+        layer._xfp_moe_K13          = K13_local
+        layer._xfp_moe_N13          = N13_local
+        layer._xfp_moe_K2           = K2_local
+        layer._xfp_moe_N2           = N2_local
         layer._xfp_moe_E            = int(meta["E"])
-        layer._xfp_moe_fpe13        = int(meta["fpe13"])
-        layer._xfp_moe_fpe2         = int(meta["fpe2"])
-        layer._xfp_moe_group_size   = int(meta["group_size"])
+        # fpe = numel of one expert's packed slice (post-narrow).
+        layer._xfp_moe_fpe13        = int(layer.w13_xfp_packed.data[0].numel())
+        layer._xfp_moe_fpe2         = int(layer.w2_xfp_packed.data[0].numel())
+        layer._xfp_moe_group_size   = group_size
         layer._xfp_moe_library_size = int(meta["library_size"])
         layer._xfp_moe_packed       = True
         layer._xfp_v2               = True
         return True
-    except (KeyError, ValueError) as e:
+    except (KeyError, ValueError, AssertionError) as e:
         logger.warning(
-            "XFP-V2 MoE cache: %s is incomplete (%s) — treating as miss",
+            "XFP-V2 MoE cache: %s is incomplete or TP-incompatible (%s) — miss",
             layer_prefix, e,
         )
         return False

@@ -241,3 +241,113 @@ def dispatch_linear_gemm(x, packed, cb, C, bits: int, K: int) -> None:
         )
     else:
         _xfp_gemm_kernel.xfp_gemm(x, packed, cb, C, int(bits), int(K))
+
+
+# ─── XFP-V2 kernel modules (v17_lib + v17_lib_splitm) ──────────────────
+
+_xfp_v17_lib_module = None
+_xfp_v17_lib_splitm_module = None
+_xfp_v2_load_attempted = False
+
+
+def _load_xfp_v2_kernels():
+    """JIT-load v17_lib (split-N) and v17_lib_splitm modules on first call.
+
+    Returns (v17_lib_module, v17_lib_splitm_module). Either may be None
+    if compile fails — caller must check.
+    """
+    global _xfp_v17_lib_module, _xfp_v17_lib_splitm_module, _xfp_v2_load_attempted
+
+    if _xfp_v2_load_attempted:
+        return _xfp_v17_lib_module, _xfp_v17_lib_splitm_module
+    _xfp_v2_load_attempted = True
+
+    if _KERNEL_SRC_DIR is None:
+        logger.warning("XFP-V2: kernel source dir not resolved")
+        return None, None
+
+    from torch.utils.cpp_extension import load
+
+    def _try(name: str, file: str):
+        path = os.path.join(_KERNEL_SRC_DIR, file)
+        if not os.path.exists(path):
+            logger.warning("XFP-V2: %s missing at %s", file, path)
+            return None
+        try:
+            return load(
+                name=name,
+                sources=[path],
+                extra_cuda_cflags=[
+                    "-O3", "-std=c++17", "--use_fast_math",
+                    "-gencode=arch=compute_120,code=sm_120",
+                    "-gencode=arch=compute_121,code=sm_121",
+                    "-diag-suppress=177,3288",
+                ],
+                verbose=False,
+            )
+        except Exception as e:
+            logger.warning("XFP-V2: %s compile FAILED: %s", file, e)
+            return None
+
+    _xfp_v17_lib_module = _try("xfp_gemm_v17_lib", "xfp_gemm_v17_lib.cu")
+    _xfp_v17_lib_splitm_module = _try(
+        "xfp_gemm_v17_lib_splitm", "xfp_gemm_v17_lib_splitm.cu")
+
+    if _xfp_v17_lib_module is not None:
+        logger.info("XFP-V2: v17_lib (split-N) compiled")
+    if _xfp_v17_lib_splitm_module is not None:
+        logger.info("XFP-V2: v17_lib_splitm compiled")
+    return _xfp_v17_lib_module, _xfp_v17_lib_splitm_module
+
+
+# Threshold for switching from split-N to split-M-internal kernel.
+# Below this M, split-N (v17_lib) is faster or equivalent. Above, split-M
+# amortizes the per-Group codebook rebuild over M_CHUNK accumulators.
+# Aligned with cudagraph_capture_sizes[0..n] — first non-trivial batch is 8;
+# at M=8 split-M is mixed (some shapes regress slightly), at M=16+ it's a
+# clear win for K ≤ 4096 and a strong improvement for K=8192.
+XFP_V2_SPLITM_THRESHOLD_M = 16
+
+
+def _select_v2_m_chunk(K: int) -> int:
+    """Pick M_CHUNK based on K to keep s_A SMEM ≤ ~32 KB.
+
+    s_A = M_CHUNK * K * 2 bytes. Target 32 KB for ~3 blocks/SM occupancy.
+    Empirically validated by Phase B bench across realistic shapes.
+    """
+    if K <= 1024:
+        return 8
+    if K <= 4096:
+        return 4
+    return 2  # K up to 8192
+
+
+def dispatch_v2_linear_gemm(
+    x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+    bits: int, K: int, group_size: int,
+) -> None:
+    """Dispatch V2 Linear GEMM to split-N or split-M-internal kernel.
+
+    Caller is responsible for repacking ``packed`` (warp-interleaved
+    layout via xfp_repack) and ensuring all tensors are contiguous + on
+    the same device. C is pre-allocated [M, N] bf16.
+    """
+    v17_lib, v17_splitm = _load_xfp_v2_kernels()
+    if v17_lib is None and v17_splitm is None:
+        raise RuntimeError("XFP-V2 kernels not loaded")
+
+    M = int(x_bf16.shape[0])
+    if M < XFP_V2_SPLITM_THRESHOLD_M or v17_splitm is None:
+        if v17_lib is None:
+            raise RuntimeError(
+                "XFP-V2: v17_lib (split-N) not loaded for M=%d" % M)
+        v17_lib.xfp_gemm_v17_lib(
+            x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+            int(bits), int(K), int(group_size),
+        )
+    else:
+        m_chunk = _select_v2_m_chunk(K)
+        v17_splitm.xfp_gemm_v17_lib_splitm(
+            x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+            int(bits), int(K), int(group_size), int(m_chunk),
+        )

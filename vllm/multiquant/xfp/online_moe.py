@@ -133,6 +133,114 @@ except Exception as e:
     _xfp_moe_op = _xfp_moe_forward_impl
 
 
+def _xfp_moe_v2_forward(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_packed: torch.Tensor,        # [E*fpe13] int32, warp-interleaved
+    w13_library: torch.Tensor,       # [L, 16] fp16
+    w13_lib_id: torch.Tensor,        # [E, N13, G13] int32
+    w13_scale: torch.Tensor,         # [E, N13, G13] fp16
+    w13_mid: torch.Tensor,           # [E, N13, G13] fp16
+    w2_packed: torch.Tensor,         # [E*fpe2] int32
+    w2_library: torch.Tensor,
+    w2_lib_id: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_mid: torch.Tensor,
+    bits: int,
+    K13: int, N13: int,
+    K2: int, N2: int,
+    group_size: int,
+    fpe13: int, fpe2: int,
+) -> torch.Tensor:
+    """V2 MoE forward — direct kernel path, no dequant."""
+    from vllm.multiquant.xfp.xfp_kernel import _load_xfp_v2_kernels
+    _, _ = _load_xfp_v2_kernels()  # ensure loaded
+    # MoE V2 kernel is loaded separately
+    import os as _os
+    from torch.utils.cpp_extension import load as _cpp_load
+    global _xfp_moe_v17_module
+    try:
+        _xfp_moe_v17_module
+    except NameError:
+        kernel_dir = "/opt/mq_kernels"
+        if not _os.path.exists(kernel_dir):
+            kernel_dir = _os.path.normpath(
+                _os.path.join(_os.path.dirname(__file__),
+                              "..", "..", "..", "kernels", "multiquant"))
+        _xfp_moe_v17_module = _cpp_load(
+            name="xfp_moe_gemm_v17_lib",
+            sources=[_os.path.join(kernel_dir, "xfp_moe_gemm_v17_lib.cu")],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17", "--use_fast_math",
+                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_121,code=sm_121",
+                "-diag-suppress=177,3288",
+            ],
+            verbose=False,
+        )
+        logger.info("XFP-V2 MoE: v17_lib MoE kernel compiled")
+    moe_kernel = _xfp_moe_v17_module
+
+    B = int(x.shape[0])
+    topk = int(topk_ids.shape[1])
+    half_n = N13 // 2
+    BT = B * topk
+
+    x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
+    no_w = torch.empty(0, dtype=torch.float32, device=x.device)
+
+    # Token sorting (Marlin pattern) — torch ops, CUDA Graph safe
+    flat_topk = topk_ids.reshape(-1)
+    sort_indices = flat_topk.argsort(stable=True)
+    sorted_token_ids = sort_indices.to(torch.int32)
+    sorted_expert_ids = flat_topk[sort_indices].to(torch.int32)
+    num_valid = sorted_token_ids.shape[0]
+
+    # Gate+Up (no topk weighting yet)
+    if not getattr(_xfp_moe_v2_forward, "_logged", False):
+        logger.info(
+            "XFP-V2 MoE forward shapes: B=%d topk=%d BT=%d K13=%d N13=%d "
+            "K2=%d N2=%d num_valid=%d fpe13=%d fpe2=%d w13_packed=%s "
+            "w13_lib_id=%s w13_scale=%s",
+            B, topk, BT, K13, N13, K2, N2, num_valid, fpe13, fpe2,
+            tuple(w13_packed.shape), tuple(w13_lib_id.shape),
+            tuple(w13_scale.shape),
+        )
+        _xfp_moe_v2_forward._logged = True
+    gate_up = torch.zeros(BT, N13, dtype=torch.bfloat16, device=x.device)
+    moe_kernel.xfp_moe_gemm_v17_lib(
+        x_bf16, w13_packed, w13_library, w13_lib_id, w13_scale, w13_mid,
+        gate_up, sorted_token_ids, sorted_expert_ids, no_w,
+        int(bits), int(K13), int(N13), int(group_size),
+        int(topk), int(fpe13), int(num_valid),
+    )
+    torch.cuda.synchronize()  # DIAG: surface kernel errors at exact site
+
+    # SiLU+mul
+    activated = torch.empty(BT, half_n, dtype=torch.bfloat16, device=x.device)
+    torch.ops._C.silu_and_mul(activated, gate_up)
+    torch.cuda.synchronize()  # DIAG
+
+    # Down — applies topk weight in epilogue
+    down = torch.zeros(BT, N2, dtype=torch.bfloat16, device=x.device)
+    down_expert_ids = topk_ids.reshape(-1).to(torch.int32)
+    down_sorted = torch.arange(BT, dtype=torch.int32, device=x.device)
+    tw_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
+    moe_kernel.xfp_moe_gemm_v17_lib(
+        activated, w2_packed, w2_library, w2_lib_id, w2_scale, w2_mid,
+        down, down_sorted, down_expert_ids, tw_flat,
+        int(bits), int(K2), int(N2), int(group_size),
+        1, int(fpe2), int(BT),
+    )
+
+    # Scatter-reduce into final output (weights already applied)
+    orig = torch.arange(BT, device=x.device, dtype=torch.int64) // topk
+    output = torch.zeros(B, N2, dtype=torch.bfloat16, device=x.device)
+    output.scatter_add_(0, orig.unsqueeze(1).expand_as(down), down)
+    return output
+
+
 class XFPMoEMethod(FusedMoEMethodBase):
     """Learned-codebook quant-on-load for FusedMoE layers.
 
@@ -537,11 +645,48 @@ class XFPMoEMethod(FusedMoEMethodBase):
         except AttributeError:
             pass
 
-    def _moe_v2_dequant_to_bf16(self, layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        """V2 reference: per-stack dequant ALL experts to BF16 [E,N,K].
+    def _v2_lazy_repack(self, layer: nn.Module) -> None:
+        """One-time per-expert xfp_repack of V2 packed tensors + int32 cast
+        of lib_id. Cached on layer as ``_xfp_v2_w{13,2}_packed_repacked``
+        and ``_xfp_v2_w{13,2}_lib_id_int32``.
+        """
+        from vllm.multiquant.xfp.xfp_pack import xfp_repack
 
-        Slow but correct. Phase 3 replaces with v17_lib kernel that
-        operates on packed indices directly.
+        if hasattr(layer, "_xfp_v2_w13_packed_repacked"):
+            return
+
+        E = int(layer._xfp_moe_E)
+        # layer.w*_xfp_packed.data is [E, K_packed, N] raw int32
+        rp13 = [xfp_repack(layer.w13_xfp_packed.data[e]) for e in range(E)]
+        rp2  = [xfp_repack(layer.w2_xfp_packed.data[e])  for e in range(E)]
+        layer._xfp_v2_w13_packed_repacked = torch.cat(
+            [t.reshape(-1) for t in rp13], dim=0).contiguous()
+        layer._xfp_v2_w2_packed_repacked = torch.cat(
+            [t.reshape(-1) for t in rp2], dim=0).contiguous()
+        # fpe = int32 words per expert (post-repack, same as pre-repack)
+        layer._xfp_v2_fpe13 = int(rp13[0].numel())
+        layer._xfp_v2_fpe2  = int(rp2[0].numel())
+
+        lid13 = layer.w13_xfp_group_lib_id.data
+        lid2  = layer.w2_xfp_group_lib_id.data
+        layer._xfp_v2_w13_lib_id_int32 = (
+            lid13 if lid13.dtype == torch.int32
+            else lid13.to(torch.int32).contiguous()
+        )
+        layer._xfp_v2_w2_lib_id_int32 = (
+            lid2 if lid2.dtype == torch.int32
+            else lid2.to(torch.int32).contiguous()
+        )
+
+        # Free original packed tensors (we have the repacked ones now)
+        layer.w13_xfp_packed.data = torch.empty(
+            0, dtype=torch.int32, device=layer.w13_xfp_packed.data.device)
+        layer.w2_xfp_packed.data = torch.empty(
+            0, dtype=torch.int32, device=layer.w2_xfp_packed.data.device)
+
+    def _moe_v2_dequant_to_bf16(self, layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        """[DEPRECATED] V2 reference: per-stack dequant ALL experts to BF16.
+        Replaced by direct V2 kernel call. Kept for numeric verification.
         """
         from vllm.multiquant.xfp.xfp_pack import dequant_xfp_v2_packed
 
@@ -595,17 +740,26 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 topk_weights=topk_weights, topk_ids=topk_ids,
             )
 
-        # XFP-V2 reference apply: dequant once (cached), then fused_experts.
-        # Slow first call, fast subsequent. Phase 3 ships the kernel.
+        # XFP-V2 apply: direct kernel call on packed indices — no dequant.
         if getattr(layer, "_xfp_v2", False):
-            from vllm.model_executor.layers.fused_moe import fused_experts
-            if not hasattr(layer, "_xfp_v2_w13_dense"):
-                w13_d, w2_d = self._moe_v2_dequant_to_bf16(layer)
-                layer._xfp_v2_w13_dense = w13_d
-                layer._xfp_v2_w2_dense = w2_d
-            return fused_experts(
-                x, layer._xfp_v2_w13_dense, layer._xfp_v2_w2_dense,
-                topk_weights=topk_weights, topk_ids=topk_ids,
+            self._v2_lazy_repack(layer)
+            return _xfp_moe_v2_forward(
+                x, topk_weights, topk_ids,
+                layer._xfp_v2_w13_packed_repacked,
+                layer.w13_xfp_library.data,
+                layer._xfp_v2_w13_lib_id_int32,
+                layer.w13_xfp_group_scale.data,
+                layer.w13_xfp_group_mid.data,
+                layer._xfp_v2_w2_packed_repacked,
+                layer.w2_xfp_library.data,
+                layer._xfp_v2_w2_lib_id_int32,
+                layer.w2_xfp_group_scale.data,
+                layer.w2_xfp_group_mid.data,
+                int(layer._xfp_moe_bits),
+                int(layer._xfp_moe_K13), int(layer._xfp_moe_N13),
+                int(layer._xfp_moe_K2), int(layer._xfp_moe_N2),
+                int(layer._xfp_moe_group_size),
+                int(layer._xfp_v2_fpe13), int(layer._xfp_v2_fpe2),
             )
 
         return _xfp_moe_op(

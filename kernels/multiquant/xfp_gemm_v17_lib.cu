@@ -30,8 +30,13 @@ static void launch_linear_v2(
     LinearPolicyV2::Params params{M};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // Dynamic SMEM: s_A (K * bf16) + s_library (library_size * 16 * fp16).
+    constexpr int LUT = 16;  // BITS=4
+    size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16)
+                      + static_cast<size_t>(library_size) * LUT * sizeof(__half);
+
     xfp_gemm_v2_templated_kernel<BITS, LinearPolicyV2>
-        <<<grid, block, 0, stream>>>(
+        <<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
             reinterpret_cast<const uint32_t*>(B_packed.data_ptr<int32_t>()),
             reinterpret_cast<const half*>(library.data_ptr()),

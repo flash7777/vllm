@@ -778,17 +778,26 @@ def _build_codebook_library(
     g = torch.Generator(device=cb_norm.device).manual_seed(seed)
 
     # k-means++ init
-    idx0 = int(torch.randint(0, M, (1,), generator=g).item())
+    idx0 = int(torch.randint(
+        0, M, (1,), generator=g, device=cb_norm.device).item())
     cents = cb_norm[idx0:idx0 + 1].clone()
+
+    # Distance computation is the memory hog: ((cb_norm[:, None] - cents[None]) ** 2).sum(-1)
+    # materializes [M, k, D] which is ~13 GB for 122B (M=6.3M, k=32, D=16). Use
+    # torch.cdist (fused, no broadcast intermediate, peak ≈ output size only).
+    def _pairwise_d2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # cdist returns euclidean distance; we want squared, so square output.
+        return torch.cdist(a, b, p=2.0).pow(2)
+
     while cents.shape[0] < library_size:
-        d2 = ((cb_norm.unsqueeze(1) - cents.unsqueeze(0)) ** 2).sum(-1).amin(dim=1)
+        d2 = _pairwise_d2(cb_norm, cents).amin(dim=1)
         prob = d2 / d2.sum().clamp(min=1e-12)
         nxt = int(torch.multinomial(prob, 1, generator=g).item())
         cents = torch.cat([cents, cb_norm[nxt:nxt + 1]], dim=0)
 
     # Lloyd refinement
     for _ in range(iters):
-        d2 = ((cb_norm.unsqueeze(1) - cents.unsqueeze(0)) ** 2).sum(-1)  # [M, k]
+        d2 = _pairwise_d2(cb_norm, cents)  # [M, k] — no [M,k,D] intermediate
         assign = d2.argmin(dim=1)
         new_cents = cents.clone()
         for c in range(library_size):

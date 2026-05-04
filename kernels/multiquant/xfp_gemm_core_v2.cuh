@@ -78,19 +78,36 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     const int lane_group          = lane / LUT_SIZE;            // 0 or 1
     const int cb_lane_offset      = lane_group * LUT_SIZE;      // 0 or 16
 
-    // ── Cooperative library load into SMEM ──
-    __shared__ half s_library[XFP_V2_LIBRARY_MAX * LUT_SIZE];
+    // ── Dynamic SMEM layout ──
+    // [0]            s_A        : K * sizeof(bf16)
+    // [s_A end]      s_library  : library_size * LUT_SIZE * sizeof(half)
+    //
+    // Codebook prebuild was tested (storing G fully-rebuilt codebooks per
+    // warp in SMEM) including K=8192 explicitly: fp32 +44.5% median
+    // (vs per-iter +35.4%) — at K=8192 the s_codebooks alone is 32 KB,
+    // dropping occupancy 6→2 blocks/SM. fp16 storage hits 2-way SMEM bank
+    // conflicts (16-bit reads on 32-bit banks). Per-iter rebuild wins for
+    // every K tested. The 3-LDG metadata fetch is L1-cached (only 2
+    // distinct addresses per warp per outer iter); the cb_val FMA is
+    // structural and unavoidable in this design.
+    extern __shared__ char xfp_v2_smem[];
+    size_t off_A   = 0;
+    size_t off_lib = off_A + (size_t)K * sizeof(__nv_bfloat16);
+    __nv_bfloat16* s_A       = reinterpret_cast<__nv_bfloat16*>(
+        xfp_v2_smem + off_A);
+    half*          s_library = reinterpret_cast<half*>(
+        xfp_v2_smem + off_lib);
+
+    // ── Cooperative library load ──
     {
         int total = library_size * LUT_SIZE;
         for (int i = threadIdx.x; i < total; i += XFP_BLOCK_SIZE) {
             s_library[i] = library[i];
         }
     }
-    // Block-uniform A-row load (mirrors v12). Library cooperative copy
-    // and A-row copy share the same __syncthreads barrier below.
+    // ── Block-uniform A-row load (mirrors v12) ──
     const __nv_bfloat16* block_A = PolicyV2::block_A_row(A, K, params);
     if (block_A == nullptr) return;
-    __shared__ __nv_bfloat16 s_A[PolicyV2::K_SMEM_MAX];
     {
         int pair_count = K >> 1;
         const __nv_bfloat162* __restrict__ src2 =
@@ -114,48 +131,24 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     float acc = 0.0f;
     int n_offset = ctx.n * XFP_WARP_SIZE + lane;
 
-    // ── Per-warp SMEM cache for this row's group metadata ──
-    // [WARPS_PER_BLOCK][G][3]  // (lib_id, scale_f, mid_f) per group.
-    // Storing as float lets us avoid __half2float in the hot loop
-    // and pack {scale, mid} as float32 too (cheap precision: scale/mid
-    // come from fp16 source already).
-    constexpr int META_PER_GROUP = 3;        // lib_id (as float), scale, mid
-    constexpr int META_MAX_G     = PolicyV2::K_SMEM_MAX / 64;  // K/group_size cap (≥ G ever observed)
-    __shared__ float s_meta[XFP_WARPS_PER_BLOCK * META_MAX_G * META_PER_GROUP];
-    float* my_warp_meta = s_meta + warp_id * META_MAX_G * META_PER_GROUP;
-    {
-        const int32_t* row_lib_id = ctx.group_lib_id + (size_t)ctx.n * G;
-        const half*    row_scale  = ctx.group_scale  + (size_t)ctx.n * G;
-        const half*    row_mid    = ctx.group_mid    + (size_t)ctx.n * G;
-        for (int g = lane; g < G; g += XFP_WARP_SIZE) {
-            my_warp_meta[g * META_PER_GROUP + 0] = (float) row_lib_id[g];
-            my_warp_meta[g * META_PER_GROUP + 1] = __half2float(row_scale[g]);
-            my_warp_meta[g * META_PER_GROUP + 2] = __half2float(row_mid[g]);
-        }
-    }
-    __syncwarp();  // warp-local: all lanes see this warp's meta
-
     int K_packed_safe = K / VALS_PER_WORD;
     int n_full_groups = K_packed_safe / XFP_WARP_SIZE;
 
-    // Storage for the lane's own codebook entry (refreshed every outer iter)
+    // Per-row metadata pointers — read directly per outer iter, L1-cached.
+    const int32_t* row_lib_id = ctx.group_lib_id + (size_t)ctx.n * G;
+    const half*    row_scale  = ctx.group_scale  + (size_t)ctx.n * G;
+    const half*    row_mid    = ctx.group_mid    + (size_t)ctx.n * G;
+
     float my_cb_val = 0.0f;
 
-    // Fast path: no bounds checks
     for (int gi = 0; gi < n_full_groups; gi++) {
-        // ── V2 PATCH: per-lane-group codebook reload ──
-        // Each outer iter spans CB_PER_ITER groups; this lane belongs to
-        // group (gi * CB_PER_ITER + lane_group). Read from per-warp SMEM
-        // (was: 3× global loads per iter — that was the +37% bottleneck).
         int my_group_idx = gi * CB_PER_ITER + lane_group;
-        const float* meta = my_warp_meta + my_group_idx * META_PER_GROUP;
-        int lib_id   = (int) meta[0];
-        float scale_f = meta[1];
-        float mid_f   = meta[2];
+        int   lib_id  = (int) row_lib_id[my_group_idx];
+        float scale_f = __half2float(row_scale[my_group_idx]);
+        float mid_f   = __half2float(row_mid  [my_group_idx]);
         my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx])
                     * scale_f + mid_f;
 
-        // ── Existing hot loop (unchanged except SHFL src lane) ──
         int kw = lane + gi * XFP_WARP_SIZE;
         uint32_t packed = ctx.B_packed[gi * N * XFP_WARP_SIZE + n_offset];
         int k_base = kw * VALS_PER_WORD;
@@ -168,7 +161,6 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
             float a1 = __bfloat162float(__high2bfloat16(a2));
             int idx0 = (int)((packed >> (slot * BITS)) & MASK);
             int idx1 = (int)((packed >> ((slot + 1) * BITS)) & MASK);
-            // V2: SHFL src lane = cb_lane_offset + idx
             float w0 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx0);
             float w1 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx1);
             acc = fmaf(w0, a0, acc);
@@ -257,6 +249,99 @@ struct LinearPolicyV2 {
         __nv_bfloat16* C, int N, const Ctx& ctx, float acc)
     {
         C[ctx.m * N + ctx.n] = __float2bfloat16(acc);
+    }
+};
+
+
+// ─── MoE V2 policy ───────────────────────────────────────────────────
+//
+// Mirrors LinearPolicyV2 but indexes B_packed and per-group metadata by
+// expert_id (from sorted_token_ids/expert_ids). Output is per-token via
+// the same sorted scheme as v12 MoE.
+
+struct MoEPolicyV2 {
+    static constexpr int K_SMEM_MAX = 4096;
+
+    struct Params {
+        const int32_t* sorted_token_ids;   // [num_tokens_padded]
+        const int32_t* expert_ids;         // [num_token_blocks]
+        const float*   topk_weights;       // [M * top_k] or nullptr
+        int M;
+        int top_k;
+        int flat_per_expert;               // int32 words per expert in B_packed
+        int num_valid_tokens;
+        int G;                             // K / group_size — needed for prologue offsets
+    };
+
+    struct Ctx {
+        bool active;
+        int n;
+        int token_id;
+        const uint32_t*      B_packed;
+        const half*          library;
+        const int32_t*       group_lib_id;  // pre-offset to expert
+        const half*          group_scale;
+        const half*          group_mid;
+        const float*         topk_weights;
+    };
+
+    __device__ static const __nv_bfloat16* block_A_row(
+        const __nv_bfloat16* A, int K, const Params& p)
+    {
+        int tb = blockIdx.y;
+        int expert_id = p.expert_ids[tb];
+        if (expert_id < 0) return nullptr;
+        int token_id = p.sorted_token_ids[tb];
+        if (token_id >= p.num_valid_tokens) return nullptr;
+        int orig = token_id / p.top_k;
+        if (orig >= p.M) return nullptr;
+        return A + (size_t)orig * K;
+    }
+
+    template <int BITS, int LUT>
+    __device__ static Ctx prologue(
+        const __nv_bfloat16* /*A*/,
+        const uint32_t*      B,
+        const half*          library_,
+        const int32_t*       group_lib_id_,
+        const half*          group_scale_,
+        const half*          group_mid_,
+        int N, int /*K*/,
+        int warp_id, int /*lane*/,
+        Params p)
+    {
+        Ctx c{};
+        int n  = blockIdx.x * XFP_WARPS_PER_BLOCK + warp_id;
+        int tb = blockIdx.y;
+
+        int expert_id = p.expert_ids[tb];
+        if (expert_id < 0) return c;
+        int token_id = p.sorted_token_ids[tb];
+        if (token_id >= p.num_valid_tokens) return c;
+        int orig = token_id / p.top_k;
+        if (orig >= p.M || n >= N) return c;
+
+        c.active = true;
+        c.n = n;
+        c.token_id = token_id;
+        c.B_packed = B + (size_t)expert_id * p.flat_per_expert;
+        c.library  = library_;
+        // Per-expert metadata stride: e × N × G entries
+        size_t e_off = (size_t)expert_id * (size_t)N * (size_t)p.G;
+        c.group_lib_id = group_lib_id_ + e_off;
+        c.group_scale  = group_scale_  + e_off;
+        c.group_mid    = group_mid_    + e_off;
+        c.topk_weights = p.topk_weights;
+        return c;
+    }
+
+    __device__ static void epilogue(
+        __nv_bfloat16* C, int N, const Ctx& ctx, float acc)
+    {
+        if (ctx.topk_weights != nullptr) {
+            acc *= ctx.topk_weights[ctx.token_id];
+        }
+        C[(size_t)ctx.token_id * N + ctx.n] = __float2bfloat16(acc);
     }
 };
 

@@ -554,22 +554,76 @@ class XFPLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # XFP-V2 reference apply (Python). Replace with v17_lib kernel
-        # call once Phase 3 ships. Slow, but mathematically equivalent
-        # to what the kernel must compute.
+        # XFP-V2 kernel dispatch: split-N (v17_lib) for M < 16, split-M-internal
+        # (v17_lib_splitm) for M >= 16 with K-adaptive M_CHUNK. Set
+        # XFP_V2_KERNEL=0 to fall back to the Python reference (slow, used
+        # for numeric verification only).
         if getattr(layer, "_xfp_v2", False):
-            from vllm.multiquant.xfp.xfp_pack import dequant_xfp_v2_packed
-            W_rec = dequant_xfp_v2_packed(
-                layer.xfp_packed.data,
+            import os as _os
+            if _os.environ.get("XFP_V2_KERNEL", "1") == "0":
+                # Python reference path
+                from vllm.multiquant.xfp.xfp_pack import dequant_xfp_v2_packed
+                W_rec = dequant_xfp_v2_packed(
+                    layer.xfp_packed.data,
+                    layer.xfp_library.data,
+                    layer.xfp_group_lib_id.data,
+                    layer.xfp_group_scale.data,
+                    layer.xfp_group_mid.data,
+                    K=int(layer._xfp_K),
+                    bits=int(layer._xfp_bits),
+                    group_size=int(layer._xfp_group_size),
+                ).to(x.dtype)
+                return torch.nn.functional.linear(x, W_rec, bias)
+
+            # Kernel path
+            from vllm.multiquant.xfp.xfp_kernel import dispatch_v2_linear_gemm
+            from vllm.multiquant.xfp.xfp_pack import xfp_repack
+
+            # Lazy one-time repack to warp-interleaved layout, cached on layer.
+            # Handles both fresh packs (2D [K_packed, N]) and pre-repacked
+            # caches (1D); kernel only accepts the 1D warp-interleaved form.
+            if (not hasattr(layer, "_xfp_v2_packed_repacked")
+                    or layer._xfp_v2_packed_repacked is None):
+                raw = layer.xfp_packed.data
+                layer._xfp_v2_packed_repacked = (
+                    raw.contiguous() if raw.dim() == 1
+                    else xfp_repack(raw).contiguous()
+                )
+
+            # Lazy one-time int32 cast for lib_id (kernel TORCH_CHECK)
+            if (not hasattr(layer, "_xfp_v2_lib_id_int32")
+                    or layer._xfp_v2_lib_id_int32 is None):
+                lid = layer.xfp_group_lib_id.data
+                layer._xfp_v2_lib_id_int32 = (
+                    lid if lid.dtype == torch.int32
+                    else lid.to(torch.int32).contiguous()
+                )
+
+            out_shape = x.shape[:-1] + (layer._xfp_N,)
+            reshaped_x = x.reshape(-1, x.shape[-1])
+            x_bf16 = (reshaped_x.to(torch.bfloat16).contiguous()
+                      if reshaped_x.dtype != torch.bfloat16
+                      else reshaped_x.contiguous())
+
+            C = torch.empty(
+                x_bf16.shape[0], layer._xfp_N,
+                dtype=torch.bfloat16, device=x.device,
+            )
+            dispatch_v2_linear_gemm(
+                x_bf16,
+                layer._xfp_v2_packed_repacked,
                 layer.xfp_library.data,
-                layer.xfp_group_lib_id.data,
+                layer._xfp_v2_lib_id_int32,
                 layer.xfp_group_scale.data,
                 layer.xfp_group_mid.data,
-                K=int(layer._xfp_K),
-                bits=int(layer._xfp_bits),
-                group_size=int(layer._xfp_group_size),
-            ).to(x.dtype)
-            return torch.nn.functional.linear(x, W_rec, bias)
+                C,
+                int(layer._xfp_bits),
+                int(layer._xfp_K),
+                int(layer._xfp_group_size),
+            )
+            if bias is not None:
+                C = C + bias.to(C.dtype)
+            return C.reshape(out_shape).to(x.dtype)
 
         out_shape = x.shape[:-1] + (layer._xfp_N,)
         reshaped_x = x.reshape(-1, x.shape[-1])
