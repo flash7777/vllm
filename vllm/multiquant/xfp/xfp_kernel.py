@@ -243,28 +243,36 @@ def dispatch_linear_gemm(x, packed, cb, C, bits: int, K: int) -> None:
         _xfp_gemm_kernel.xfp_gemm(x, packed, cb, C, int(bits), int(K))
 
 
-# ─── XFP-V2 kernel modules (v17_lib + v17_lib_splitm) ──────────────────
+# ─── XFP-V2 kernel modules (v17_lib + v17_lib_splitm + v17_lib_splitk) ──
 
 _xfp_v17_lib_module = None
 _xfp_v17_lib_splitm_module = None
+_xfp_v17_lib_splitk_module = None
 _xfp_v2_load_attempted = False
 
 
 def _load_xfp_v2_kernels():
-    """JIT-load v17_lib (split-N) and v17_lib_splitm modules on first call.
+    """JIT-load v17_lib (split-N), v17_lib_splitm and v17_lib_splitk on
+    first call.
 
-    Returns (v17_lib_module, v17_lib_splitm_module). Either may be None
-    if compile fails — caller must check.
+    Returns (v17_lib_module, v17_lib_splitm_module, v17_lib_splitk_module).
+    Any of the three may be None if compile fails — caller must check.
+
+    splitk (V3) is the K-axis split kernel for K > 8192 (Q3.6-27B
+    down_proj K=17408, GLM-4.7-Flash down_proj K=10240). Replaces the
+    V2a "split-N fallback" path which only worked at 1-2 blocks/SM.
     """
-    global _xfp_v17_lib_module, _xfp_v17_lib_splitm_module, _xfp_v2_load_attempted
+    global _xfp_v17_lib_module, _xfp_v17_lib_splitm_module
+    global _xfp_v17_lib_splitk_module, _xfp_v2_load_attempted
 
     if _xfp_v2_load_attempted:
-        return _xfp_v17_lib_module, _xfp_v17_lib_splitm_module
+        return (_xfp_v17_lib_module, _xfp_v17_lib_splitm_module,
+                _xfp_v17_lib_splitk_module)
     _xfp_v2_load_attempted = True
 
     if _KERNEL_SRC_DIR is None:
         logger.warning("XFP-V2: kernel source dir not resolved")
-        return None, None
+        return None, None, None
 
     from torch.utils.cpp_extension import load
 
@@ -292,12 +300,17 @@ def _load_xfp_v2_kernels():
     _xfp_v17_lib_module = _try("xfp_gemm_v17_lib", "xfp_gemm_v17_lib.cu")
     _xfp_v17_lib_splitm_module = _try(
         "xfp_gemm_v17_lib_splitm", "xfp_gemm_v17_lib_splitm.cu")
+    _xfp_v17_lib_splitk_module = _try(
+        "xfp_gemm_v17_lib_splitk", "xfp_gemm_v17_lib_splitk.cu")
 
     if _xfp_v17_lib_module is not None:
         logger.info("XFP-V2: v17_lib (split-N) compiled")
     if _xfp_v17_lib_splitm_module is not None:
         logger.info("XFP-V2: v17_lib_splitm compiled")
-    return _xfp_v17_lib_module, _xfp_v17_lib_splitm_module
+    if _xfp_v17_lib_splitk_module is not None:
+        logger.info("XFP-V2: v17_lib_splitk (V3, K>8192) compiled")
+    return (_xfp_v17_lib_module, _xfp_v17_lib_splitm_module,
+            _xfp_v17_lib_splitk_module)
 
 
 # Threshold for switching from split-N to split-M-internal kernel.
@@ -324,10 +337,30 @@ def _select_v2_m_chunk(K: int) -> int:
 
 # SMEM-Limit für split-M: M_CHUNK * K * bf16 + library + meta muss in
 # ~96 KB carveout passen. Bei K=8192 mit M_CHUNK=2 → s_A = 32 KB OK.
-# Bei K > 8192 reicht selbst M_CHUNK=2 (oder lookup-Default) nicht
-# zuverlässig — in dem Fall fällt der Dispatcher auf split-N (v17_lib)
-# zurück, der nur 1×K für A im SMEM hält.
+# Bei K > 8192 nimmt der V3 split-K Kernel (v17_lib_splitk) über.
 XFP_V2_SPLITM_K_MAX = 8192
+
+
+def _select_v3_splitk_chunks(M: int) -> tuple:
+    """Pick (M_CHUNK, K_CHUNK) for V3 split-K kernel.
+
+    K_CHUNK=4096 default (best throughput per RTX bench). M_CHUNK
+    matches effective M to avoid wasted accumulator slots.
+    """
+    if M == 1:
+        m_chunk = 1
+    elif M <= 4:
+        m_chunk = 2
+    else:
+        m_chunk = 4
+    return m_chunk, 4096
+
+
+def _xfp_v3_enabled() -> bool:
+    """V3 split-K path is opt-in via XFP_V3=1. Default off — fall back
+    to V2a single-block-per-SM split-N for K > 8192.
+    """
+    return os.environ.get("XFP_V3", "0").lower() in ("1", "true", "yes", "on")
 
 
 _xfp_v2_dispatch_seen: set = set()  # First-occurrence cache (M_bucket, K, path)
@@ -369,10 +402,15 @@ def _xfp_v2_log_dispatch(M: int, K: int, path: str, m_chunk: int = 0) -> None:
         logger.info(
             "XFP-V2 dispatch [first-seen]: %s K=%d -> splitm M_CHUNK=%d",
             m_b, K, m_chunk)
+    elif path == "splitk":
+        logger.info(
+            "XFP-V2 dispatch [first-seen]: %s K=%d -> splitk V3 "
+            "(M_CHUNK=%d, K_CHUNK=4096)",
+            m_b, K, m_chunk)
     elif path == "split-N-fallback":
         logger.warning(
             "XFP-V2 dispatch [first-seen]: %s K=%d -> split-N FALLBACK "
-            "(K > %d, splitm SMEM too tight)",
+            "(K > %d, splitk unavailable)",
             m_b, K, XFP_V2_SPLITM_K_MAX)
     else:
         logger.info(
@@ -384,41 +422,62 @@ def dispatch_v2_linear_gemm(
     x_bf16, packed_repacked, library, lib_id, scale, mid, C,
     bits: int, K: int, group_size: int,
 ) -> None:
-    """Dispatch V2 Linear GEMM to split-N or split-M-internal kernel.
+    """Dispatch V2 Linear GEMM to split-N, split-M or split-K kernel.
 
     Caller is responsible for repacking ``packed`` (warp-interleaved
     layout via xfp_repack) and ensuring all tensors are contiguous + on
     the same device. C is pre-allocated [M, N] bf16.
 
     Decision matrix:
-      - M < THRESHOLD (16):              split-N (v17_lib) -- top perf
-      - M >= THRESHOLD, K <= 8192:       splitm (split-M)  -- batched
-      - M >= THRESHOLD, K  > 8192:       split-N fallback  -- splitm SMEM
-                                                              would be
-                                                              too tight
+      - K  > 8192, XFP_V3=1:             splitk (V3)       -- opt-in,
+                                                              chunked K
+      - K  > 8192, default:              split-N (V2a)     -- single
+                                                              block/SM,
+                                                              tested path
+      - M < THRESHOLD (16), K <= 8192:   split-N (v17_lib) -- top perf M=1
+      - M >= THRESHOLD,    K <= 8192:    splitm (split-M)  -- batched
     Logging: first-seen (M-bucket, K, path) emits one INFO line. Set
     ``XFP_V2_LOG=verbose`` to log every call.
     """
-    v17_lib, v17_splitm = _load_xfp_v2_kernels()
-    if v17_lib is None and v17_splitm is None:
+    v17_lib, v17_splitm, v17_splitk = _load_xfp_v2_kernels()
+    if v17_lib is None and v17_splitm is None and v17_splitk is None:
         raise RuntimeError("XFP-V2 kernels not loaded")
 
     M = int(x_bf16.shape[0])
+
+    # K > 8192: V3 split-K opt-in via XFP_V3=1, otherwise V2a fallback
+    # (single-block-per-SM split-N) — V2a is the tested path.
+    if K > XFP_V2_SPLITM_K_MAX:
+        if _xfp_v3_enabled() and v17_splitk is not None:
+            m_chunk, k_chunk = _select_v3_splitk_chunks(M)
+            _xfp_v2_log_dispatch(M, K, "splitk", m_chunk)
+            v17_splitk.xfp_gemm_v17_lib_splitk(
+                x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+                int(bits), int(K), int(group_size),
+                int(m_chunk), int(k_chunk),
+            )
+            return
+        # V2a tested fallback (Q3.6-27B K=17408, GLM K=10240).
+        if v17_lib is None:
+            raise RuntimeError(
+                "XFP-V2: K=%d > 8192 but v17_lib not loaded" % K)
+        _xfp_v2_log_dispatch(M, K, "split-N-fallback")
+        v17_lib.xfp_gemm_v17_lib(
+            x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+            int(bits), int(K), int(group_size),
+        )
+        return
+
+    # K <= 8192: split-N or split-M based on M.
     use_splitm = (
         M >= XFP_V2_SPLITM_THRESHOLD_M
-        and K <= XFP_V2_SPLITM_K_MAX
         and v17_splitm is not None
     )
     if not use_splitm:
         if v17_lib is None:
             raise RuntimeError(
                 "XFP-V2: v17_lib (split-N) not loaded for M=%d" % M)
-        path = (
-            "split-N-fallback"
-            if M >= XFP_V2_SPLITM_THRESHOLD_M and K > XFP_V2_SPLITM_K_MAX
-            else "split-N"
-        )
-        _xfp_v2_log_dispatch(M, K, path)
+        _xfp_v2_log_dispatch(M, K, "split-N")
         v17_lib.xfp_gemm_v17_lib(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size),
