@@ -62,6 +62,9 @@ def main() -> None:
         (32,  256,  2048),
         (8,   4096, 2048),
         (16,  1024, 4096),
+        # Phase 3.5 — K > 8192 cases (after K_SMEM_MAX lift to 32768)
+        (1,   5120, 17408),  # Qwen3.6-27B down_proj (decode)
+        (1,   5120, 10240),  # GLM-4.7-Flash down_proj (decode)
     ]
 
     overall_ok = True

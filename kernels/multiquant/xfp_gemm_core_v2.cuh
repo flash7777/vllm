@@ -192,7 +192,13 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
 // ─── Linear V2 policy ────────────────────────────────────────────────
 
 struct LinearPolicyV2 {
-    static constexpr int K_SMEM_MAX = 8192;
+    // Lifted from 8192 → 32768 to support dense FFN down_proj of
+    // Qwen3.6-27B (K=17408) and GLM-4.7-Flash (K=10240). Inner loop
+    // (`n_full_groups = K_packed / WARP_SIZE`) is K-agnostic; SMEM
+    // scales as 2K bytes (K=17408 → 35 KB, K=32768 → 66 KB) — fits in
+    // sm_120/121 96 KB carveout. Occupancy drops from 6 to 2-3 blocks
+    // per SM at K=17408, accepted trade for unblocking dense models.
+    static constexpr int K_SMEM_MAX = 32768;
 
     struct Params {
         int M;
