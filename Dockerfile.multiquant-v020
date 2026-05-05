@@ -61,7 +61,7 @@ WORKDIR /tmp/vllm-build
 RUN python use_existing_torch.py
 RUN sed -i '/flashinfer-python/d' requirements/cuda.txt 2>/dev/null || true && \
     sed -i '/flashinfer-python/d' pyproject.toml 2>/dev/null || true
-RUN pip install --cache-dir /pip-cache -r requirements/build.txt
+RUN pip install --cache-dir /pip-cache -r requirements/build/cuda.txt
 
 RUN pip uninstall -y vllm
 
