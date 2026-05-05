@@ -92,9 +92,15 @@ Q3.6-27B mit linear_attn K=6144 → splitm-Pfad → torch.compile fullgraph_capt
 | 35B-A3B | 76.02% (full) | **76.0%** ±6.1 | within stderr | — | ✅ |
 | 122B-A10B | n/a (>1 GPU) | **98.0%** ±2.0 | (V2 ref 94.62%) | 68.3 (-22% vs alt 138 PreV2a) | ✅ |
 | Q3.6-27B (dense) | **64.0%** ±6.86 | **58.0%** ±7.05 | -6 pp within stderr | 30.8 (+25% vs BF16 24.7) | ✅ |
-| GLM-4.7-Flash | **68.0%** ±6.66 | ❌ MLA bug | — | — | blocker |
+| GLM-4.7-Flash | **68.0%** ±6.66 | **76.0%** ±6.1 | +8 pp (n=50 noise) | 116.8 (~ BF16) | ✅ |
 
 **Wichtigster Befund:** V2a-Pfad mit K=17408 (Q3.6-27B down_proj, K_SMEM_MAX-Lift) ist **end-to-end funktional bewiesen**. Quality innerhalb stderr-Range, Throughput +25-28% vs BF16. cudaFuncSetAttribute 96 KB carveout greift.
+
+**Bonus: GLM XFP-V2a auch fertig** — MLA-Bug via `XFP_SKIP_LAYERS=kv_b_proj` (env-list, default kv_b_proj) gelöst. 47 kv_b_proj-Layer bleiben BF16 (~24 MB overhead). MLA-Absorption findet weight, kein AttributeError mehr. GSM8K n=50: V2a 76.0% vs BF16 68.0% (+8 pp, vermutlich seed-noise; n=50 ±6.1).
+
+## Alle 4 Modelle V2a-bewiesen am Tagesende
+
+Commit `6a3fea816` — `XFP_SKIP_LAYERS` env-list für MLA-Layer-Skip.
 
 ## Offene Folgeaufgaben
 

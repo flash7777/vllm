@@ -73,19 +73,19 @@
 | **Qwen3.6-27B** (dense, MM) | **BF16 (n=50)** | **64.0% ±6.86** | — | **28.6** | 96% |
 | | **XFP-V2a (n=50)** | **58.0% ±7.05** | -6 pp (within stderr) | **36.7** (+28%) | 94% |
 | **GLM-4.7-Flash** (MoE Lite) | **BF16 (n=50)** | **68.0% ±6.66** | — | **116.8** | 70% |
-| | XFP-V2a | ❌ MLA-Bug (kv_b_proj) | — | — | — |
+| | **XFP-V2a (n=50)** ✅ | **76.0% ±6.1** | +8 pp (n=50 noise) | **116.8** | 68% |
 
 ### V2 → V2a Pfad-Validation
 - **35B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
 - **122B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
 - **Q3.6-27B** (K=17408): V2a-Pfad funktional ✅ (-6 pp innerhalb stderr, +28% Throughput vs BF16)
-- **GLM** (K=10240): V2a-Pfad aktiv aber MLA blockiert separately
+- **GLM** (K=10240): V2a-Pfad funktional ✅ via XFP_SKIP_LAYERS=kv_b_proj (47 kv_b_proj layers stay BF16, ~24 MB overhead). MLA-Absorption findet weight wieder, kein AttributeError.
 
 ### Throughput-Beobachtung
 122B XFP-V2a misst 106.7 tok/s medium / 68.3 long auf RTX, vs alte Erinnerung "138 tok/s" (PreV2a). Möglicherweise Mikro-Regression durch cudaFuncSetAttribute oder custom_op-overhead. Nicht qualitäts-relevant.
 
-### GLM-MLA Inkompatibilität
-Glm4MoeLiteForCausalLM nutzt MLA — `mla_attention.py:766 process_weights_after_loading` ruft `get_and_maybe_dequant_weights(kv_b_proj)`. XFP-V2 hat `del layer.weight` gemacht und nur `xfp_packed` registriert. AttributeError: `weight`/`qweight`/`weight_packed` nicht gefunden. Vermutlich gleicher Bug wie xfpglm-serve exit(1) am 02.05. **Fix nötig**: kv_b_proj von XFP-Path ausnehmen ODER xfp_packed als `weight_packed` mit dequant-callback registrieren.
+### GLM-MLA Inkompatibilität (gefixed, commit 6a3fea816)
+Glm4MoeLiteForCausalLM nutzt MLA — `mla_attention.py:766` ruft `get_and_maybe_dequant_weights(kv_b_proj)`. XFP-V2 hatte `del layer.weight` gemacht. **Fix:** env `XFP_SKIP_LAYERS` (default `kv_b_proj`), substring-Match auf layer_prefix. Skipped layers behalten `weight` BF16 + `_xfp_skipped=True`. `apply()` short-circuit auf `F.linear`. Memory-overhead: 47 × ~0.5 MB = ~24 MB BF16, vs ~14 GB XFP-Total → vernachlässigbar.
 
 ## Lücken / Verbesserungsbedarf
 
@@ -94,7 +94,7 @@ Glm4MoeLiteForCausalLM nutzt MLA — `mla_attention.py:766 process_weights_after
 | 35B XFP-V2a full GSM8K 3 seeds | n=50 ✅, full ausstehend |
 | 122B XFP-V2a full GSM8K 3 seeds | n=50 ✅ (98.0%), full ausstehend |
 | Q3.6-27B XFP-V2a full GSM8K 3 seeds | n=50 ✅ (58.0%), full ausstehend |
-| GLM XFP-V2a | ❌ MLA-Bug — Engineering-Fix nötig |
+| GLM XFP-V2a full GSM8K 3 seeds | n=50 ✅ (76.0%), full ausstehend |
 | 122B FP8 | Modell nicht heruntergeladen (5.7M-Stub) |
 | 397B alle Quants | nur 1 Sample (RIY36% INT4) |
 | MMLU für alle | TODO mit `bench.lm-eval --tasks mmlu` (batch_size=auto fix in `fa5e6313d`) |
