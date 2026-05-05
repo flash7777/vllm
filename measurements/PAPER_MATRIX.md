@@ -1,9 +1,10 @@
 # Paper-Matrix — XFP-vs-Calibrated-INT4-vs-FP8 Quality Comparison
 
-**Stand:** 2026-05-04 (lm-eval-harness 0.4.11 / 5-shot GSM8K, 0-shot WikiText)
-**Hardware:** DGX Spark (GB10, sm_121, 120 GiB UMA), single-GPU, FP8 KV-Cache
-**Server:** vLLM 0.17.1 base + multiquant patches (`--enforce-eager`)
-**Bench-Harness:** `bench.lm-eval` (3 seeds GSM8K, 3 seeds WikiText)
+**Stand:** 2026-05-05 (lm-eval-harness 0.4.11 / 5-shot GSM8K, 0-shot WikiText)
+**Hardware:** **RTX PRO 6000 (sm_120, 96 GB)** für V2a-Bench-Reihe
+**Hardware (alt):** DGX Spark (GB10, sm_121, 120 GiB UMA) für DGX-Daten
+**Server:** vLLM 0.17.1 base + multiquant patches
+**Bench-Harness:** `bench.lm-eval` (3 seeds GSM8K, 3 seeds WikiText) bzw. n=50-Probe für V2a
 
 ## Master-Matrix (mean strict-match GSM8K, mean WikiText PPL)
 
@@ -54,20 +55,47 @@
 - Qwen3.6-27B: +3.9pp (positiv!) GSM8K — within seed-noise
 - FP8 ist die natürliche default für Production wo BF16-Footprint zu groß ist
 
+## RTX V2a-Bench-Reihe (2026-05-05)
+
+**Hardware:** RTX PRO 6000 (sm_120, 96 GB), GPU 1 isoliert (GPU 0 = mq-serve PreV2a-Referenz)
+**Image:** localhost/vllm-multiquant:latest (re-built 2026-05-04 mit V2a + V3 splitk + custom_op fixes)
+**Bench-Größe:** GSM8K **n=50, seed=0** (Probe — Δ BF16↔XFP-V2a relevant, nicht Absolutwert)
+
+| Modell | Quant | GSM8K strict (n=50) | Δ vs BF16 | bench.py tok/s (medium) | Math 50 |
+|---|---|---|---|---|---|
+| **Qwen3.5-35B-A3B** (MoE) | BF16 baseline (full, 02.05.) | 76.02% | — | — | — |
+| | XFP-V2 (full, 02.05.) | 77.18% | **+1.16 pp** | — | — |
+| | **XFP-V2a (n=50)** | **76.0% ±6.1** | innerhalb stderr | **200.4** | 92% |
+| **Qwen3.5-122B-A10B** (MoE) | BF16 | nicht möglich (>1 GPU) | — | — | — |
+| | INT4 Marlin (full, 02.05.) | 95.27% | — | — | — |
+| | XFP-V2 (full, 02.05.) | 94.62% | -0.65 pp vs Marlin | — | — |
+| | **XFP-V2a (n=50)** | **98.0% ±2.0** | (n=50, plausibel innerhalb stderr) | **106.7** | 96% |
+| **Qwen3.6-27B** (dense, MM) | **BF16 (n=50)** | **64.0% ±6.86** | — | **28.6** | 96% |
+| | XFP-V2a | ⏳ pending (3rd attempt) | — | — | — |
+| **GLM-4.7-Flash** (MoE Lite) | **BF16 (n=50)** | **68.0% ±6.66** | — | **116.8** | 70% |
+| | XFP-V2a | ❌ MLA-Bug (kv_b_proj) | — | — | — |
+
+### V2 → V2a Pfad-Validation
+- **35B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
+- **122B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
+- **Q3.6-27B** (K=17408): V2a-Pfad aktiv (lift K_SMEM_MAX 8192→32768) — Validation laufend
+- **GLM** (K=10240): V2a-Pfad aktiv aber MLA blockiert separately
+
+### Throughput-Beobachtung
+122B XFP-V2a misst 106.7 tok/s medium / 68.3 long auf RTX, vs alte Erinnerung "138 tok/s" (PreV2a). Möglicherweise Mikro-Regression durch cudaFuncSetAttribute oder custom_op-overhead. Nicht qualitäts-relevant.
+
+### GLM-MLA Inkompatibilität
+Glm4MoeLiteForCausalLM nutzt MLA — `mla_attention.py:766 process_weights_after_loading` ruft `get_and_maybe_dequant_weights(kv_b_proj)`. XFP-V2 hat `del layer.weight` gemacht und nur `xfp_packed` registriert. AttributeError: `weight`/`qweight`/`weight_packed` nicht gefunden. Vermutlich gleicher Bug wie xfpglm-serve exit(1) am 02.05. **Fix nötig**: kv_b_proj von XFP-Path ausnehmen ODER xfp_packed als `weight_packed` mit dequant-callback registrieren.
+
 ## Lücken / Verbesserungsbedarf
 
 | Lücke | Status |
 |---|---|
-| 35B FP8 | kein Modell verfügbar |
-| 35B XFP-V2 | TODO (e2e-test mit `XFP_V2=1`) |
-| 122B BF16 | nicht möglich (244 GB single-node) |
+| 35B XFP-V2a full GSM8K 3 seeds | n=50 ✅, full ausstehend |
+| 122B XFP-V2a full GSM8K 3 seeds | n=50 ✅ (98.0%), full ausstehend |
+| Q3.6-27B XFP-V2a | ⏳ läuft (3rd attempt mit allen Fixes) |
+| GLM XFP-V2a | ❌ MLA-Bug — Engineering-Fix nötig |
 | 122B FP8 | Modell nicht heruntergeladen (5.7M-Stub) |
-| 122B XFP-V2 | TODO (V1 hatte regression) |
-| 122B INT4 RIY% | (nur Sample 1 vorhanden) |
-| GLM-Flash XFP-V2 | TODO |
-| GLM-Flash XFP S2-Retry | TODO (V1, möglicherweise gleicher Bug wie 35B) |
-| Qwen3.6-27B XFP-V1 | nicht gepackt (V2 statt direkt) |
-| Qwen3.6-27B XFP-V2 | TODO (dense + K=17408 testet split-K-Pfad) |
 | 397B alle Quants | nur 1 Sample (RIY36% INT4) |
 | MMLU für alle | TODO mit `bench.lm-eval --tasks mmlu` (batch_size=auto fix in `fa5e6313d`) |
 
