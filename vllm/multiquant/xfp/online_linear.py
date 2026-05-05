@@ -586,8 +586,13 @@ class XFPLinearMethod(QuantizeMethodBase):
                 ).to(x.dtype)
                 return torch.nn.functional.linear(x, W_rec, bias)
 
-            # Kernel path
-            from vllm.multiquant.xfp.xfp_kernel import dispatch_v2_linear_gemm
+            # Kernel path — use the registered custom op so torch.compile
+            # / aot_compile sees an opaque boundary; the op internally
+            # invokes dispatch_v2_linear_gemm with the right kernel
+            # variant (split-N / splitm / splitk).
+            from vllm.multiquant.xfp.xfp_kernel import (
+                dispatch_v2_linear_gemm, xfp_v2_op,
+            )
             from vllm.multiquant.xfp.xfp_pack import xfp_repack
 
             # Lazy one-time repack to warp-interleaved layout, cached on layer.
@@ -616,22 +621,37 @@ class XFPLinearMethod(QuantizeMethodBase):
                       if reshaped_x.dtype != torch.bfloat16
                       else reshaped_x.contiguous())
 
-            C = torch.empty(
-                x_bf16.shape[0], layer._xfp_N,
-                dtype=torch.bfloat16, device=x.device,
-            )
-            dispatch_v2_linear_gemm(
-                x_bf16,
-                layer._xfp_v2_packed_repacked,
-                layer.xfp_library.data,
-                layer._xfp_v2_lib_id_int32,
-                layer.xfp_group_scale.data,
-                layer.xfp_group_mid.data,
-                C,
-                int(layer._xfp_bits),
-                int(layer._xfp_K),
-                int(layer._xfp_group_size),
-            )
+            if xfp_v2_op is not None:
+                C = xfp_v2_op(
+                    x_bf16,
+                    layer._xfp_v2_packed_repacked,
+                    layer.xfp_library.data,
+                    layer._xfp_v2_lib_id_int32,
+                    layer.xfp_group_scale.data,
+                    layer.xfp_group_mid.data,
+                    int(layer._xfp_bits),
+                    int(layer._xfp_K),
+                    int(layer._xfp_group_size),
+                    int(layer._xfp_N),
+                )
+            else:
+                # Fallback: direct dispatch (graph-break under aot_compile)
+                C = torch.empty(
+                    x_bf16.shape[0], layer._xfp_N,
+                    dtype=torch.bfloat16, device=x.device,
+                )
+                dispatch_v2_linear_gemm(
+                    x_bf16,
+                    layer._xfp_v2_packed_repacked,
+                    layer.xfp_library.data,
+                    layer._xfp_v2_lib_id_int32,
+                    layer.xfp_group_scale.data,
+                    layer.xfp_group_mid.data,
+                    C,
+                    int(layer._xfp_bits),
+                    int(layer._xfp_K),
+                    int(layer._xfp_group_size),
+                )
             if bias is not None:
                 C = C + bias.to(C.dtype)
             return C.reshape(out_shape).to(x.dtype)
