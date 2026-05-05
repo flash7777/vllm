@@ -247,6 +247,25 @@ class XFPLinearMethod(QuantizeMethodBase):
         W = layer.weight.data  # [N_out, K]
         device = W.device
 
+        # ─── Skip-list for layers that need raw BF16 weight access ──
+        # Some attention variants (e.g. GLM/DeepSeek MLA) read kv_b_proj
+        # directly in their process_weights_after_loading for absorption,
+        # via mla_attention.py's get_and_maybe_dequant_weights. XFP packs
+        # would `del layer.weight`, so MLA breaks with AttributeError.
+        # Skip configurable via XFP_SKIP_LAYERS (comma-separated substrings).
+        # Default: "kv_b_proj" — covers GLM-4.7 and DeepSeek-V2/V3 MLA.
+        import os as _skip_os
+        layer_prefix = (getattr(layer, "layer_name", None)
+                        or getattr(layer, "prefix", None) or "")
+        skip_csv = _skip_os.environ.get("XFP_SKIP_LAYERS", "kv_b_proj")
+        skip_list = [s.strip() for s in skip_csv.split(",") if s.strip()]
+        if layer_prefix and any(s in layer_prefix for s in skip_list):
+            logger.info("XFP %s: skipped (XFP_SKIP_LAYERS), staying BF16",
+                        layer_prefix)
+            layer._xfp_skipped = True
+            layer._xfp_packed_done = True
+            return
+
         # ─── XFP-V2 branch — per-group + shared codebook library ──
         # Gated on env XFP_V2=1. Pack/cache uses the existing reuse map
         # (see doc/xfp/v2_codebook_library.md). Apply path falls back to
@@ -565,6 +584,13 @@ class XFPLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # ─── Skip-list bypass: layers in XFP_SKIP_LAYERS keep raw BF16 ──
+        # MLA absorption (mla_attention.py) reads kv_b_proj.weight before
+        # XFP can dequant. We left the BF16 weight intact in
+        # process_weights_after_loading, so just call F.linear here.
+        if getattr(layer, "_xfp_skipped", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
         # XFP-V2 kernel dispatch: split-N (v17_lib) for M < 16, split-M-internal
         # (v17_lib_splitm) for M >= 16 with K-adaptive M_CHUNK. Set
         # XFP_V2_KERNEL=0 to fall back to the Python reference (slow, used
