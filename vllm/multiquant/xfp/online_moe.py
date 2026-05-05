@@ -215,12 +215,10 @@ def _xfp_moe_v2_forward(
         int(bits), int(K13), int(N13), int(group_size),
         int(topk), int(fpe13), int(num_valid),
     )
-    torch.cuda.synchronize()  # DIAG: surface kernel errors at exact site
 
     # SiLU+mul
     activated = torch.empty(BT, half_n, dtype=torch.bfloat16, device=x.device)
     torch.ops._C.silu_and_mul(activated, gate_up)
-    torch.cuda.synchronize()  # DIAG
 
     # Down — applies topk weight in epilogue
     down = torch.zeros(BT, N2, dtype=torch.bfloat16, device=x.device)
