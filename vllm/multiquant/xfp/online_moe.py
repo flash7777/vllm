@@ -155,7 +155,7 @@ def _xfp_moe_v2_forward(
 ) -> torch.Tensor:
     """V2 MoE forward — direct kernel path, no dequant."""
     from vllm.multiquant.xfp.xfp_kernel import _load_xfp_v2_kernels
-    _, _ = _load_xfp_v2_kernels()  # ensure loaded
+    _load_xfp_v2_kernels()  # ensure loaded (returns 3-tuple post-V3)
     # MoE V2 kernel is loaded separately
     import os as _os
     from torch.utils.cpp_extension import load as _cpp_load
