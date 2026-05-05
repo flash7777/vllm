@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.utils.torch_utils import is_torch_equal
+from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
 class ConvLayerBase(CustomOp):
@@ -252,13 +252,16 @@ class Conv3dLayer(ConvLayerBase):
             return self._forward_conv(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # PyTorch2.9.0 disabled CUDNN's Conv3D, which caused a
+        # PyTorch 2.9.0+ disabled CUDNN's Conv3D, which caused a
         # significant performance regression.
         # See: https://github.com/vllm-project/vllm/issues/27406
         # and https://github.com/pytorch/pytorch/issues/166122
+        # and https://github.com/huggingface/transformers/pull/45041
         # By default, we use CUDNN's convolution ops with optimization.
+        # MultiQuant: also trigger matmul fallback on SM12+ (Blackwell)
+        # regardless of torch version — sm_120/121 has cuDNN Conv3D issues.
         if self.enable_linear and (
-            is_torch_equal("2.9.0") or is_torch_equal("2.9.1")
+            is_torch_equal_or_newer("2.9.0")
             or torch.cuda.get_device_capability()[0] >= 12
         ):
             if not getattr(self, '_logged_mulmat', False):
