@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+import torch
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -366,12 +368,18 @@ def _xfp_v3_enabled() -> bool:
 _xfp_v2_dispatch_seen: set = set()  # First-occurrence cache (M_bucket, K, path)
 
 
+@torch.compiler.disable
 def _xfp_v2_log_dispatch(M: int, K: int, path: str, m_chunk: int = 0) -> None:
     """Log V2 dispatch decision once per (M-bucket, K, path) combination.
 
     Default: first-seen logging — emits one INFO per shape so we can
     confirm in benchmark logs which kernel served which layer-class.
     Set ``XFP_V2_LOG=verbose`` to log every call (very chatty).
+
+    Decorated ``@torch.compiler.disable`` because logger.info is not
+    traceable by torch.dynamo — without this, every first-seen layer
+    triggers a graph break in aot_compile (gb0291) and crashes engine
+    init under vLLM 0.17 cuda-graph capture.
     """
     if os.environ.get("XFP_V2_LOG", "").lower() in ("verbose", "v"):
         if path == "splitm":
