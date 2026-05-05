@@ -87,12 +87,14 @@ Q3.6-27B mit linear_attn K=6144 → splitm-Pfad → torch.compile fullgraph_capt
 
 ## Stand am Ende des Tages
 
-| Modell | BF16 (n=50) | XFP-V2a (n=50) | Δ | Status |
-|---|---|---|---|---|
-| 35B-A3B | 76.02% (full) | **76.0%** ±6.1 | within stderr | ✅ |
-| 122B-A10B | n/a (>1 GPU) | **98.0%** ±2.0 | (V2 ref 94.62%) | ✅ |
-| Q3.6-27B (dense) | **64.0%** ±6.86 | ⏳ | — | loading |
-| GLM-4.7-Flash | **68.0%** ±6.66 | ❌ MLA bug | — | blocker |
+| Modell | BF16 (n=50) | XFP-V2a (n=50) | Δ | tok/s long Δ | Status |
+|---|---|---|---|---|---|
+| 35B-A3B | 76.02% (full) | **76.0%** ±6.1 | within stderr | — | ✅ |
+| 122B-A10B | n/a (>1 GPU) | **98.0%** ±2.0 | (V2 ref 94.62%) | 68.3 (-22% vs alt 138 PreV2a) | ✅ |
+| Q3.6-27B (dense) | **64.0%** ±6.86 | **58.0%** ±7.05 | -6 pp within stderr | 30.8 (+25% vs BF16 24.7) | ✅ |
+| GLM-4.7-Flash | **68.0%** ±6.66 | ❌ MLA bug | — | — | blocker |
+
+**Wichtigster Befund:** V2a-Pfad mit K=17408 (Q3.6-27B down_proj, K_SMEM_MAX-Lift) ist **end-to-end funktional bewiesen**. Quality innerhalb stderr-Range, Throughput +25-28% vs BF16. cudaFuncSetAttribute 96 KB carveout greift.
 
 ## Offene Folgeaufgaben
 

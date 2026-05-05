@@ -71,14 +71,14 @@
 | | XFP-V2 (full, 02.05.) | 94.62% | -0.65 pp vs Marlin | — | — |
 | | **XFP-V2a (n=50)** | **98.0% ±2.0** | (n=50, plausibel innerhalb stderr) | **106.7** | 96% |
 | **Qwen3.6-27B** (dense, MM) | **BF16 (n=50)** | **64.0% ±6.86** | — | **28.6** | 96% |
-| | XFP-V2a | ⏳ pending (3rd attempt) | — | — | — |
+| | **XFP-V2a (n=50)** | **58.0% ±7.05** | -6 pp (within stderr) | **36.7** (+28%) | 94% |
 | **GLM-4.7-Flash** (MoE Lite) | **BF16 (n=50)** | **68.0% ±6.66** | — | **116.8** | 70% |
 | | XFP-V2a | ❌ MLA-Bug (kv_b_proj) | — | — | — |
 
 ### V2 → V2a Pfad-Validation
 - **35B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
 - **122B** (K ≤ 4096): V2a == V2 algorithmisch, n=50 Probe innerhalb stderr ✅
-- **Q3.6-27B** (K=17408): V2a-Pfad aktiv (lift K_SMEM_MAX 8192→32768) — Validation laufend
+- **Q3.6-27B** (K=17408): V2a-Pfad funktional ✅ (-6 pp innerhalb stderr, +28% Throughput vs BF16)
 - **GLM** (K=10240): V2a-Pfad aktiv aber MLA blockiert separately
 
 ### Throughput-Beobachtung
@@ -93,7 +93,7 @@ Glm4MoeLiteForCausalLM nutzt MLA — `mla_attention.py:766 process_weights_after
 |---|---|
 | 35B XFP-V2a full GSM8K 3 seeds | n=50 ✅, full ausstehend |
 | 122B XFP-V2a full GSM8K 3 seeds | n=50 ✅ (98.0%), full ausstehend |
-| Q3.6-27B XFP-V2a | ⏳ läuft (3rd attempt mit allen Fixes) |
+| Q3.6-27B XFP-V2a full GSM8K 3 seeds | n=50 ✅ (58.0%), full ausstehend |
 | GLM XFP-V2a | ❌ MLA-Bug — Engineering-Fix nötig |
 | 122B FP8 | Modell nicht heruntergeladen (5.7M-Stub) |
 | 397B alle Quants | nur 1 Sample (RIY36% INT4) |
