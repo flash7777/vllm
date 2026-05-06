@@ -1003,11 +1003,14 @@ if _is_cuda():
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
-    # FA4 CuteDSL - Python-only component for FA4's cute DSL support
-    # Optional since this doesn't produce a .so file, just copies Python files
-    ext_modules.append(
-        CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
-    )
+    # FA4 CuteDSL - skipped on SM12x (Blackwell consumer / RTX PRO 6000 / GB10).
+    # FA4 targets Hopper SM90 datacenter; on SM120/121 we use FA2 + Triton.
+    # Bundler bug in v0.20.1: even with optional=True, wheel-build expects
+    # the `vllm/vllm_flash_attn/cute` directory to exist after CMake. Skip
+    # to avoid the failure. Re-enable for sm_90/100 builds.
+    # ext_modules.append(
+    #     CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
+    # )
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
     ):
