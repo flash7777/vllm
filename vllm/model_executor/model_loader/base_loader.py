@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -117,6 +118,10 @@ class BaseModelLoader(ABC):
                     scope="local",
                 )
 
+            # Upstream v0.20.1: layerwise online-quant finalization
+            if _has_online_quant(model):
+                finalize_layerwise_processing(model, model_config)
+
             process_weights_after_loading(model, model_config, target_device)
 
             # Finalize cache (write manifest + log summary + dump
@@ -147,6 +152,15 @@ class BaseModelLoader(ABC):
                 sys.exit(0)
 
         return model.eval()
+
+
+def _has_online_quant(model: nn.Module) -> bool:
+    """Upstream v0.20.1: detect online-quant via uses_meta_device flag."""
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if getattr(quant_method, "uses_meta_device", False):
+            return True
+    return False
 
 
 def log_model_inspection(model: nn.Module) -> None:
