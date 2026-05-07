@@ -12,11 +12,16 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+import vllm.envs as _vllm_envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
+
+
+def vllm_is_batch_invariant() -> bool:
+    """v0.20.1 removed this helper — keep multiquant call sites working."""
+    return bool(_vllm_envs.VLLM_BATCH_INVARIANT)
+
+
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,

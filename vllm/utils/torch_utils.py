@@ -868,14 +868,22 @@ class LayerName(OpaqueBase):  # type: ignore[misc]
     def __hash__(self):
         return hash(self.value)
 
+    def __repr__(self):
+        return f"LayerName({self.value!r})"
+
     def __fx_repr__(self):
         return (f"LayerName({self.value!r})", {"LayerName": LayerName})
 
 
 if HAS_OPAQUE_TYPE:
-    from torch._library.opaque_object import register_opaque_type
-
-    register_opaque_type(LayerName, typ="value", hoist=True)
+    try:
+        from torch._library.opaque_object import register_opaque_type
+        try:
+            register_opaque_type(LayerName, typ="value", hoist=True)
+        except TypeError:
+            register_opaque_type(LayerName, typ="value")
+    except (ImportError, ModuleNotFoundError):
+        pass
 
 # On torch >= 2.11 (with VLLM_USE_LAYERNAME enabled), custom op
 # layer_name parameters use LayerName; otherwise they remain plain str.

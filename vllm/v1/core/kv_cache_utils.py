@@ -4,6 +4,7 @@
 
 import copy
 import hashlib
+import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -1794,3 +1795,72 @@ class BlockHashListWithBlockSize:
 
 
 BlockHashList = list[BlockHash] | BlockHashListWithBlockSize
+
+
+# v0.20.1 compat: upstream introduced resolve_kv_cache_block_sizes used
+# by the scheduler. Re-add for compatibility with v0.20.1-merged callers.
+def resolve_kv_cache_block_sizes(
+    kv_cache_config: KVCacheConfig,
+    vllm_config: VllmConfig,
+) -> tuple[int, int]:
+    """Resolve (scheduler_block_size, hash_block_size).
+
+    - ``scheduler_block_size`` is the token-alignment invariant used by the
+      scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
+      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
+      group's block size — context parallelism is not supported here.
+    - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
+      is computed. Single group: equals scheduler block size. Multiple groups:
+      ``cache_config.hash_block_size`` override if set, else the GCD of group
+      block sizes; every group's block size must be divisible by it. Returns
+      the scheduler block size (i.e. disables finer hashing) if block hashing
+      is inactive or a mamba group's block size diverges from the cache
+      block size (mamba_cache_mode != "align").
+    """
+    cache_config = vllm_config.cache_config
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
+    groups = kv_cache_config.kv_cache_groups
+
+    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
+        bs = cache_config.block_size * dcp * pcp
+        return bs, bs
+
+    if dcp != 1 or pcp != 1:
+        raise ValueError(
+            "Hybrid KV cache groups with multiple block sizes do not "
+            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+        )
+
+    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    scheduler_block_size = math.lcm(*group_block_sizes)
+
+    # Block hashes are only consumed by prefix caching and KV connectors
+    # (P/D, offloading); when neither is active, keep hash_block_size equal
+    # to the scheduler block size.
+    connector_enabled = vllm_config.kv_transfer_config is not None
+    if not (cache_config.enable_prefix_caching or connector_enabled):
+        return scheduler_block_size, scheduler_block_size
+
+    # Mamba groups with block_size != cache_config.block_size
+    # (mamba_cache_mode != "align") break divisibility; back off to the
+    # scheduler block size.
+    if any(
+        isinstance(g.kv_cache_spec, MambaSpec)
+        and g.kv_cache_spec.block_size != cache_config.block_size
+        for g in groups
+    ):
+        return scheduler_block_size, scheduler_block_size
+
+    requested = cache_config.hash_block_size
+    hash_block_size = (
+        requested if requested is not None else math.gcd(*group_block_sizes)
+    )
+    if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+        raise ValueError(
+            f"Invalid hash_block_size={hash_block_size}; all KV cache group "
+            f"block sizes must be divisible by hash_block_size. "
+            f"Got group block sizes={group_block_sizes}."
+        )
+    return scheduler_block_size, hash_block_size
+

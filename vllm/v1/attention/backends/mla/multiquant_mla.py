@@ -422,9 +422,8 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
             decompressed[used_pages] = x_recon_pages
 
         # Now delegate to Triton MLA decode with decompressed BF16 cache
-        from vllm.model_executor.layers.batch_invariant import (
-            vllm_is_batch_invariant,
-        )
+        # v0.20.1: vllm_is_batch_invariant() removed — use envs.VLLM_BATCH_INVARIANT
+        import vllm.envs as _envs
         from vllm.v1.attention.ops.triton_decode_attention import (
             decode_attention_fwd,
         )
@@ -435,7 +434,7 @@ class MultiQuantMLAImpl(MLACommonImpl[MLACommonMetadata]):
             B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=device
         )
         lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=device)
-        num_kv_splits = 1 if vllm_is_batch_invariant() else 4
+        num_kv_splits = 1 if _envs.VLLM_BATCH_INVARIANT else 4
         attn_logits = torch.empty(
             (B, q_num_heads, num_kv_splits, self.kv_lora_rank + 1),
             dtype=torch.float32, device=device,
