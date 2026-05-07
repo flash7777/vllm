@@ -128,6 +128,17 @@ new='        return (f\"ModuleName({self.value!r})\", {\"ModuleName\": ModuleNam
 import sys; \
 sys.exit(0) if old not in t else (open(p,'w').write(t.replace(old,new)) or print('__fx_repr__ patched'))"
 
+# v0.20.1: torch.compile codegen ruft repr(LayerName_instance), upstream
+# hat nur __fx_repr__ — fügen __repr__ hinzu damit codegen ein gültiges
+# Python-expression bekommt. Ohne: SyntaxError oder NameError beim exec.
+RUN python3 -c "\
+p='/usr/local/lib/python3.12/dist-packages/vllm/utils/torch_utils.py'; \
+t=open(p).read(); \
+old='    def __fx_repr__(self):\n        return (f\"LayerName({self.value!r})\", {\"LayerName\": LayerName})'; \
+new='    def __repr__(self):\n        return f\"LayerName({self.value!r})\"\n\n    def __fx_repr__(self):\n        return (f\"LayerName({self.value!r})\", {\"LayerName\": LayerName})'; \
+import sys; \
+sys.exit(0) if old not in t else (open(p,'w').write(t.replace(old,new)) or print('LayerName __repr__ patched'))"
+
 # ─── transformers 5.x ────────────────────────────────────────
 RUN pip install --cache-dir /pip-cache --no-deps "transformers>=5.2" && \
     pip install --cache-dir /pip-cache --upgrade "huggingface_hub>=0.32" && \
@@ -150,6 +161,10 @@ COPY build/moe-configs/*.json /usr/local/lib/python3.12/dist-packages/vllm/model
 ENV FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a"
 ENV RAY_memory_monitor_refresh_ms=0
 ENV RAY_object_store_memory=1073741824
+# Default-disable LayerName: torch.compile codegen on NGC torch 2.11 has
+# repr/exec issues; multiquant doesn't need the hoisted opaque type.
+# Override at runtime via -e VLLM_USE_LAYERNAME=1 if your model needs it.
+ENV VLLM_USE_LAYERNAME=0
 
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2/typing 2>/dev/null || true
 RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
