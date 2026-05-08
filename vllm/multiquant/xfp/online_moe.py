@@ -60,6 +60,11 @@ def _xfp_moe_forward_impl(
     half_n = N13 // 2
     BT = B * topk
 
+    # Empty-batch guard: a profile-run dummy with B=0 would launch the
+    # downstream xfp_moe_gemm with grid (0,) and trigger cudaErrorInvalidValue.
+    if BT == 0:
+        return torch.zeros(B, N2, dtype=torch.bfloat16, device=x.device)
+
     x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
     no_w = torch.empty(0, dtype=torch.float32, device=x.device)
 
