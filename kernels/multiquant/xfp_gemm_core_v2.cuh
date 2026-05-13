@@ -62,21 +62,30 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     int G, int group_size, int library_size,
     typename PolicyV2::Params params)
 {
-    static_assert(BITS == 4,
-                  "xfp_gemm_core_v2: only BITS=4 supported in v17_lib v1");
-    constexpr int VALS_PER_WORD = 8;     // BITS=4
-    constexpr uint32_t MASK = 0x0fu;
-    constexpr int LUT_SIZE = 16;
+    static_assert(BITS == 2 || BITS == 4,
+                  "xfp_gemm_core_v2: BITS must be 2, 3, or 4");
+    // BITS=2 → 16 vals/word (LUT=4), BITS=3 → 10 vals/word (LUT=8),
+    // BITS=4 → 8 vals/word (LUT=16). BITS=3 wastes 2 bits/word.
+    constexpr int VALS_PER_WORD = (BITS == 2) ? 16 : 8;
+    constexpr uint32_t MASK = (1u << BITS) - 1u;
+    constexpr int LUT_SIZE = (1 << BITS);
 
     int warp_id = threadIdx.x / XFP_WARP_SIZE;
     int lane    = threadIdx.x % XFP_WARP_SIZE;
 
     // Lane-subgroup partitioning. For BITS=4, LUT_SIZE=16, WARP_SIZE=32:
     // 2 lane-subgroups (codebooks) per warp outer iter → CB_PER_ITER = 2.
-    constexpr int CB_PER_ITER     = XFP_WARP_SIZE / LUT_SIZE;  // = 2
+    // GROUP_SIZE hardcoded to 128 (host TORCH_CHECK enforces this).
+    // For BITS=4: VALS_PER_WORD=8, LANES_PER_GROUP=16 (=LUT_SIZE, coincidence).
+    // For BITS=2: VALS_PER_WORD=16, LANES_PER_GROUP=8 (<LUT_SIZE — lane
+    // duplicates within each codebook subgroup; shuffle uses
+    // cb_lane_offset+idx, only first LUT_SIZE lanes hold distinct values).
+    constexpr int GROUP_SIZE      = 128;
+    constexpr int LANES_PER_GROUP = GROUP_SIZE / VALS_PER_WORD;
+    constexpr int CB_PER_ITER     = XFP_WARP_SIZE / LANES_PER_GROUP;
     const int my_cb_idx           = lane % LUT_SIZE;            // 0..15
-    const int lane_group          = lane / LUT_SIZE;            // 0 or 1
-    const int cb_lane_offset      = lane_group * LUT_SIZE;      // 0 or 16
+    const int lane_group          = lane / LANES_PER_GROUP;            // 0 or 1
+    const int cb_lane_offset      = lane_group * LANES_PER_GROUP;      // 0 or 16
 
     // ── Dynamic SMEM layout ──
     // [0]            s_A        : K * sizeof(bf16)

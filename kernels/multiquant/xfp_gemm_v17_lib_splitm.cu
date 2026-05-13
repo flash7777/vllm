@@ -90,7 +90,8 @@ void xfp_gemm_v17_lib_splitm(
                 "group_mid must be float16");
     TORCH_CHECK(C.dtype() == torch::kBFloat16, "C must be bfloat16");
     TORCH_CHECK(K % 2 == 0, "K must be even (bf162 vector load)");
-    TORCH_CHECK(bits == 4, "split-M v1: only BITS=4 supported");
+    TORCH_CHECK(bits == 2 || bits == 4,
+                "split-M v17_lib: only BITS=2 or 4 supported, got ", bits);
     TORCH_CHECK(group_size == 128,
                 "split-M v1: only group_size=128 supported, got ", group_size);
     TORCH_CHECK(K % group_size == 0, "K not divisible by group_size");
@@ -99,34 +100,34 @@ void xfp_gemm_v17_lib_splitm(
     int N = static_cast<int>(group_scale.size(0));
     int G = static_cast<int>(group_scale.size(1));
     int library_size = static_cast<int>(library.size(0));
-    int K_packed = (static_cast<int>(K) + 7) / 8;  // bits=4 → 8 vals/word
+    int vals_per_word = (bits == 2) ? 16 : 8;
+    int K_packed = (static_cast<int>(K) + vals_per_word - 1) / vals_per_word;
 
     TORCH_CHECK(library_size <= XFP_V2_LIBRARY_MAX, "library_size > MAX");
 
     int kK = static_cast<int>(K);
     int gs = static_cast<int>(group_size);
 
-    switch (m_chunk) {
-        case 2:
-            launch_splitm<4, 2>(A, B_packed, library, group_lib_id, group_scale,
-                                group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-            break;
-        case 4:
-            launch_splitm<4, 4>(A, B_packed, library, group_lib_id, group_scale,
-                                group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-            break;
-        case 8:
-            launch_splitm<4, 8>(A, B_packed, library, group_lib_id, group_scale,
-                                group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-            break;
-        case 16:
-            launch_splitm<4, 16>(A, B_packed, library, group_lib_id, group_scale,
-                                 group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-            break;
-        default:
-            TORCH_CHECK(false, "unsupported m_chunk: ", m_chunk,
-                        " (supported: 2, 4, 8, 16)");
+#define LAUNCH_SPLITM(BITS_, MC_) \
+    launch_splitm<BITS_, MC_>(A, B_packed, library, group_lib_id, group_scale, \
+                              group_mid, C, kK, N, K_packed, G, gs, library_size, M)
+#define DISPATCH_MC(BITS_) \
+    switch (m_chunk) { \
+        case 2:  LAUNCH_SPLITM(BITS_, 2);  break; \
+        case 4:  LAUNCH_SPLITM(BITS_, 4);  break; \
+        case 8:  LAUNCH_SPLITM(BITS_, 8);  break; \
+        case 16: LAUNCH_SPLITM(BITS_, 16); break; \
+        default: \
+            TORCH_CHECK(false, "unsupported m_chunk: ", m_chunk, \
+                        " (supported: 2, 4, 8, 16)"); \
     }
+    switch (bits) {
+        case 2: DISPATCH_MC(2); break;
+        case 4: DISPATCH_MC(4); break;
+        default: TORCH_CHECK(false, "unreachable");
+    }
+#undef DISPATCH_MC
+#undef LAUNCH_SPLITM
 }
 
 }  // namespace multiquant

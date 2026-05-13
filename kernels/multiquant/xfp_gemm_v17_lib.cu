@@ -31,7 +31,7 @@ static void launch_linear_v2(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Dynamic SMEM: s_A (K * bf16) + s_library (library_size * 16 * fp16).
-    constexpr int LUT = 16;  // BITS=4
+    constexpr int LUT = (1 << BITS);  // bits-dependent codebook size
     size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16)
                       + static_cast<size_t>(library_size) * LUT * sizeof(__half);
 
@@ -96,7 +96,8 @@ void xfp_gemm_v17_lib(
     TORCH_CHECK(K <= LinearPolicyV2::K_SMEM_MAX,
                 "xfp_gemm_v17_lib: K=", K, " exceeds K_SMEM_MAX=",
                 LinearPolicyV2::K_SMEM_MAX);
-    TORCH_CHECK(bits == 4, "xfp_gemm_v17_lib v1: only BITS=4 supported");
+    TORCH_CHECK(bits == 2 || bits == 4,
+                "xfp_gemm_v17_lib: only BITS=2 or 4 supported, got ", bits);
     TORCH_CHECK(group_size == 128,
                 "xfp_gemm_v17_lib v1: only group_size=128 supported, got ",
                 group_size);
@@ -107,7 +108,7 @@ void xfp_gemm_v17_lib(
     int N = static_cast<int>(group_scale.size(0));
     int G = static_cast<int>(group_scale.size(1));
     int library_size = static_cast<int>(library.size(0));
-    int vals_per_word = 8;  // bits=4
+    int vals_per_word = (bits == 2) ? 16 : 8;
     int K_packed = (static_cast<int>(K) + vals_per_word - 1) / vals_per_word;
 
     TORCH_CHECK(library_size <= XFP_V2_LIBRARY_MAX,
@@ -117,9 +118,20 @@ void xfp_gemm_v17_lib(
                 "group_lib_id shape mismatch: expected [N=", N, ", G=", G,
                 "], got [", group_lib_id.size(0), ", ", group_lib_id.size(1), "]");
 
-    launch_linear_v2<4>(A, B_packed, library, group_lib_id, group_scale,
-                        group_mid, C, static_cast<int>(K), N, K_packed,
-                        G, static_cast<int>(group_size), library_size);
+    switch (bits) {
+        case 2:
+            launch_linear_v2<2>(A, B_packed, library, group_lib_id, group_scale,
+                                group_mid, C, static_cast<int>(K), N, K_packed,
+                                G, static_cast<int>(group_size), library_size);
+            break;
+        case 4:
+            launch_linear_v2<4>(A, B_packed, library, group_lib_id, group_scale,
+                                group_mid, C, static_cast<int>(K), N, K_packed,
+                                G, static_cast<int>(group_size), library_size);
+            break;
+        default:
+            TORCH_CHECK(false, "unreachable");
+    }
 }
 
 }  // namespace multiquant

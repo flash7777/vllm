@@ -102,7 +102,8 @@ void xfp_gemm_v17_lib_splitk(
                 "group_mid must be float16");
     TORCH_CHECK(C.dtype() == torch::kBFloat16, "C must be bfloat16");
     TORCH_CHECK(K % 2 == 0, "K must be even (bf162 vector load)");
-    TORCH_CHECK(bits == 4, "split-K v1: only BITS=4 supported");
+    TORCH_CHECK(bits == 2 || bits == 4,
+                "split-K v17_lib: only BITS=2 or 4 supported, got ", bits);
     TORCH_CHECK(group_size == 128,
                 "split-K v1: only group_size=128 supported, got ", group_size);
     TORCH_CHECK(K % group_size == 0, "K not divisible by group_size");
@@ -113,7 +114,8 @@ void xfp_gemm_v17_lib_splitk(
     int N = static_cast<int>(group_scale.size(0));
     int G = static_cast<int>(group_scale.size(1));
     int library_size = static_cast<int>(library.size(0));
-    int K_packed = (static_cast<int>(K) + 7) / 8;  // bits=4 → 8 vals/word
+    int vals_per_word = (bits == 2) ? 16 : 8;
+    int K_packed = (static_cast<int>(K) + vals_per_word - 1) / vals_per_word;
 
     TORCH_CHECK(library_size <= XFP_V2_LIBRARY_MAX, "library_size > MAX");
 
@@ -123,43 +125,32 @@ void xfp_gemm_v17_lib_splitk(
     // Dispatch on (M_CHUNK, K_CHUNK) combinations.
     // M_CHUNK ∈ {1, 2, 4}: 1 for single-stream M=1, 2/4 for batched.
     // K_CHUNK ∈ {2048, 4096}: 4096 default, 2048 fallback for very large M.
-    if (k_chunk == 4096) {
-        switch (m_chunk) {
-            case 1:
-                launch_splitk<4, 1, 4096>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            case 2:
-                launch_splitk<4, 2, 4096>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            case 4:
-                launch_splitk<4, 4, 4096>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            default:
-                TORCH_CHECK(false, "split-K v1: unsupported m_chunk=", m_chunk,
-                            " for k_chunk=4096 (supported: 1, 2, 4)");
-        }
-    } else {  // k_chunk == 2048
-        switch (m_chunk) {
-            case 1:
-                launch_splitk<4, 1, 2048>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            case 2:
-                launch_splitk<4, 2, 2048>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            case 4:
-                launch_splitk<4, 4, 2048>(A, B_packed, library, group_lib_id,
-                    group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M);
-                break;
-            default:
-                TORCH_CHECK(false, "split-K v1: unsupported m_chunk=", m_chunk,
-                            " for k_chunk=2048 (supported: 1, 2, 4)");
-        }
+#define LAUNCH_SK(BITS_, MC_, KC_) \
+        launch_splitk<BITS_, MC_, KC_>(A, B_packed, library, group_lib_id, \
+            group_scale, group_mid, C, kK, N, K_packed, G, gs, library_size, M)
+#define DISPATCH_MC_KC(BITS_) \
+    if (k_chunk == 4096) { \
+        switch (m_chunk) { \
+            case 1: LAUNCH_SK(BITS_, 1, 4096); break; \
+            case 2: LAUNCH_SK(BITS_, 2, 4096); break; \
+            case 4: LAUNCH_SK(BITS_, 4, 4096); break; \
+            default: TORCH_CHECK(false, "split-K: unsupported m_chunk=", m_chunk); \
+        } \
+    } else { \
+        switch (m_chunk) { \
+            case 1: LAUNCH_SK(BITS_, 1, 2048); break; \
+            case 2: LAUNCH_SK(BITS_, 2, 2048); break; \
+            case 4: LAUNCH_SK(BITS_, 4, 2048); break; \
+            default: TORCH_CHECK(false, "split-K: unsupported m_chunk=", m_chunk); \
+        } \
     }
+    switch (bits) {
+        case 2: DISPATCH_MC_KC(2); break;
+        case 4: DISPATCH_MC_KC(4); break;
+        default: TORCH_CHECK(false, "unreachable");
+    }
+#undef DISPATCH_MC_KC
+#undef LAUNCH_SK
 }
 
 }  // namespace multiquant

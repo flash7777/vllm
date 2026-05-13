@@ -60,6 +60,11 @@ def _xfp_moe_forward_impl(
     half_n = N13 // 2
     BT = B * topk
 
+    # Empty-batch guard: a profile-run dummy with B=0 would launch the
+    # downstream xfp_moe_gemm with grid (0,) and trigger cudaErrorInvalidValue.
+    if BT == 0:
+        return torch.zeros(B, N2, dtype=torch.bfloat16, device=x.device)
+
     x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
     no_w = torch.empty(0, dtype=torch.float32, device=x.device)
 
@@ -155,7 +160,7 @@ def _xfp_moe_v2_forward(
 ) -> torch.Tensor:
     """V2 MoE forward — direct kernel path, no dequant."""
     from vllm.multiquant.xfp.xfp_kernel import _load_xfp_v2_kernels
-    _, _ = _load_xfp_v2_kernels()  # ensure loaded
+    _ = _load_xfp_v2_kernels()  # ensure loaded (3-tuple in HEAD)
     # MoE V2 kernel is loaded separately
     import os as _os
     from torch.utils.cpp_extension import load as _cpp_load
@@ -215,12 +220,10 @@ def _xfp_moe_v2_forward(
         int(bits), int(K13), int(N13), int(group_size),
         int(topk), int(fpe13), int(num_valid),
     )
-    torch.cuda.synchronize()  # DIAG: surface kernel errors at exact site
 
     # SiLU+mul
     activated = torch.empty(BT, half_n, dtype=torch.bfloat16, device=x.device)
     torch.ops._C.silu_and_mul(activated, gate_up)
-    torch.cuda.synchronize()  # DIAG
 
     # Down — applies topk weight in epilogue
     down = torch.zeros(BT, N2, dtype=torch.bfloat16, device=x.device)
@@ -308,7 +311,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
         # ─── XFP-V2 MoE branch — env-gated, shared library across experts ──
         # Mirrors online_linear's _process_v2 path.
         import os as _v2_os
-        if _v2_os.environ.get("XFP_V2", "0") == "1":
+        if int(_v2_os.environ.get("XFP_V2", "0") or 0) >= 1:
             return self._process_moe_v2(layer)
 
         from vllm.multiquant.xfp.xfp_pack import xfp_pack, xfp_repack
@@ -388,15 +391,28 @@ class XFPMoEMethod(FusedMoEMethodBase):
             se_env = int(os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
             sample_experts = E if se_env == 0 else min(se_env, E)
             sample = w13[:sample_experts].reshape(-1, w13.shape[2]).float()
+            # MoE routed experts = "lazy" class: tolerant of more
+            # aggressive compression than attention. XFP_MIN_COS_LAZY
+            # overrides the linear-path strict cos (linear uses
+            # XFP_MIN_COS_STRICT). Legacy XFP_MIN_COS works for both.
+            _lazy_min_cos = float(
+                os.environ.get("XFP_MIN_COS_LAZY",
+                               os.environ.get("XFP_MIN_COS",
+                                              str(self.quant_config.auto_min_cos
+                                                  if hasattr(self.quant_config,
+                                                             'auto_min_cos')
+                                                  else 0.98)))
+            )
+            # V1 MoE kernel supports BITS=2/3/4 natively.
             bits = xfp_auto_select(
                 sample,
                 candidates=(2, 3, 4),
-                min_cos=self.quant_config.auto_min_cos
-                    if hasattr(self.quant_config, 'auto_min_cos') else 0.98,
+                min_cos=_lazy_min_cos,
                 lloyd_iters=moe_lloyd_iters,
             )
             logger.info("XFP MoE auto-select: bits=%d (from %d/%d expert sample, "
-                        "lloyd=%d)", bits, sample_experts, E, moe_lloyd_iters)
+                        "lloyd=%d, min_cos=%.4f)", bits, sample_experts, E,
+                        moe_lloyd_iters, _lazy_min_cos)
             # Sample kann bei sample_experts=E mehrere GB belegen → explizit
             # freigeben bevor die teure Packing-Stufe den HBM braucht.
             del sample
@@ -576,7 +592,7 @@ class XFPMoEMethod(FusedMoEMethodBase):
                 pass
             return
 
-        bits = self.bits if self.bits != 0 else 4
+        bits = self.bits
         group_size = int(_os.environ.get("XFP_GROUP_SIZE", "128"))
         library_size = int(_os.environ.get("XFP_LIBRARY_SIZE", "32"))
 
@@ -588,6 +604,41 @@ class XFPMoEMethod(FusedMoEMethodBase):
         K2 = int(w2.shape[2])
         N2 = int(w2.shape[1])
         E = int(w13.shape[0])
+
+        # Auto-bits in V2 MoE: MoE = lazy class → XFP_MIN_COS_LAZY (fallback
+        # XFP_MIN_COS, then quant_config.auto_min_cos). Same pattern as V1.
+        if bits == 0:
+            from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
+            se_env = int(_os.environ.get("XFP_MOE_SAMPLE_EXPERTS", "4"))
+            sample_experts = E if se_env == 0 else min(se_env, E)
+            sample = w13[:sample_experts].reshape(-1, w13.shape[2]).float()
+            _lazy_min_cos = float(
+                _os.environ.get("XFP_MIN_COS_LAZY",
+                               _os.environ.get("XFP_MIN_COS",
+                                              str(self.quant_config.auto_min_cos
+                                                  if hasattr(self.quant_config,
+                                                             'auto_min_cos')
+                                                  else 0.98)))
+            )
+            moe_lloyd_iters = int(_os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
+            # V2 MoE kernel only supports BITS=2/4 (lane-geometry mismatch
+            # at GROUP_SIZE=128 / VPW=10 for BITS=3). V3 kernel (XFP_V2=3,
+            # not yet shipped — "missing 3bit") would add bits=3 via
+            # lane-padding (13 lanes/group, 2 padding slots).
+            bits = xfp_auto_select(
+                sample,
+                candidates=(2, 4),
+                min_cos=_lazy_min_cos,
+                lloyd_iters=moe_lloyd_iters,
+            )
+            logger.info("XFP-V2 MoE %s auto-select: bits=%d "
+                        "(from %d/%d expert sample, lloyd=%d, min_cos=%.4f)",
+                        layer_prefix, bits, sample_experts, E,
+                        moe_lloyd_iters, _lazy_min_cos)
+            del sample
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
 
         # Pack w13
         p13, lib13, lid13, sc13, mid13, st13 = xfp_moe_pack_v2(

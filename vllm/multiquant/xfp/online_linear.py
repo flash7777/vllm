@@ -181,11 +181,16 @@ class XFPLinearMethod(QuantizeMethodBase):
     outlier_max_fraction: float = 0.02
 
     # Auto bit-width selection: minimum per-channel cosine similarity
-    # for a candidate bit width to be accepted. Configurable via
-    # XFP_MIN_COS environment variable. Default 0.98 — calibrated on
-    # GLM-4.7-Flash where it separates routed experts (xfp3 OK at
-    # cos 0.982) from attention (needs xfp4 at cos 0.994).
-    auto_min_cos: float = float(os.environ.get("XFP_MIN_COS", "0.98"))
+    # for a candidate bit width to be accepted. Linear path (attention
+    # qkv/o_proj, shared expert gate/up/down) is the "strict" class —
+    # higher quality bar than routed MoE experts. Configurable via
+    # XFP_MIN_COS_STRICT, falls back to legacy XFP_MIN_COS, default 0.98
+    # — calibrated on GLM-4.7-Flash (xfp3 OK for routed at cos 0.982,
+    # attention needs xfp4 at cos 0.994).
+    auto_min_cos: float = float(
+        os.environ.get("XFP_MIN_COS_STRICT",
+                       os.environ.get("XFP_MIN_COS", "0.98"))
+    )
 
     def __init__(
         self,
@@ -248,11 +253,20 @@ class XFPLinearMethod(QuantizeMethodBase):
         device = W.device
 
         # ─── XFP-V2 branch — per-group + shared codebook library ──
-        # Gated on env XFP_V2=1. Pack/cache uses the existing reuse map
+        # XFP_V2 state machine:
+        #   0  V1 path: per-channel codebook (default).
+        #   1  V2/V2a: per-channel pack + shared codebook library + fused
+        #      CUTLASS kernel (BITS=2/4). Current default for V2 path.
+        #   2  Reserved.
+        #   3  V3 (NOT YET IMPLEMENTED — "missing 3bit"): planned kernel
+        #      variant with BITS=3 support via lane-padding (13 lanes/group,
+        #      10 vals/word, 2 padding-slots/group end). Until V3 ships,
+        #      XFP_V2=3 currently behaves as XFP_V2=1 (silent fallback).
+        # Pack/cache uses the existing reuse map
         # (see doc/xfp/v2_codebook_library.md). Apply path falls back to
         # a Python reference until the v17_lib kernel ships (Phase 3).
         import os as _v2_os
-        _xfp_v2 = _v2_os.environ.get("XFP_V2", "0") == "1"
+        _xfp_v2 = int(_v2_os.environ.get("XFP_V2", "0") or 0) >= 1
         if _xfp_v2:
             return self._process_v2(layer, W, device)
 
@@ -284,6 +298,7 @@ class XFPLinearMethod(QuantizeMethodBase):
 
         # Auto bit-width selection: when dtype="xfp" (bits=0), run Lloyd
         # at candidates 2/3/4 and pick the lowest that passes the cos gate.
+        # V1 kernel supports BITS=2/3/4 natively.
         bits = self.bits
         if bits == 0:
             from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
@@ -485,13 +500,29 @@ class XFPLinearMethod(QuantizeMethodBase):
             return
 
         # Fresh pack
-        bits = self.bits if self.bits != 0 else 4  # V2 fixed bits=4 in phase 1
+        bits = self.bits
         group_size = int(_os.environ.get("XFP_GROUP_SIZE", "128"))
         library_size = int(_os.environ.get("XFP_LIBRARY_SIZE", "32"))
 
         # K must be divisible by group_size; otherwise the pack raises.
         Wf = W.float()
         K = Wf.shape[1]
+        if bits == 0:
+            # Auto-bits in V2: same xfp_auto_select as V1, then pack with
+            # chosen width. Linear = strict class → uses auto_min_cos.
+            # NOTE: V2 kernel only supports BITS=2/4 (128/10 lane-geometry
+            # mismatch). BITS=3 requires V3 kernel (XFP_V2=3, not yet
+            # shipped — "missing 3bit"). Until V3, candidates stay (2,4).
+            from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
+            bits = xfp_auto_select(
+                Wf,
+                candidates=(2, 4),
+                min_cos=self.auto_min_cos,
+                outlier_sigma=self.outlier_sigma,
+                outlier_max_fraction=self.outlier_max_fraction,
+            )
+            logger.info("XFP-V2 %s auto-select: bits=%d (min_cos=%.4f)",
+                        layer_prefix, bits, self.auto_min_cos)
         if K % group_size != 0:
             # Fall back to V1 for layers whose K is not divisible by
             # group_size (e.g. attention proj with odd intermediate size).
@@ -587,7 +618,7 @@ class XFPLinearMethod(QuantizeMethodBase):
                 return torch.nn.functional.linear(x, W_rec, bias)
 
             # Kernel path
-            from vllm.multiquant.xfp.xfp_kernel import dispatch_v2_linear_gemm
+            from vllm.multiquant.xfp.xfp_kernel import dispatch_v2_linear_gemm, xfp_v2_op
             from vllm.multiquant.xfp.xfp_pack import xfp_repack
 
             # Lazy one-time repack to warp-interleaved layout, cached on layer.
@@ -616,22 +647,36 @@ class XFPLinearMethod(QuantizeMethodBase):
                       if reshaped_x.dtype != torch.bfloat16
                       else reshaped_x.contiguous())
 
-            C = torch.empty(
-                x_bf16.shape[0], layer._xfp_N,
-                dtype=torch.bfloat16, device=x.device,
-            )
-            dispatch_v2_linear_gemm(
-                x_bf16,
-                layer._xfp_v2_packed_repacked,
-                layer.xfp_library.data,
-                layer._xfp_v2_lib_id_int32,
-                layer.xfp_group_scale.data,
-                layer.xfp_group_mid.data,
-                C,
-                int(layer._xfp_bits),
-                int(layer._xfp_K),
-                int(layer._xfp_group_size),
-            )
+            if xfp_v2_op is not None:
+                C = xfp_v2_op(
+                    x_bf16,
+                    layer._xfp_v2_packed_repacked,
+                    layer.xfp_library.data,
+                    layer._xfp_v2_lib_id_int32,
+                    layer.xfp_group_scale.data,
+                    layer.xfp_group_mid.data,
+                    int(layer._xfp_bits),
+                    int(layer._xfp_K),
+                    int(layer._xfp_group_size),
+                    int(layer._xfp_N),
+                )
+            else:
+                C = torch.empty(
+                    x_bf16.shape[0], layer._xfp_N,
+                    dtype=torch.bfloat16, device=x.device,
+                )
+                dispatch_v2_linear_gemm(
+                    x_bf16,
+                    layer._xfp_v2_packed_repacked,
+                    layer.xfp_library.data,
+                    layer._xfp_v2_lib_id_int32,
+                    layer.xfp_group_scale.data,
+                    layer.xfp_group_mid.data,
+                    C,
+                    int(layer._xfp_bits),
+                    int(layer._xfp_K),
+                    int(layer._xfp_group_size),
+                )
             if bias is not None:
                 C = C + bias.to(C.dtype)
             return C.reshape(out_shape).to(x.dtype)

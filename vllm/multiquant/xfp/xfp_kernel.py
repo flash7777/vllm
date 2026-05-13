@@ -368,7 +368,6 @@ def _xfp_v3_enabled() -> bool:
 _xfp_v2_dispatch_seen: set = set()  # First-occurrence cache (M_bucket, K, path)
 
 
-@torch.compiler.disable
 def _xfp_v2_log_dispatch(M: int, K: int, path: str, m_chunk: int = 0) -> None:
     """Log V2 dispatch decision once per (M-bucket, K, path) combination.
 
@@ -376,10 +375,11 @@ def _xfp_v2_log_dispatch(M: int, K: int, path: str, m_chunk: int = 0) -> None:
     confirm in benchmark logs which kernel served which layer-class.
     Set ``XFP_V2_LOG=verbose`` to log every call (very chatty).
 
-    Decorated ``@torch.compiler.disable`` because logger.info is not
-    traceable by torch.dynamo — without this, every first-seen layer
-    triggers a graph break in aot_compile (gb0291) and crashes engine
-    init under vLLM 0.17 cuda-graph capture.
+    NOTE: Caller is responsible for ensuring this is NOT invoked from
+    inside a torch.compile graph region — logger.info is not traceable
+    by torch.dynamo (gb0291) and ``@torch.compiler.disable`` triggers
+    fullgraph_capture refusal (gb0098). Only call from out-of-graph
+    helpers (e.g. process_weights_after_loading).
     """
     if os.environ.get("XFP_V2_LOG", "").lower() in ("verbose", "v"):
         if path == "splitm":
@@ -444,8 +444,11 @@ def dispatch_v2_linear_gemm(
                                                               tested path
       - M < THRESHOLD (16), K <= 8192:   split-N (v17_lib) -- top perf M=1
       - M >= THRESHOLD,    K <= 8192:    splitm (split-M)  -- batched
-    Logging: first-seen (M-bucket, K, path) emits one INFO line. Set
-    ``XFP_V2_LOG=verbose`` to log every call.
+
+    No logging from this function — the dispatcher is invoked inside a
+    torch.compile fullgraph capture under vLLM 0.17, where neither
+    raw logger.info (gb0291 graph break) nor @torch.compiler.disable
+    (gb0098 fullgraph refusal) is permitted.
     """
     v17_lib, v17_splitm, v17_splitk = _load_xfp_v2_kernels()
     if v17_lib is None and v17_splitm is None and v17_splitk is None:
@@ -458,7 +461,6 @@ def dispatch_v2_linear_gemm(
     if K > XFP_V2_SPLITM_K_MAX:
         if _xfp_v3_enabled() and v17_splitk is not None:
             m_chunk, k_chunk = _select_v3_splitk_chunks(M)
-            _xfp_v2_log_dispatch(M, K, "splitk", m_chunk)
             v17_splitk.xfp_gemm_v17_lib_splitk(
                 x_bf16, packed_repacked, library, lib_id, scale, mid, C,
                 int(bits), int(K), int(group_size),
@@ -469,7 +471,6 @@ def dispatch_v2_linear_gemm(
         if v17_lib is None:
             raise RuntimeError(
                 "XFP-V2: K=%d > 8192 but v17_lib not loaded" % K)
-        _xfp_v2_log_dispatch(M, K, "split-N-fallback")
         v17_lib.xfp_gemm_v17_lib(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size),
@@ -477,23 +478,89 @@ def dispatch_v2_linear_gemm(
         return
 
     # K <= 8192: split-N or split-M based on M.
+    # split-M v1 kernel only supports bits=4 — fallback to split-N for
+    # bits!=4 (TORCH_CHECK in xfp_gemm_v17_lib_splitm.cu:93).
     use_splitm = (
         M >= XFP_V2_SPLITM_THRESHOLD_M
         and v17_splitm is not None
+        and int(bits) == 4
     )
     if not use_splitm:
         if v17_lib is None:
             raise RuntimeError(
                 "XFP-V2: v17_lib (split-N) not loaded for M=%d" % M)
-        _xfp_v2_log_dispatch(M, K, "split-N")
         v17_lib.xfp_gemm_v17_lib(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size),
         )
     else:
         m_chunk = _select_v2_m_chunk(K)
-        _xfp_v2_log_dispatch(M, K, "splitm", m_chunk)
         v17_splitm.xfp_gemm_v17_lib_splitm(
             x_bf16, packed_repacked, library, lib_id, scale, mid, C,
             int(bits), int(K), int(group_size), int(m_chunk),
         )
+
+
+# ─── XFP-V2 custom op (torch.compile / aot_compile safe) ──────────────
+#
+# dispatch_v2_linear_gemm calls JIT-loaded C++ extensions via dynamic
+# dispatch — torch.dynamo cannot trace through that under fullgraph
+# capture (gb0007). Wrap as a torch custom_op so dynamo treats the
+# call as an opaque boundary, identical to the V1 xfp_apply pattern in
+# online_linear.py.
+
+def _xfp_v2_apply_impl(
+    x_bf16: torch.Tensor,
+    packed_repacked: torch.Tensor,
+    library: torch.Tensor,
+    lib_id: torch.Tensor,
+    scale: torch.Tensor,
+    mid: torch.Tensor,
+    bits: int,
+    K: int,
+    group_size: int,
+    N_out: int,
+) -> torch.Tensor:
+    """Real impl: alloc C, call V2 dispatcher, return C."""
+    M = int(x_bf16.shape[0])
+    C = torch.empty(M, N_out, dtype=torch.bfloat16, device=x_bf16.device)
+    dispatch_v2_linear_gemm(
+        x_bf16, packed_repacked, library, lib_id, scale, mid, C,
+        bits, K, group_size,
+    )
+    return C
+
+
+def _xfp_v2_apply_fake(
+    x_bf16: torch.Tensor,
+    packed_repacked: torch.Tensor,
+    library: torch.Tensor,
+    lib_id: torch.Tensor,
+    scale: torch.Tensor,
+    mid: torch.Tensor,
+    bits: int,
+    K: int,
+    group_size: int,
+    N_out: int,
+) -> torch.Tensor:
+    """Fake impl for torch.dynamo graph tracing."""
+    return torch.empty(
+        x_bf16.shape[0], N_out, dtype=torch.bfloat16, device=x_bf16.device
+    )
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+    direct_register_custom_op(
+        op_name="xfp_v2_apply",
+        op_func=_xfp_v2_apply_impl,
+        fake_impl=_xfp_v2_apply_fake,
+    )
+    xfp_v2_op = torch.ops.vllm.xfp_v2_apply
+    logger.info("XFP-V2 custom op registered (torch.compile safe)")
+except Exception as e:
+    logger.warning(
+        "XFP-V2 custom op registration failed: %s — "
+        "torch.compile with XFP_V2=1 may break", e,
+    )
+    xfp_v2_op = None

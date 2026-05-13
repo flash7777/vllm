@@ -381,8 +381,11 @@ def initialize_streaming_quantload(model: nn.Module) -> None:
 
 def _move_params_to_device(layer: nn.Module) -> None:
     """Move all direct parameters to CUDA after CPU quantization."""
-    target = torch.device("cuda:0") if torch.cuda.is_available() \
-        else torch.device("cpu")
+    # [xfp_tp] Per-worker current device, not hardcoded cuda:0.
+    if torch.cuda.is_available():
+        target = torch.device(f"cuda:{torch.cuda.current_device()}")
+    else:
+        target = torch.device("cpu")
     for name in list(layer._parameters.keys()):
         p = layer._parameters[name]
         if p is not None and p.device != target:
@@ -401,11 +404,14 @@ def _make_moe_streaming_loader(layer, original_load_weights, meta_specs):
     """
     import functools
 
-    target = torch.device("cuda:0") if torch.cuda.is_available() \
-        else torch.device("cpu")
-
     @functools.wraps(original_load_weights)
     def streaming_load_weights(weights):
+        # [xfp_tp] Resolve target lazily — closure executes after worker
+        # set_device, so current_device() reflects the per-rank pin.
+        if torch.cuda.is_available():
+            target = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            target = torch.device("cpu")
         # Materialize meta params before FusedMoE loads experts into them.
         materialized_bytes = 0
         for name, (shape, dtype, attrs) in meta_specs.items():
@@ -457,11 +463,18 @@ def _make_streaming_loader(layer, param_name, original_loader,
     """Wrap a weight_loader to materialize meta params and trigger quantization."""
     import functools
 
-    target = torch.device("cuda:0") if torch.cuda.is_available() \
-        else torch.device("cpu")
-
     @functools.wraps(original_loader)
     def streaming_loader(*args, **kwargs):
+        # [xfp_tp] Resolve target lazily at load time, not at closure
+        # creation. With TP > 1, multiproc_executor spawns workers that
+        # later call set_device(rank) — but this closure runs before
+        # that, so a captured ``cuda:0`` would force every rank's weights
+        # onto GPU 0. current_device() reflects the per-worker pin set
+        # via set_device, so each rank materializes on its own GPU.
+        if torch.cuda.is_available():
+            target = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            target = torch.device("cpu")
         # If process_weights_after_loading already fired for this
         # layer, the original ``layer.weight`` may have been replaced by
         # quant-specific attributes (xfp_packed, xfp_codebook, …) and
