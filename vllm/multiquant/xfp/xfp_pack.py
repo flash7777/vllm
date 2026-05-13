@@ -257,6 +257,58 @@ def _assign_indices(
 # ─── Word-aligned sub-byte packing ────────────────────────────────────
 
 
+def _pack_indices_v3_per_group(
+    idx: torch.Tensor,  # [N_out, K] int, values in [0, 2^bits)
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    """V3 per-group packing for BITS=3 (lane-padding scheme).
+
+    Layout: each group is packed independently to K_PACKED_PER_GROUP
+    words. For BITS=3 with group_size=128:
+      VALS_PER_WORD = 10
+      K_PACKED_PER_GROUP = ceil(128 / 10) = 13
+      Per group: 13 words × 10 vals = 130 slots, 2 padding slots (index 0).
+
+    Result shape: [N_out, G, K_PACKED_PER_GROUP] uint32.
+
+    For BITS=2/4 the existing flat _pack_indices is preferred (group_size
+    divides vals_per_word evenly, no padding overhead).
+    """
+    if bits != 3:
+        raise ValueError(f"_pack_indices_v3_per_group: only bits=3 supported, got {bits}")
+    N_out, K = idx.shape
+    if K % group_size != 0:
+        raise ValueError(
+            f"K={K} not divisible by group_size={group_size}")
+    G = K // group_size
+    vals_per_word = 10  # bits=3
+    K_packed_per_group = (group_size + vals_per_word - 1) // vals_per_word  # 13
+
+    # Reshape into groups: [N_out, G, group_size]
+    idx_g = idx.reshape(N_out, G, group_size).to(torch.int64)
+
+    # Pad each group to K_packed_per_group * vals_per_word slots
+    pad = K_packed_per_group * vals_per_word - group_size  # 2
+    if pad > 0:
+        idx_g = F.pad(idx_g, (0, pad), value=0)  # pad last dim
+
+    # View per group as [N_out, G, K_packed_per_group, vals_per_word]
+    idx_g = idx_g.view(N_out, G, K_packed_per_group, vals_per_word)
+
+    # Pack each word
+    packed = torch.zeros(
+        N_out, G, K_packed_per_group,
+        dtype=torch.int64, device=idx.device,
+    )
+    mask = (1 << bits) - 1
+    for slot in range(vals_per_word):
+        packed |= (idx_g[:, :, :, slot] & mask) << (slot * bits)
+
+    # Return [N_out, G, K_PACKED_PER_GROUP] int32 (uint32 bit-identical)
+    return packed.contiguous().to(torch.int32)
+
+
 def _pack_indices(
     idx: torch.Tensor,  # [N_out, K] int, values in [0, 2^bits)
     bits: int,
@@ -370,6 +422,50 @@ def _score_mse_only(W: torch.Tensor, bits: int, lloyd_iters: int) -> float:
 
 
 # ─── Weight repack for coalesced warp reads ────────────────────────
+
+
+def xfp_repack_v3(
+    packed: torch.Tensor,  # [N_out, G, K_PACKED_PER_GROUP=13] int32
+    cb_per_iter: int = 2,
+    lanes_per_group: int = 13,
+) -> torch.Tensor:
+    """V3 repack for BITS=3 per-group + lane-padding.
+
+    Input:  [N_out, G, 13] uint32 (from _pack_indices_v3_per_group)
+    Output: flat [n_warp_iters * N_out * ACTIVE_LANES] int32 in row-major
+
+    Kernel access pattern (per warp-iter gi):
+        packed_flat[gi * N_out * ACTIVE_LANES + n * ACTIVE_LANES + lane]
+        for lane in [0, ACTIVE_LANES). lanes [ACTIVE_LANES, 32) are idle.
+
+    ACTIVE_LANES = CB_PER_ITER * LANES_PER_GROUP = 2 * 13 = 26 for BITS=3.
+    Each warp-iter advances by CB_PER_ITER groups (2). Lanes 0..12 belong
+    to group_idx = gi*2+0; lanes 13..25 belong to group_idx = gi*2+1.
+
+    For odd G (G%cb_per_iter != 0), the tail group is dropped from the
+    repacked output. Callers must ensure G is divisible by cb_per_iter
+    (G%2==0 for BITS=3) — typically the case for power-of-2 K with GS=128.
+    """
+    assert packed.dim() == 3, f"xfp_repack_v3: expected 3D input, got {packed.dim()}D"
+    N_out, G, K_PACKED_PER_GROUP = packed.shape
+    assert K_PACKED_PER_GROUP == lanes_per_group, (
+        f"K_PACKED_PER_GROUP={K_PACKED_PER_GROUP} != lanes_per_group={lanes_per_group}"
+    )
+    active_lanes = cb_per_iter * lanes_per_group
+    if G % cb_per_iter != 0:
+        raise ValueError(
+            f"xfp_repack_v3: G={G} not divisible by cb_per_iter={cb_per_iter}"
+        )
+    n_warp_iters = G // cb_per_iter
+
+    # Reshape to [N_out, n_warp_iters, cb_per_iter, K_PACKED_PER_GROUP]
+    p = packed.reshape(N_out, n_warp_iters, cb_per_iter, K_PACKED_PER_GROUP)
+    # Concat cb_per_iter groups along last dim: [N_out, n_warp_iters, ACTIVE_LANES]
+    p = p.reshape(N_out, n_warp_iters, active_lanes)
+    # Permute to kernel-friendly layout: [n_warp_iters, N_out, ACTIVE_LANES]
+    p = p.permute(1, 0, 2).contiguous()
+    # Flatten to 1D
+    return p.reshape(-1)
 
 
 def xfp_repack(packed: torch.Tensor, warp_size: int = 32) -> torch.Tensor:
@@ -884,8 +980,15 @@ def xfp_pack_v2(
     # Reassemble back to [N, K]
     idx_full = idx_per_group.reshape(N, G, group_size).reshape(N, K)
 
-    # Step 7 — pack indices via existing _pack_indices (UNCHANGED layout)
-    packed = _pack_indices(idx_full, bits)
+    # Step 7 — pack indices.
+    #   bits=2/4: flat layout [K_packed, N] via _pack_indices (UNCHANGED).
+    #   bits=3:   per-group V3 layout [N, G, K_PACKED_PER_GROUP=13] via
+    #             _pack_indices_v3_per_group. Caller selects xfp_repack_v3
+    #             based on bits.
+    if bits == 3:
+        packed = _pack_indices_v3_per_group(idx_full, bits, group_size)
+    else:
+        packed = _pack_indices(idx_full, bits)
 
     # Reconstruction for stats
     rec_norm = torch.gather(chosen_lib, 1, idx_per_group.long())  # [N*G, group_size]

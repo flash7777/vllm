@@ -510,13 +510,15 @@ class XFPLinearMethod(QuantizeMethodBase):
         if bits == 0:
             # Auto-bits in V2: same xfp_auto_select as V1, then pack with
             # chosen width. Linear = strict class → uses auto_min_cos.
-            # NOTE: V2 kernel only supports BITS=2/4 (128/10 lane-geometry
-            # mismatch). BITS=3 requires V3 kernel (XFP_V2=3, not yet
-            # shipped — "missing 3bit"). Until V3, candidates stay (2,4).
+            # V2 kernel supports BITS=2/4. V3 kernel (XFP_V2>=3) adds
+            # BITS=3 via lane-padding + SMEM-direct codebook lookup
+            # ("V1+V2 symbiosis"). Per-group structure preserved.
+            _xfp_v2_level = int(_os.environ.get("XFP_V2", "0") or 0)
+            _v2_candidates = (2, 3, 4) if _xfp_v2_level >= 3 else (2, 4)
             from vllm.multiquant.xfp.xfp_pack import xfp_auto_select
             bits = xfp_auto_select(
                 Wf,
-                candidates=(2, 4),
+                candidates=_v2_candidates,
                 min_cos=self.auto_min_cos,
                 outlier_sigma=self.outlier_sigma,
                 outlier_max_fraction=self.outlier_max_fraction,
@@ -619,18 +621,26 @@ class XFPLinearMethod(QuantizeMethodBase):
 
             # Kernel path
             from vllm.multiquant.xfp.xfp_kernel import dispatch_v2_linear_gemm, xfp_v2_op
-            from vllm.multiquant.xfp.xfp_pack import xfp_repack
+            from vllm.multiquant.xfp.xfp_pack import xfp_repack, xfp_repack_v3
 
             # Lazy one-time repack to warp-interleaved layout, cached on layer.
-            # Handles both fresh packs (2D [K_packed, N]) and pre-repacked
-            # caches (1D); kernel only accepts the 1D warp-interleaved form.
+            # Layout depends on bits:
+            #   raw.dim() == 1: pre-repacked from cache (no-op)
+            #   raw.dim() == 2: V2 bits=2/4 flat layout — use xfp_repack
+            #   raw.dim() == 3: V3 bits=3 per-group layout — use xfp_repack_v3
             if (not hasattr(layer, "_xfp_v2_packed_repacked")
                     or layer._xfp_v2_packed_repacked is None):
                 raw = layer.xfp_packed.data
-                layer._xfp_v2_packed_repacked = (
-                    raw.contiguous() if raw.dim() == 1
-                    else xfp_repack(raw).contiguous()
-                )
+                if raw.dim() == 1:
+                    layer._xfp_v2_packed_repacked = raw.contiguous()
+                elif raw.dim() == 2:
+                    layer._xfp_v2_packed_repacked = xfp_repack(raw).contiguous()
+                elif raw.dim() == 3:
+                    # V3 BITS=3 per-group layout [N, G, K_PACKED_PER_GROUP=13]
+                    layer._xfp_v2_packed_repacked = xfp_repack_v3(raw).contiguous()
+                else:
+                    raise ValueError(
+                        f"unexpected xfp_packed dim: {raw.dim()}")
 
             # Lazy one-time int32 cast for lib_id (kernel TORCH_CHECK)
             if (not hasattr(layer, "_xfp_v2_lib_id_int32")

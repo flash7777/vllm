@@ -621,13 +621,14 @@ class XFPMoEMethod(FusedMoEMethodBase):
                                                   else 0.98)))
             )
             moe_lloyd_iters = int(_os.environ.get("XFP_MOE_LLOYD_ITERS", "5"))
-            # V2 MoE kernel only supports BITS=2/4 (lane-geometry mismatch
-            # at GROUP_SIZE=128 / VPW=10 for BITS=3). V3 kernel (XFP_V2=3,
-            # not yet shipped — "missing 3bit") would add bits=3 via
-            # lane-padding (13 lanes/group, 2 padding slots).
+            # V2 MoE kernel supports BITS=2/4. V3 kernel (XFP_V2>=3) adds
+            # BITS=3 via lane-padding + SMEM-direct codebook lookup
+            # ("V1+V2 symbiosis"). Per-group structure preserved.
+            _xfp_v2_level = int(_os.environ.get("XFP_V2", "0") or 0)
+            _v2_candidates_moe = (2, 3, 4) if _xfp_v2_level >= 3 else (2, 4)
             bits = xfp_auto_select(
                 sample,
-                candidates=(2, 4),
+                candidates=_v2_candidates_moe,
                 min_cos=_lazy_min_cos,
                 lloyd_iters=moe_lloyd_iters,
             )
