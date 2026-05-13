@@ -66,7 +66,7 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
                   "xfp_gemm_core_v2: BITS must be 2, 3, or 4");
     // BITS=2 → 16 vals/word (LUT=4), BITS=3 → 10 vals/word (LUT=8),
     // BITS=4 → 8 vals/word (LUT=16). BITS=3 wastes 2 bits/word.
-    constexpr int VALS_PER_WORD = (BITS == 2) ? 16 : 8;
+    constexpr int VALS_PER_WORD = (BITS == 2) ? 16 : (BITS == 3) ? 10 : 8;
     constexpr uint32_t MASK = (1u << BITS) - 1u;
     constexpr int LUT_SIZE = (1 << BITS);
 
