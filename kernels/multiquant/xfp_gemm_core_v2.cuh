@@ -62,7 +62,7 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
     int G, int group_size, int library_size,
     typename PolicyV2::Params params)
 {
-    static_assert(BITS == 2 || BITS == 4,
+    static_assert(BITS == 2 || BITS == 3 || BITS == 4,
                   "xfp_gemm_core_v2: BITS must be 2, 3, or 4");
     // BITS=2 → 16 vals/word (LUT=4), BITS=3 → 10 vals/word (LUT=8),
     // BITS=4 → 8 vals/word (LUT=16). BITS=3 wastes 2 bits/word.
@@ -150,30 +150,83 @@ __device__ __forceinline__ void xfp_gemm_core_v2(
 
     float my_cb_val = 0.0f;
 
-    for (int gi = 0; gi < n_full_groups; gi++) {
-        int my_group_idx = gi * CB_PER_ITER + lane_group;
-        int   lib_id  = (int) row_lib_id[my_group_idx];
-        float scale_f = __half2float(row_scale[my_group_idx]);
-        float mid_f   = __half2float(row_mid  [my_group_idx]);
-        my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx])
-                    * scale_f + mid_f;
+    if constexpr (BITS == 3) {
+        // ── V3 BITS=3 hot loop: per-group + lane-padding + SMEM-direct ──
+        // 13 lanes/group, 2 groups/warp = 26 active lanes; lanes 26..31 idle.
+        // Codebook lookup via s_library (SMEM-direct, no shuffle subgroup).
+        // 2 padding slots/group end skipped via abs_slot < GROUP_SIZE check.
+        // Memory: K_PACKED_PER_GROUP = 13 (vs 16 for BITS=4) → 17% saving.
+        constexpr int LANES_PER_GROUP_V3 = 13;
+        constexpr int CB_PER_ITER_V3     = 2;
+        constexpr int ACTIVE_LANES_V3    = CB_PER_ITER_V3 * LANES_PER_GROUP_V3;  // 26
 
-        int kw = lane + gi * XFP_WARP_SIZE;
-        uint32_t packed = ctx.B_packed[gi * N * XFP_WARP_SIZE + n_offset];
-        int k_base = kw * VALS_PER_WORD;
+        const bool lane_active_v3 = (lane < ACTIVE_LANES_V3);
+        const int  lane_grp_v3    = lane / LANES_PER_GROUP_V3;   // 0 or 1
+        const int  lane_in_grp_v3 = lane % LANES_PER_GROUP_V3;   // 0..12
 
-        #pragma unroll
-        for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
-            __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(
-                A_src + k_base + slot);
-            float a0 = __bfloat162float(__low2bfloat16(a2));
-            float a1 = __bfloat162float(__high2bfloat16(a2));
-            int idx0 = (int)((packed >> (slot * BITS)) & MASK);
-            int idx1 = (int)((packed >> ((slot + 1) * BITS)) & MASK);
-            float w0 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx0);
-            float w1 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx1);
-            acc = fmaf(w0, a0, acc);
-            acc = fmaf(w1, a1, acc);
+        const int n_warp_iters_v3 = G / CB_PER_ITER_V3;  // G must be even
+
+        for (int gi = 0; gi < n_warp_iters_v3; gi++) {
+            if (!lane_active_v3) continue;
+
+            int   my_group_idx = gi * CB_PER_ITER_V3 + lane_grp_v3;
+            int   lib_id       = (int) row_lib_id[my_group_idx];
+            float scale_f      = __half2float(row_scale[my_group_idx]);
+            float mid_f        = __half2float(row_mid  [my_group_idx]);
+
+            const half* my_lib = s_library + (size_t)lib_id * LUT_SIZE;
+
+            // Stride per warp-iter = ACTIVE_LANES_V3 (26), N-stride likewise.
+            uint32_t packed = ctx.B_packed[
+                (size_t)gi      * (size_t)N * ACTIVE_LANES_V3
+              + (size_t)ctx.n   *               ACTIVE_LANES_V3
+              + lane
+            ];
+
+            int k_base = my_group_idx * GROUP_SIZE
+                       + lane_in_grp_v3 * VALS_PER_WORD;
+
+            #pragma unroll
+            for (int slot = 0; slot < VALS_PER_WORD; slot++) {
+                int abs_slot = lane_in_grp_v3 * VALS_PER_WORD + slot;
+                if (abs_slot >= GROUP_SIZE) break;  // 2 padding slots/group
+
+                int idx = (int)((packed >> (slot * BITS)) & MASK);
+                float w_norm = __half2float(my_lib[idx]);
+                float w      = w_norm * scale_f + mid_f;
+
+                __nv_bfloat16 a_bf = A_src[k_base + slot];
+                float a            = __bfloat162float(a_bf);
+                acc = fmaf(w, a, acc);
+            }
+        }
+    } else {
+        // ── BITS=2/4: original hot loop (unchanged) ──
+        for (int gi = 0; gi < n_full_groups; gi++) {
+            int my_group_idx = gi * CB_PER_ITER + lane_group;
+            int   lib_id  = (int) row_lib_id[my_group_idx];
+            float scale_f = __half2float(row_scale[my_group_idx]);
+            float mid_f   = __half2float(row_mid  [my_group_idx]);
+            my_cb_val = __half2float(s_library[lib_id * LUT_SIZE + my_cb_idx])
+                        * scale_f + mid_f;
+
+            int kw = lane + gi * XFP_WARP_SIZE;
+            uint32_t packed = ctx.B_packed[gi * N * XFP_WARP_SIZE + n_offset];
+            int k_base = kw * VALS_PER_WORD;
+
+            #pragma unroll
+            for (int slot = 0; slot < VALS_PER_WORD; slot += 2) {
+                __nv_bfloat162 a2 = *reinterpret_cast<const __nv_bfloat162*>(
+                    A_src + k_base + slot);
+                float a0 = __bfloat162float(__low2bfloat16(a2));
+                float a1 = __bfloat162float(__high2bfloat16(a2));
+                int idx0 = (int)((packed >> (slot * BITS)) & MASK);
+                int idx1 = (int)((packed >> ((slot + 1) * BITS)) & MASK);
+                float w0 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx0);
+                float w1 = __shfl_sync(0xffffffff, my_cb_val, cb_lane_offset + idx1);
+                acc = fmaf(w0, a0, acc);
+                acc = fmaf(w1, a1, acc);
+            }
         }
     }
 

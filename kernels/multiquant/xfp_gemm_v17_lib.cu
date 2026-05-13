@@ -96,8 +96,8 @@ void xfp_gemm_v17_lib(
     TORCH_CHECK(K <= LinearPolicyV2::K_SMEM_MAX,
                 "xfp_gemm_v17_lib: K=", K, " exceeds K_SMEM_MAX=",
                 LinearPolicyV2::K_SMEM_MAX);
-    TORCH_CHECK(bits == 2 || bits == 4,
-                "xfp_gemm_v17_lib: only BITS=2 or 4 supported, got ", bits);
+    TORCH_CHECK(bits == 2 || bits == 3 || bits == 4,
+                "xfp_gemm_v17_lib: only BITS=2/3/4 supported, got ", bits);
     TORCH_CHECK(group_size == 128,
                 "xfp_gemm_v17_lib v1: only group_size=128 supported, got ",
                 group_size);
@@ -121,6 +121,11 @@ void xfp_gemm_v17_lib(
     switch (bits) {
         case 2:
             launch_linear_v2<2>(A, B_packed, library, group_lib_id, group_scale,
+                                group_mid, C, static_cast<int>(K), N, K_packed,
+                                G, static_cast<int>(group_size), library_size);
+            break;
+        case 3:
+            launch_linear_v2<3>(A, B_packed, library, group_lib_id, group_scale,
                                 group_mid, C, static_cast<int>(K), N, K_packed,
                                 G, static_cast<int>(group_size), library_size);
             break;

@@ -458,8 +458,10 @@ def dispatch_v2_linear_gemm(
 
     # K > 8192: V3 split-K opt-in via XFP_V3=1, otherwise V2a fallback
     # (single-block-per-SM split-N) — V2a is the tested path.
+    # NOTE: split-K kernel only supports BITS=2/4. BITS=3 (V3 hot loop)
+    # is only in main v17_lib — always falls through to it.
     if K > XFP_V2_SPLITM_K_MAX:
-        if _xfp_v3_enabled() and v17_splitk is not None:
+        if _xfp_v3_enabled() and v17_splitk is not None and int(bits) != 3:
             m_chunk, k_chunk = _select_v3_splitk_chunks(M)
             v17_splitk.xfp_gemm_v17_lib_splitk(
                 x_bf16, packed_repacked, library, lib_id, scale, mid, C,
