@@ -997,7 +997,7 @@ def xfp_pack_v2(
 
     # Free the heaviest temp (d_w) before reconstruction stats.
     del d_w
-    if Wf.is_cuda:
+    if W.is_cuda:
         torch.cuda.empty_cache()
 
     # Reconstruction for stats
@@ -1114,8 +1114,10 @@ def xfp_moe_pack_v2(
     """
     if W_stack.dim() != 3:
         raise ValueError(f"xfp_moe_pack_v2: W must be 3D [E,N,K], got {W_stack.shape}")
-    Wf = W_stack.float()
-    E, N, K = Wf.shape
+    # Stream per-expert cast (BF16→fp32 inside loops) — avoids 4-8 GB
+    # full-stack fp32 copy that was OOM source on 397B with TP=2.
+    # W_stack stays as input dtype (typically bf16).
+    E, N, K = W_stack.shape
     if K % group_size != 0:
         raise ValueError(
             f"xfp_moe_pack_v2: K={K} not divisible by group_size={group_size}"
@@ -1128,7 +1130,9 @@ def xfp_moe_pack_v2(
     all_scale: list[torch.Tensor] = []
     all_mid: list[torch.Tensor] = []
     for e in range(E):
-        W_e = Wf[e].reshape(N, G, group_size).reshape(N * G, group_size)
+        # Per-expert fp32 cast — freed at end of iteration
+        W_e_fp32 = W_stack[e].float()
+        W_e = W_e_fp32.reshape(N, G, group_size).reshape(N * G, group_size)
         cb_e = _lloyd_per_channel(W_e, n_centroids, lloyd_iters)
         cb_min = cb_e.amin(dim=1, keepdim=True)
         cb_max = cb_e.amax(dim=1, keepdim=True)
@@ -1137,6 +1141,7 @@ def xfp_moe_pack_v2(
         all_cb_norm.append((cb_e - mid_e) / scale_e)        # [N*G, n_cents]
         all_scale.append(scale_e.squeeze(-1))                # [N*G]
         all_mid.append(mid_e.squeeze(-1))                    # [N*G]
+        del W_e_fp32, W_e, cb_e
 
     # Step 2 — build SHARED library across all experts in this stack
     cb_norm_all = torch.cat(all_cb_norm, dim=0)  # [E*N*G, n_cents]
@@ -1144,7 +1149,7 @@ def xfp_moe_pack_v2(
     # [library_size, n_centroids] fp32 in [-1, +1]
     # cb_norm_all (~2-4 GB for 397B MoE) is no longer needed after lib build
     del cb_norm_all
-    if Wf.is_cuda:
+    if W_stack.is_cuda:
         torch.cuda.empty_cache()
 
     # Step 3 — per-expert: assign + re-quantize + pack (REUSE _pack_indices)
@@ -1173,7 +1178,8 @@ def xfp_moe_pack_v2(
         library_p5_min = min(library_p5_min, p5)
         library_min_min = min(library_min_min, float(cb_cos_sorted[0].item()))
         # Re-quantize weights with chosen library codebook
-        W_groups_e = Wf[e].reshape(N, G, group_size).reshape(N * G, group_size)
+        W_e_fp32 = W_stack[e].float()
+        W_groups_e = W_e_fp32.reshape(N, G, group_size).reshape(N * G, group_size)
         W_norm_e = (W_groups_e - mid_e.unsqueeze(-1)) / scale_e.unsqueeze(-1)
         chosen_lib = library[lib_id_e]  # [N*G, n_cents]
         d_w = (W_norm_e.unsqueeze(-1) - chosen_lib.unsqueeze(1)).abs()
@@ -1191,20 +1197,20 @@ def xfp_moe_pack_v2(
         # MSE/cos for stats (running aggregates)
         rec_norm = torch.gather(chosen_lib, 1, idx_e.long())
         W_rec_e = (rec_norm * scale_e.unsqueeze(-1) + mid_e.unsqueeze(-1)).reshape(N, K)
-        diff = Wf[e] - W_rec_e
+        diff = W_e_fp32 - W_rec_e
         total_mse += float((diff * diff).sum().item())
-        total_cos_num += float((Wf[e] * W_rec_e).sum().item())
-        total_cos_den_a += float((Wf[e] * Wf[e]).sum().item())
+        total_cos_num += float((W_e_fp32 * W_rec_e).sum().item())
+        total_cos_den_a += float((W_e_fp32 * W_e_fp32).sum().item())
         total_cos_den_b += float((W_rec_e * W_rec_e).sum().item())
         # Free per-expert temps before next iteration to avoid caching-allocator
         # pile-up across 512 experts (was the V3 H1 leak source on 397B).
-        del idx_e, rec_norm, W_rec_e, diff, chosen_lib
-        if Wf.is_cuda:
+        del W_e_fp32, idx_e, rec_norm, W_rec_e, diff, chosen_lib
+        if W_stack.is_cuda:
             torch.cuda.empty_cache()
 
     # Free per-expert codebook lists (collected only for library build)
     del all_cb_norm, all_scale, all_mid
-    if Wf.is_cuda:
+    if W_stack.is_cuda:
         torch.cuda.empty_cache()
 
     n_total = float(E * N * K)
