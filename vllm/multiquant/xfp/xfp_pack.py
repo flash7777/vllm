@@ -305,8 +305,13 @@ def _pack_indices_v3_per_group(
     for slot in range(vals_per_word):
         packed |= (idx_g[:, :, :, slot] & mask) << (slot * bits)
 
-    # Return [N_out, G, K_PACKED_PER_GROUP] int32 (uint32 bit-identical)
-    return packed.contiguous().to(torch.int32)
+    # Free idx_g (was a int64 copy of input idx) before returning
+    del idx_g
+    out = packed.to(torch.int32)
+    del packed
+    if idx.is_cuda:
+        torch.cuda.empty_cache()
+    return out.contiguous()
 
 
 def _pack_indices(
@@ -990,6 +995,11 @@ def xfp_pack_v2(
     else:
         packed = _pack_indices(idx_full, bits)
 
+    # Free the heaviest temp (d_w) before reconstruction stats.
+    del d_w
+    if Wf.is_cuda:
+        torch.cuda.empty_cache()
+
     # Reconstruction for stats
     rec_norm = torch.gather(chosen_lib, 1, idx_per_group.long())  # [N*G, group_size]
     W_rec_groups = rec_norm * scale + midpoint  # [N*G, group_size]
@@ -1001,6 +1011,12 @@ def xfp_pack_v2(
         W_rec.reshape(-1).unsqueeze(0),
         dim=1,
     ).item())
+    # Free reconstruction temps before final cast/reshape
+    del W_rec_groups, W_rec, rec_norm, diff, chosen_lib, idx_per_group
+    del cb_per_group, cb_norm, d2, nearest, cb_cos, cb_cos_sorted
+    del W_norm_groups, W_groups, Wf
+    if W.is_cuda:
+        torch.cuda.empty_cache()
 
     # Reshape group params to [N, G]
     group_lib_id_2d = group_lib_id.reshape(N, G).to(torch.int32)
@@ -1126,6 +1142,10 @@ def xfp_moe_pack_v2(
     cb_norm_all = torch.cat(all_cb_norm, dim=0)  # [E*N*G, n_cents]
     library = _build_codebook_library(cb_norm_all, library_size, iters=library_iters)
     # [library_size, n_centroids] fp32 in [-1, +1]
+    # cb_norm_all (~2-4 GB for 397B MoE) is no longer needed after lib build
+    del cb_norm_all
+    if Wf.is_cuda:
+        torch.cuda.empty_cache()
 
     # Step 3 — per-expert: assign + re-quantize + pack (REUSE _pack_indices)
     packed_list: list[torch.Tensor] = []
@@ -1158,9 +1178,12 @@ def xfp_moe_pack_v2(
         chosen_lib = library[lib_id_e]  # [N*G, n_cents]
         d_w = (W_norm_e.unsqueeze(-1) - chosen_lib.unsqueeze(1)).abs()
         idx_e = d_w.argmin(dim=-1).to(torch.int32)  # [N*G, group_size]
+        # Free d_w immediately — largest peak in MoE pack (~150 MB/expert × E experts)
+        del d_w, W_norm_e, W_groups_e
         idx_full_e = idx_e.reshape(N, G, group_size).reshape(N, K)
         # Pack indices
         packed_e = _pack_indices(idx_full_e, bits)
+        del idx_full_e
         packed_list.append(packed_e)
         lib_id_list.append(lib_id_e.reshape(N, G).to(torch.int32))
         scale_list.append(scale_e.reshape(N, G).to(torch.float16))
@@ -1173,6 +1196,16 @@ def xfp_moe_pack_v2(
         total_cos_num += float((Wf[e] * W_rec_e).sum().item())
         total_cos_den_a += float((Wf[e] * Wf[e]).sum().item())
         total_cos_den_b += float((W_rec_e * W_rec_e).sum().item())
+        # Free per-expert temps before next iteration to avoid caching-allocator
+        # pile-up across 512 experts (was the V3 H1 leak source on 397B).
+        del idx_e, rec_norm, W_rec_e, diff, chosen_lib
+        if Wf.is_cuda:
+            torch.cuda.empty_cache()
+
+    # Free per-expert codebook lists (collected only for library build)
+    del all_cb_norm, all_scale, all_mid
+    if Wf.is_cuda:
+        torch.cuda.empty_cache()
 
     n_total = float(E * N * K)
     mse = total_mse / n_total
